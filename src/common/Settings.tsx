@@ -197,7 +197,7 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
         <FormControlLabel
           control={
             <Switch
-              checked={kubescapeData?.imageVersions !== false}
+              checked={kubescapeData?.imageVersions === true}
               onChange={(_, checked) =>
                 onDataChange?.(changeImageVersionSetting(data, 'imageVersions', checked))
               }
@@ -205,39 +205,83 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
           }
           label="Show the newest version of images"
         />
-        <Typography variant="body2" color="text.secondary" sx={{ ml: 6, mt: -0.5 }}>
-          Asks Quay, Google&apos;s Artifact Registry, GitHub, jsDelivr (for projects on GitHub and
-          Docker&apos;s official images) and endoflife.date about public images, and reads
-          version-checker in clusters that run it. The name of an image only goes to its own
-          registry, or elsewhere once it is known to be public; answers are kept for a day.
+        <Typography variant="body2" component="div" color="text.secondary" sx={{ ml: 6, mt: -0.5 }}>
+          Off by default. When on, your browser asks these public services about the images in your
+          clusters, without cookies, so each one sees your IP address and what is listed here:
+          <Box component="ul" sx={{ my: 0.5, pl: 3 }}>
+            <li>quay.io: the names of quay.io images.</li>
+            <li>
+              artifactregistry.googleapis.com: the project and repository of gcr.io,
+              *-docker.pkg.dev and registry.k8s.io images, and the name of an image once its
+              repository answers as public.
+            </li>
+            <li>
+              data.jsdelivr.com: the GitHub project (owner/name) of images known to be public, and
+              once a day the list of Docker&apos;s official images, which names no image.
+            </li>
+            <li>
+              cdn.jsdelivr.net: the names of Docker&apos;s official images in use, such as nginx.
+            </li>
+          </Box>
+          No other image names leave the cluster unless the setting below is on. version-checker is
+          read through the Kubernetes API in clusters that run it. Answers are kept for a day.
         </Typography>
         <FormControlLabel
           sx={{ ml: 4 }}
           control={
             <Switch
               checked={
-                kubescapeData?.imageVersions !== false &&
+                kubescapeData?.imageVersions === true &&
                 kubescapeData?.possiblyPrivateImages === true
               }
-              disabled={kubescapeData?.imageVersions === false}
+              disabled={kubescapeData?.imageVersions !== true}
               onChange={(_, checked) =>
                 onDataChange?.(changeImageVersionSetting(data, 'possiblyPrivateImages', checked))
               }
             />
           }
-          label="Also look up Docker Hub, GHCR and Upbound images that may be private, which sends their names to shields.io and jsDelivr"
+          label="Also look up Docker Hub, GHCR and Upbound images that may be private"
         />
+        <Typography variant="body2" component="div" color="warning.main" sx={{ ml: 10, mt: -0.5 }}>
+          Off by default. The browser cannot tell whether these images are public, so when on it
+          also sends, internal images included:
+          <Box component="ul" sx={{ my: 0.5, pl: 3 }}>
+            <li>
+              img.shields.io: the name (publisher/name) of every Docker Hub image that is not one of
+              Docker&apos;s official images.
+            </li>
+            <li>
+              data.jsdelivr.com: the GitHub project (owner/name) of every ghcr.io image, and of the
+              Upbound packages of other publishers than Upbound and the Crossplane community.
+            </li>
+          </Box>
+          An image name can reveal internal projects, teams or customers, which for some
+          organisations is a security risk. Leave it off if your image names are confidential.
+        </Typography>
         <FormControlLabel
           sx={{ ml: 4 }}
           control={
             <Switch
-              checked={kubescapeData?.imageVersions !== false && kubescapeData?.endOfLife !== false}
-              disabled={kubescapeData?.imageVersions === false}
+              checked={kubescapeData?.imageVersions === true && kubescapeData?.endOfLife === true}
+              disabled={kubescapeData?.imageVersions !== true}
               onChange={(_, checked) => onDataChange?.({ ...data, endOfLife: checked })}
             />
           }
           label="Show when the release line of an image reaches its end of life (from endoflife.date)"
         />
+        <Typography
+          variant="body2"
+          component="div"
+          color="text.secondary"
+          sx={{ ml: 10, mt: -0.5 }}
+        >
+          Off by default. When on, your browser reads endoflife.date&apos;s lists of products and
+          image identifiers once a day, which name no image, and matches your images against them
+          itself. For each product that matches, such as postgresql or redis, it then asks
+          endoflife.date for the release lines: the product name only, never the name, registry or
+          organisation of an image. Their newest release also serves as the newest version when no
+          other service knows it. When off, endoflife.date is not asked at all.
+        </Typography>
       </Box>
 
       <Box display="flex" flexDirection="column" mt={2}>

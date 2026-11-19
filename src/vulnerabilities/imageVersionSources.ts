@@ -13,16 +13,15 @@
 
   The name of an image only goes to its own registry, and to other services once it is known to
   be public: by its registry, which holds only public images (registry.k8s.io) or answers for it
-  (Quay, Artifact Registry), as an official image of Docker Hub on the list that jsDelivr reads
-  once a day without naming an image, or, for the project of a ghcr.io image, by GitHub, which
-  runs ghcr.io and shows whether the project is public. Docker Hub cannot be asked from the
-  browser, so the name of another Docker Hub image,
-  which may be private, only goes to shields.io when the settings allow names that may be private
-  (possiblyPrivate); so do the projects of ghcr.io images that GitHub does not show and of Upbound
-  packages of other publishers than Upbound and the Crossplane community. Switching that setting
-  off stops those requests that were not sent yet (possiblyPrivatePermit). The project an image's
-  labels name is only asked about when the image is public. Answers are kept for a day, in
-  localStorage where they are small.
+  (Quay, Artifact Registry), or as an official image of Docker Hub on the list that jsDelivr reads
+  once a day without naming an image. Docker Hub and GHCR cannot be asked from the browser whether
+  an image is public, so the name of another Docker Hub image only goes to shields.io, and the
+  project of a ghcr.io image to jsDelivr, when the settings allow names that may be private
+  (possiblyPrivate); so do the projects of Upbound packages of other publishers than Upbound and
+  the Crossplane community. Switching that setting off stops those requests that were not sent yet
+  (possiblyPrivatePermit). The project an image's labels name is only asked about when the image
+  is public. endoflife.date only gets the names of products on its own lists, and only when the
+  settings show the end of life. Answers are kept for a day, in localStorage where they are small.
 */
 import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { githubProjectOfSource } from './imageSource';
@@ -61,7 +60,7 @@ const day = 24 * 3600 * 1000;
 const retryAfter = 3600 * 1000;
 const storageName = 'kubescape-plugin.image-versions.';
 // raised when lookups change, so that answers of the old lookups are not used
-const storageVersion = 7;
+const storageVersion = 8;
 const storagePrefix = `${storageName}${storageVersion}.`;
 
 const memory = new Map<string, { expires: number; value: Promise<unknown> }>();
@@ -284,22 +283,6 @@ function githubVersions(project: string, permit?: AbortSignal) {
   });
 }
 
-/**
- * Whether a GitHub project is public, asked of GitHub, which runs ghcr.io and so knows the names
- * of its images already. GitHub answers 60 of these requests an hour from an address and says 403
- * after that, so the answers are kept a day, and a refusal is asked again after an hour.
- */
-function isPublicGithubProject(project: string) {
-  return cached<boolean>(
-    `github-project|${project}`,
-    async () => {
-      const body = await fetchBody(`https://api.github.com/repos/${project}`, 'json', [404]);
-      return body?.private === false;
-    },
-    { persist: true }
-  );
-}
-
 interface Release {
   name: string;
   latest?: string;
@@ -496,14 +479,12 @@ function isPublicByName({ registry, repository }: ImageReference) {
 
 /**
  * The GitHub project the registry of an image implies, when its name may go to jsDelivr: the image
- * is public or the settings allow names that may be private (mayName), or GitHub shows the project
- * of a ghcr.io image as public.
+ * is public or the settings allow names that may be private (mayName). Whether a ghcr.io image is
+ * public cannot be asked from the browser: ghcr.io does not allow other sites, GitHub's API for
+ * packages needs a login, and a package can be private while the repository of its name is public.
  */
-async function impliedProject(reference: ImageReference, mayName: boolean) {
-  const project = githubProject(reference);
-  if (!project || mayName) return project;
-  if (reference.registry === 'ghcr.io' && (await isPublicGithubProject(project))) return project;
-  return undefined;
+function impliedProject(reference: ImageReference, mayName: boolean) {
+  return mayName ? githubProject(reference) : undefined;
 }
 
 /**
@@ -731,7 +712,7 @@ function registryOrProjectLatest(
       }
       // the releases of the project go before shields.io, which sorts the tags loosely
       const project =
-        (await impliedProject(reference, isPublic || !!possiblyPrivate)) ??
+        impliedProject(reference, isPublic || !!possiblyPrivate) ??
         (isPublic ? sourceProject : undefined);
       if (project) {
         // the project of an image not known to be public is only named with the permit
@@ -785,13 +766,16 @@ async function endOfLifeOf(
 
 /**
  * The newest version of a public image and the release line of its tag. Images whose tag is not
- * a version, such as latest, are not looked up.
+ * a version, such as latest, are not looked up. Without the end of life, endoflife.date is not
+ * asked, also not for the newest version.
  */
 export async function lookupImageVersion(
   image: string,
   options: {
     // false when version-checker already knows the newest version
     latest?: boolean;
+    // false when the settings leave out the end of life, so that endoflife.date is not asked
+    endOfLife?: boolean;
     // the source repository the labels of the image name (imageSourceLabel)
     source?: string;
     // the permit to send the names of images that may be private to shields.io and jsDelivr
@@ -804,15 +788,18 @@ export async function lookupImageVersion(
   if (!reference || !tag || !parseVersion(tag)) return {};
   const sourceProject = githubProjectOfSource(options.source);
   // a service that fails leaves out what it would tell
+  const noEndOfLife: { line?: ReleaseLine; newest?: LatestVersion } = {};
   const [latest, endOfLife] = await Promise.all([
     options.latest === false
       ? null
       : registryOrProjectLatest(reference, tag, sourceProject, options.possiblyPrivate).catch(
           () => null
         ),
-    endOfLifeOf(reference, tag, githubProject(reference) ?? sourceProject).catch(
-      () => ({} as Awaited<ReturnType<typeof endOfLifeOf>>)
-    ),
+    options.endOfLife === false
+      ? noEndOfLife
+      : endOfLifeOf(reference, tag, githubProject(reference) ?? sourceProject).catch(
+          () => noEndOfLife
+        ),
   ]);
   return { latest: latest ?? endOfLife.newest, line: endOfLife.line };
 }
