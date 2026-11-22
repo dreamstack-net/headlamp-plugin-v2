@@ -3,7 +3,6 @@ import { post, put } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import {
   Button,
   Dialog,
-  DialogActions,
   DialogContent,
   DialogTitle,
   FormControl,
@@ -20,6 +19,8 @@ import {
 } from '@mui/material';
 import { useSnackbar } from 'notistack';
 import { useState } from 'react';
+import { errorMessage } from '../common/errors';
+import { AccessCheck, createExceptionCheck } from '../common/permissions';
 import {
   ClusterSecurityException,
   PostureException,
@@ -30,8 +31,14 @@ import {
   VulnerabilityResponse,
   VulnerabilityStatus,
 } from '../softwarecomposition/SecurityException';
+import { formatLabelSelector } from './apply-security-exceptions';
+import { ExceptionDialogActions } from './ExceptionDialogActions';
+import { AnyException, saveExceptionYaml } from './exceptionYaml';
 import { recordChangeByCurrentUser } from './history';
 import {
+  ContextBadge,
+  expiresAtFor,
+  expiryDate,
   JUSTIFICATION_OPTIONS,
   MetadataFields,
   RESOURCE_KINDS,
@@ -54,12 +61,16 @@ export interface SecurityExceptionFormProps {
   workloadName?: string;
   workloadNamespace?: string;
   workloadKind?: string;
+  // the cluster of the exception, the current one by default
+  cluster?: string;
   onClose: () => void;
 }
 
 interface ResourceRow {
   kind: string;
   name: string;
+  // the resource as it was, whose other fields, such as its apiGroup, are kept
+  original?: ResourceMatch;
 }
 
 interface NsSelectorRow {
@@ -86,6 +97,13 @@ interface VulnRow {
   original?: VulnerabilityException;
 }
 
+// A copy of an object without the given fields
+function without<T extends object>(value: T | undefined, ...keys: (keyof T)[]): Partial<T> {
+  const copy: Partial<T> = { ...value };
+  for (const key of keys) delete copy[key];
+  return copy;
+}
+
 const newVulnRow = (cveId: string): VulnRow => ({
   cveId,
   status: 'under_investigation',
@@ -107,6 +125,7 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
     workloadName,
     workloadNamespace,
     workloadKind,
+    cluster,
     onClose,
   } = props;
   const { enqueueSnackbar } = useSnackbar();
@@ -129,9 +148,14 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
     existing?.kind === 'SecurityException' ? existing.metadata.namespace : workloadNamespace ?? ''
   );
   const [reason, setReason] = useState(existing?.spec.reason ?? '');
-  const [expiresDate, setExpiresDate] = useState(
-    existing?.spec.expiresAt ? existing.spec.expiresAt.split('T')[0] : ''
-  );
+  const [expiresDate, setExpiresDate] = useState(expiryDate(existing?.spec.expiresAt));
+  // the parts of the match that the form does not edit, which are kept as they are
+  const existingMatch = existing?.spec.match;
+  const keptNamespaceExpressions =
+    existing?.kind === 'ClusterSecurityException'
+      ? existingMatch?.namespaceSelector?.matchExpressions ?? []
+      : [];
+  const keptObjectSelector = existingMatch?.objectSelector;
 
   const [namespaceSelectorRows, setNamespaceSelectorRows] = useState<NsSelectorRow[]>(
     existing?.kind === 'ClusterSecurityException' &&
@@ -144,8 +168,11 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
   );
 
   const [resources, setResources] = useState<ResourceRow[]>(
-    existing?.spec.match?.resources?.map(r => ({ kind: r.kind, name: r.name ?? '' })) ??
-      (workloadName && workloadKind ? [{ kind: workloadKind, name: workloadName }] : [])
+    existing?.spec.match?.resources?.map(r => ({
+      kind: r.kind,
+      name: r.name ?? '',
+      original: r,
+    })) ?? (workloadName && workloadKind ? [{ kind: workloadKind, name: workloadName }] : [])
   );
 
   const [images, setImages] = useState<string[]>(
@@ -200,14 +227,18 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
     return `Applies to ${resourceDesc} in namespace "${namespace}"`;
   }
 
-  const handleSubmit = async () => {
+  /**
+   * The exception that Save or Create sends, with the author and the history of the change, or
+   * undefined after saying what is missing.
+   */
+  const buildException = async (): Promise<AnyException | undefined> => {
     if (!name) {
       enqueueSnackbar('Name is required', { variant: 'error' });
-      return;
+      return undefined;
     }
     if (!clusterScoped && !namespace) {
       enqueueSnackbar('Namespace is required for namespaced exceptions', { variant: 'error' });
-      return;
+      return undefined;
     }
     const missingJustification = vulnEntries.find(
       v => v.cveId && v.status === 'not_affected' && !v.justification
@@ -217,7 +248,7 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
         `Justification is required for "${missingJustification.cveId}" when status is not_affected`,
         { variant: 'error' }
       );
-      return;
+      return undefined;
     }
     const missingAction = vulnEntries.find(
       v =>
@@ -228,20 +259,50 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
         `A response and an action statement are required for "${missingAction.cveId}" when status is affected`,
         { variant: 'error' }
       );
-      return;
+      return undefined;
+    }
+
+    // A row that is half filled is not left out: without it the exception would apply to more
+    // workloads or namespaces than the form shows
+    const resourceWithoutKind = resources.find(r => !r.kind && r.name);
+    if (resourceWithoutKind) {
+      enqueueSnackbar(`A kind is required for the resource "${resourceWithoutKind.name}"`, {
+        variant: 'error',
+      });
+      return undefined;
+    }
+    const labelWithoutKey = clusterScoped && namespaceSelectorRows.find(r => !r.key && r.value);
+    if (labelWithoutKey) {
+      enqueueSnackbar(
+        `A key is required for the namespace label with the value "${labelWithoutKey.value}"`,
+        { variant: 'error' }
+      );
+      return undefined;
     }
 
     const validResources = resources.filter(r => r.kind);
     const validNsSelector = namespaceSelectorRows.filter(r => r.key);
 
-    const matchSpec: Record<string, any> = {};
-    if (clusterScoped && validNsSelector.length > 0) {
+    // the fields of the match that the form does not show, such as an objectSelector, are kept,
+    // as dropping them would make the exception apply to more workloads
+    const matchSpec: Record<string, any> = without(
+      existingMatch,
+      'namespaceSelector',
+      'resources',
+      'images'
+    );
+    if (clusterScoped && (validNsSelector.length > 0 || keptNamespaceExpressions.length > 0)) {
       matchSpec.namespaceSelector = {
-        matchLabels: Object.fromEntries(validNsSelector.map(r => [r.key, r.value])),
+        ...without(existingMatch?.namespaceSelector, 'matchLabels'),
+        ...(validNsSelector.length > 0 && {
+          matchLabels: Object.fromEntries(validNsSelector.map(r => [r.key, r.value])),
+        }),
       };
     }
     if (validResources.length > 0) {
       matchSpec.resources = validResources.map(r => ({
+        // the API group is that of the kind the entry had
+        ...(r.original?.kind === r.kind ? without(r.original, 'name') : {}),
         kind: r.kind,
         ...(r.name && { name: r.name }),
       })) as ResourceMatch[];
@@ -256,7 +317,7 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
 
     const spec = {
       ...(reason && { reason }),
-      ...(expiresDate && { expiresAt: `${expiresDate}T00:00:00Z` }),
+      ...(expiresDate && { expiresAt: expiresAtFor(expiresDate, existing?.spec.expiresAt) }),
       match: matchSpec,
       ...(validPosture.length > 0 && {
         posture: validPosture.map(p => ({
@@ -268,17 +329,24 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
       ...(validVulns.length > 0 && {
         vulnerabilities: validVulns.map(v => {
           const kept: Partial<VulnerabilityException> = { ...v.original };
-          // the fields that the form shows are set again
+          const sameCve = kept.vulnerability?.id === v.cveId;
+          // the fields that the form shows are set again; it does not show the impact
+          // statement of an affected entry, which that entry keeps
           delete kept.justification;
-          delete kept.impactStatement;
+          if (!sameCve || v.status !== 'affected' || v.original?.status !== 'affected') {
+            delete kept.impactStatement;
+          }
           delete kept.actionStatement;
           delete kept.response;
           delete kept.expiredOnFix;
+          // the aliases, the packages and the expiry are those of the CVE the entry had
+          if (!sameCve) {
+            delete kept.subcomponents;
+            delete kept.expiresAt;
+          }
           return {
             ...kept,
-            // the aliases are those of the CVE the entry had
-            vulnerability:
-              kept.vulnerability?.id === v.cveId ? kept.vulnerability : { id: v.cveId },
+            vulnerability: sameCve ? kept.vulnerability : { id: v.cveId },
             status: v.status,
             ...(v.status === 'not_affected' &&
               v.justification && { justification: v.justification }),
@@ -294,55 +362,97 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
       }),
     };
 
+    // Keeps the author and history of an edited exception, and adds this change
+    const previous = isEdit ? existing : undefined;
+    if (clusterScoped) {
+      return recordChangeByCurrentUser<ClusterSecurityException>(
+        {
+          ...(existing as ClusterSecurityException),
+          apiVersion: 'kubescape.io/v1beta1',
+          kind: 'ClusterSecurityException',
+          metadata: { ...existing?.metadata, name },
+          spec,
+        },
+        previous,
+        cluster
+      );
+    }
+    return recordChangeByCurrentUser<SecurityException>(
+      {
+        ...(existing as SecurityException),
+        apiVersion: 'kubescape.io/v1beta1',
+        kind: 'SecurityException',
+        metadata: { ...existing?.metadata, name, namespace },
+        spec,
+      },
+      previous,
+      cluster
+    );
+  };
+
+  const handleSubmit = async () => {
+    const obj = await buildException();
+    if (!obj) return;
+    const options = cluster ? { cluster } : undefined;
     try {
-      // Keeps the author and history of an edited exception, and adds this change
-      const previous = isEdit ? existing : undefined;
-      if (clusterScoped) {
-        const obj = await recordChangeByCurrentUser<ClusterSecurityException>(
-          {
-            ...(existing as ClusterSecurityException),
-            apiVersion: 'kubescape.io/v1beta1',
-            kind: 'ClusterSecurityException',
-            metadata: { ...existing?.metadata, name },
-            spec,
-          },
-          previous
-        );
-        if (isEdit) {
-          await put(`/apis/kubescape.io/v1beta1/clustersecurityexceptions/${name}`, obj as any);
-        } else {
-          await post('/apis/kubescape.io/v1beta1/clustersecurityexceptions', obj);
-        }
-      } else {
-        const obj = await recordChangeByCurrentUser<SecurityException>(
-          {
-            ...(existing as SecurityException),
-            apiVersion: 'kubescape.io/v1beta1',
-            kind: 'SecurityException',
-            metadata: { ...existing?.metadata, name, namespace },
-            spec,
-          },
-          previous
-        );
+      if (obj.kind === 'ClusterSecurityException') {
         if (isEdit) {
           await put(
-            `/apis/kubescape.io/v1beta1/namespaces/${namespace}/securityexceptions/${name}`,
-            obj as any
+            `/apis/kubescape.io/v1beta1/clustersecurityexceptions/${name}`,
+            obj as any,
+            true,
+            options
           );
         } else {
-          await post(`/apis/kubescape.io/v1beta1/namespaces/${namespace}/securityexceptions`, obj);
+          await post('/apis/kubescape.io/v1beta1/clustersecurityexceptions', obj, true, options);
         }
+      } else if (isEdit) {
+        await put(
+          `/apis/kubescape.io/v1beta1/namespaces/${namespace}/securityexceptions/${name}`,
+          obj as any,
+          true,
+          options
+        );
+      } else {
+        await post(
+          `/apis/kubescape.io/v1beta1/namespaces/${namespace}/securityexceptions`,
+          obj,
+          true,
+          options
+        );
       }
       enqueueSnackbar(`Security exception ${isEdit ? 'updated' : 'created'}`, {
         variant: 'success',
       });
       onClose();
-    } catch (err: any) {
-      enqueueSnackbar(`Failed to ${isEdit ? 'update' : 'create'}: ${err?.message ?? err}`, {
+    } catch (err) {
+      enqueueSnackbar(`Failed to ${isEdit ? 'update' : 'create'}: ${errorMessage(err)}`, {
         variant: 'error',
       });
     }
   };
+
+  // the exception that Save or Create would send, for a GitOps repository
+  const handleDownload = async () => {
+    const obj = await buildException();
+    if (obj) await saveExceptionYaml(obj, enqueueSnackbar);
+  };
+
+  // what Save or Create needs; nothing to check while a namespaced exception has no namespace
+  let submitCheck: AccessCheck | null = null;
+  if (isEdit) {
+    submitCheck = clusterScoped
+      ? { group: 'kubescape.io', resource: 'clustersecurityexceptions', verb: 'update', name }
+      : {
+          group: 'kubescape.io',
+          resource: 'securityexceptions',
+          verb: 'update',
+          namespace,
+          name,
+        };
+  } else if (clusterScoped || namespace) {
+    submitCheck = createExceptionCheck(clusterScoped ? undefined : namespace);
+  }
 
   const scopeSummary = buildScopeSummary();
   const dialogTitle = `${isEdit ? 'Edit' : 'Create'} ${
@@ -375,7 +485,9 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
             onReasonChange={setReason}
             expiresDate={expiresDate}
             onExpiresDateChange={setExpiresDate}
+            cluster={cluster}
           />
+          {cluster && <ContextBadge label="Cluster" value={cluster} />}
 
           {/* Namespace selector (ClusterSecurityException only) */}
           {clusterScoped && (
@@ -426,6 +538,18 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
           {scopeSummary && (
             <Typography variant="body2" color="text.secondary" sx={{ fontStyle: 'italic' }}>
               {scopeSummary}
+            </Typography>
+          )}
+          {(keptObjectSelector || (clusterScoped && keptNamespaceExpressions.length > 0)) && (
+            <Typography variant="body2" color="text.secondary">
+              Kept as they are, as this form does not edit them:
+              {keptObjectSelector &&
+                ` only workloads labelled ${formatLabelSelector(keptObjectSelector) || '(any)'}.`}
+              {clusterScoped &&
+                keptNamespaceExpressions.length > 0 &&
+                ` Only namespaces where ${formatLabelSelector({
+                  matchExpressions: keptNamespaceExpressions,
+                })}.`}
             </Typography>
           )}
 
@@ -536,6 +660,8 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
                   />
                   <TextField
                     label="Framework"
+                    placeholder="any"
+                    helperText="Limits the entry to the framework of this name, such as NSA"
                     value={p.frameworkName}
                     onChange={e => {
                       const updated = [...postureEntries];
@@ -710,6 +836,13 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
                   >
                     <Icon icon="mdi:delete" />
                   </IconButton>
+                  {v.original?.expiresAt && v.original.vulnerability.id === v.cveId && (
+                    <Typography variant="caption" color="text.secondary" sx={{ width: '100%' }}>
+                      Kept as it is, as this form does not edit it: this entry expires on its own on{' '}
+                      {new Date(v.original.expiresAt).toLocaleDateString()}, whatever the expiry of
+                      the exception.
+                    </Typography>
+                  )}
                 </Stack>
               ))}
               <Button
@@ -745,12 +878,14 @@ export function SecurityExceptionForm(props: Readonly<SecurityExceptionFormProps
           )}
         </Stack>
       </DialogContent>
-      <DialogActions>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button onClick={handleSubmit} variant="contained">
-          {isEdit ? 'Save' : 'Create'}
-        </Button>
-      </DialogActions>
+      <ExceptionDialogActions
+        onCancel={onClose}
+        onDownload={handleDownload}
+        onSubmit={handleSubmit}
+        submitLabel={isEdit ? 'Save' : 'Create'}
+        check={submitCheck}
+        clusters={[cluster]}
+      />
     </Dialog>
   );
 }

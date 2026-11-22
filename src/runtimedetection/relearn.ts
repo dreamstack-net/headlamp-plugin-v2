@@ -5,6 +5,7 @@
   new profile that is learned from their start.
 */
 import { patch, remove, request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
+import { errorStatus } from '../common/errors';
 import type { AccessCheck } from '../common/permissions';
 import type { ContainerProfile } from '../softwarecomposition/ContainerProfile';
 import type { ProfileResource } from '../softwarecomposition/profileApi';
@@ -70,8 +71,10 @@ export interface AppsWorkload {
     replicas?: number;
     // of a Deployment
     strategy?: { type?: string };
-    // of a StatefulSet or DaemonSet
-    updateStrategy?: { type?: string };
+    // of a Deployment whose rollouts are paused
+    paused?: boolean;
+    // of a StatefulSet or DaemonSet; a StatefulSet only replaces the pods from its partition up
+    updateStrategy?: { type?: string; rollingUpdate?: { partition?: number } };
   };
   status?: { desiredNumberScheduled?: number };
 }
@@ -88,8 +91,10 @@ export interface RestartImpact {
   // error when the workload is down for a while
   severity: 'error' | 'warning';
   text: string;
-  // false when the restart replaces no pods
+  // false when the restart replaces no pods, or leaves some of them running
   replacesPods: boolean;
+  // true when pods keep running after the restart, with the profiles they are checked against
+  leavesPodsRunning?: boolean;
 }
 
 function pods(count: number) {
@@ -118,7 +123,27 @@ export function restartImpact(kind: string, object?: AppsWorkload): RestartImpac
     return {
       severity: 'warning',
       replacesPods: false,
+      leavesPodsRunning: true,
       text: 'Its update strategy is OnDelete: the pods keep running until you delete them, so nothing is relearned until then.',
+    };
+  }
+  // kubectl rollout restart refuses a paused Deployment
+  if (kind === 'Deployment' && spec.paused) {
+    return {
+      severity: 'warning',
+      replacesPods: false,
+      leavesPodsRunning: true,
+      text: 'Its rollouts are paused: the pods keep running until the rollout is resumed, so nothing is relearned until then.',
+    };
+  }
+  // a StatefulSet replaces the pods numbered from its partition up, and leaves the others
+  const partition = kind === 'StatefulSet' ? spec.updateStrategy?.rollingUpdate?.partition ?? 0 : 0;
+  if (partition > 0) {
+    return {
+      severity: 'warning',
+      replacesPods: false,
+      leavesPodsRunning: true,
+      text: `Its update strategy has a partition of ${partition}: the pods numbered below ${partition} keep running until the partition is lowered, so they are not relearned until then.`,
     };
   }
   if (kind === 'Deployment') {
@@ -209,9 +234,10 @@ export async function deleteProfiles(
           `${storagePath}/namespaces/${profile.metadata.namespace}/${plural}/${profile.metadata.name}`,
           clusterOptions(cluster)
         );
-      } catch (error: any) {
-        // the other half of an older profile may be gone already
-        if (plural === source.plural || error?.status !== 404) throw error;
+      } catch (error) {
+        // a profile that is gone already, or the other half of an older one, is what deleting
+        // it was for
+        if (errorStatus(error) !== 404) throw error;
       }
     }
   }
@@ -224,14 +250,16 @@ export function restartCheck(workload: ProfileWorkload): AccessCheck | null {
     : null;
 }
 
+/** Deleting the profiles of the workload; on older Storage releases both of their halves. */
 export function deleteProfilesCheck(
   workload: ProfileWorkload,
   source: ProfileResource
-): AccessCheck {
-  return {
+): AccessCheck[] {
+  const plurals = source.modern ? [source.plural] : ['applicationprofiles', 'networkneighborhoods'];
+  return plurals.map(resource => ({
     group: storageGroup,
-    resource: source.plural,
+    resource,
     verb: 'delete',
     namespace: workload.namespace,
-  };
+  }));
 }

@@ -1,24 +1,34 @@
 import { FormControl, MenuItem, Stack, TextField } from '@mui/material';
 import * as yaml from 'js-yaml';
-import { useContext, useEffect, useState } from 'react';
-import { getKubescapePluginUrl } from '../common/PluginHelper';
+import { useEffect, useState } from 'react';
+import { errorMessage } from '../common/errors';
 import { ValidatingAdmissionPolicy } from '../types/ValidatingAdmissionPolicy';
-import { CurrentEvalContext } from './ValidatingAdmissionPolicy';
+import { fetchPluginFile } from './samples';
+import { useEvalContext } from './ValidatingAdmissionPolicy';
 
 export function ChoosePolicyButton() {
-  const { setValidatingAdmissionPolicy } = useContext<any>(CurrentEvalContext);
+  const { setValidatingAdmissionPolicy } = useEvalContext();
   const [policies, setKubescapeValidatingAdmissionPolicies] = useState<ValidatingAdmissionPolicy[]>(
     []
   );
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    getKubescapePluginUrl().then(baseUrl => {
-      fetch(baseUrl + '/validating-admission-policies.yaml')
-        .then(response => response.text())
-        .then(data =>
-          setKubescapeValidatingAdmissionPolicies(yaml.loadAll(data) as ValidatingAdmissionPolicy[])
+    let active = true;
+    fetchPluginFile('validating-admission-policies.yaml')
+      .then(data => {
+        // an empty document, such as after a trailing separator, is no policy
+        const loaded = (yaml.loadAll(data) as ValidatingAdmissionPolicy[]).filter(
+          policy => policy?.metadata?.name
         );
-    });
+        if (active) setKubescapeValidatingAdmissionPolicies(loaded);
+      })
+      .catch(err => {
+        if (active) setError(`Unable to read the sample policies: ${errorMessage(err)}`);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const handleChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -38,6 +48,8 @@ export function ChoosePolicyButton() {
           value={selectedValue}
           onChange={handleChange}
           label="Choose Sample Policy"
+          error={!!error}
+          helperText={error}
         >
           {policies?.map((policy, indx) => (
             <MenuItem key={indx} value={policy.metadata.name}>

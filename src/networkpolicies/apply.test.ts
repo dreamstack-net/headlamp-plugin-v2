@@ -80,3 +80,67 @@ it('does not hide other errors while looking for an existing policy', async () =
     message: 'forbidden',
   });
 });
+
+it('leaves out the labels of a run, so the policy still matches after the next one', () => {
+  const withRuns = {
+    ...generated,
+    spec: {
+      ...generated.spec,
+      spec: {
+        podSelector: { matchLabels: { app: 'web' } },
+        ingress: [
+          {
+            from: [
+              { podSelector: { matchLabels: { app: 'backup', 'job-name': 'backup-29001' } } },
+              { podSelector: { matchLabels: { app: 'backup', 'job-name': 'backup-29002' } } },
+              {
+                namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'shop' } },
+                podSelector: { matchLabels: { app: 'api', 'pod-template-hash': '7d9f' } },
+              },
+              // without the label it would select every pod, so it is kept
+              { podSelector: { matchLabels: { 'job-name': 'only-run' } } },
+            ],
+          },
+        ],
+      },
+    },
+  } as unknown as GeneratedNetworkPolicy;
+
+  expect(toNetworkPolicy(withRuns).spec.ingress![0].from).toEqual([
+    { podSelector: { matchLabels: { app: 'backup' } } },
+    {
+      namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': 'shop' } },
+      podSelector: { matchLabels: { app: 'api' } },
+    },
+    { podSelector: { matchLabels: { 'job-name': 'only-run' } } },
+  ]);
+});
+
+it('leaves out the name and index of the pods of a StatefulSet', () => {
+  const withReplicas = {
+    ...generated,
+    spec: {
+      ...generated.spec,
+      spec: {
+        podSelector: { matchLabels: { app: 'web' } },
+        egress: [
+          {
+            to: [0, 1].map(index => ({
+              podSelector: {
+                matchLabels: {
+                  app: 'db',
+                  'statefulset.kubernetes.io/pod-name': `db-${index}`,
+                  'apps.kubernetes.io/pod-index': `${index}`,
+                },
+              },
+            })),
+          },
+        ],
+      },
+    },
+  } as unknown as GeneratedNetworkPolicy;
+
+  expect(toNetworkPolicy(withReplicas).spec.egress![0].to).toEqual([
+    { podSelector: { matchLabels: { app: 'db' } } },
+  ]);
+});

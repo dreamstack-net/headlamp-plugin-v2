@@ -3,6 +3,7 @@
 */
 import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { getAllowedNamespaces } from '../common/clusterContext';
+import { errorMessage } from '../common/errors';
 import { getScanTime } from './reportTimestamp';
 
 export interface ImageWorkload {
@@ -16,6 +17,13 @@ export interface ImageWorkload {
   scannedAt?: string;
 }
 
+/** The workloads that run an image, and the allowed namespaces that could not be read. */
+export interface ImageWorkloadList {
+  workloads: ImageWorkload[];
+  // such as namespace team-b: forbidden
+  errors: string[];
+}
+
 const summaries = '/apis/spdx.softwarecomposition.kubescape.io/v1beta1';
 
 /**
@@ -26,7 +34,7 @@ const summaries = '/apis/spdx.softwarecomposition.kubescape.io/v1beta1';
 export async function fetchImageWorkloads(
   imageId: string,
   cluster: string
-): Promise<ImageWorkload[]> {
+): Promise<ImageWorkloadList> {
   const query = new URLSearchParams({ labelSelector: `kubescape.io/image-id=${imageId}` });
   const namespaces = getAllowedNamespaces(cluster);
   const paths =
@@ -36,10 +44,18 @@ export async function fetchImageWorkloads(
             `${summaries}/namespaces/${namespace}/vulnerabilitymanifestsummaries?${query}`
         )
       : [`${summaries}/vulnerabilitymanifestsummaries?${query}`];
-  const lists = await Promise.all(paths.map(path => request(path, { cluster })));
+  // an allowed namespace that cannot be read leaves the others, and the errors name it; when
+  // none can be read, it rejects
+  const results = await Promise.allSettled(paths.map(path => request(path, { cluster })));
+  const errors = results.flatMap((result, i) =>
+    result.status === 'rejected'
+      ? [`namespace ${namespaces[i]}: ${errorMessage(result.reason)}`]
+      : []
+  );
+  if (errors.length === results.length) throw (results[0] as PromiseRejectedResult).reason;
 
-  return lists
-    .flatMap(list => list.items ?? [])
+  const workloads = results
+    .flatMap(result => (result.status === 'fulfilled' ? result.value.items ?? [] : []))
     .map((summary: any): ImageWorkload => {
       const labels = summary.metadata.labels ?? {};
       return {
@@ -55,6 +71,7 @@ export async function fetchImageWorkloads(
     .sort((a, b) =>
       `${a.namespace}/${a.kind}/${a.name}`.localeCompare(`${b.namespace}/${b.kind}/${b.name}`)
     );
+  return { workloads, errors };
 }
 
 /** When the image was last scanned for one of the workloads. */

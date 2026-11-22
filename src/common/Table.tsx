@@ -8,15 +8,13 @@ import {
   TableProps,
 } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
 import { Box } from '@mui/material';
-import { MouseEvent, ReactNode, useState } from 'react';
+import { MouseEvent, ReactNode, useMemo, useState } from 'react';
 import { CsvExport, ExportCsvButton } from './ExportCsvButton';
 
 export type SortingState = Array<{ id: string; desc: boolean }>;
 
-const storagePrefix = 'kubescape.sorting.';
-
-// Headlamp offers up to 50 rows; scan results run into the hundreds
-const rowsPerPageOptions = [15, 25, 50, 100, 200];
+// 2: the sorting names a column by its header instead of its index (withColumnIds)
+const storagePrefix = 'kubescape.sorting.2.';
 
 export function readSorting(key: string): SortingState | undefined {
   try {
@@ -42,6 +40,24 @@ export function sortingKeyOf<RowItem extends Record<string, any>>(
   return columns
     .map(column => column.id ?? (typeof column.header === 'string' ? column.header : ''))
     .join('|');
+}
+
+/**
+ * The columns with an id of their own: their header, where they have none. Headlamp names a
+ * column without an id by its index, so the sorting would move to another column when a column
+ * appears before it, such as the Cluster column once a second cluster is selected. A header that
+ * is taken, or that could be the index of another column, gives no id.
+ */
+export function withColumnIds<RowItem extends Record<string, any>>(
+  columns: TableColumn<RowItem>[]
+): TableColumn<RowItem>[] {
+  const taken = new Set(columns.map(column => column.id));
+  return columns.map(column => {
+    const header = typeof column.header === 'string' ? column.header : '';
+    if (column.id || !header || /^\d+$/.test(header) || taken.has(header)) return column;
+    taken.add(header);
+    return { ...column, id: header };
+  });
 }
 
 /**
@@ -102,6 +118,7 @@ export default function Table<RowItem extends Record<string, any>>(
   }
 ) {
   const { sortingKey, csvExport, toolbarStart, onRowClick, ...tableProps } = props;
+  const columns = useMemo(() => withColumnIds(tableProps.columns), [tableProps.columns]);
   const key = sortingKey ?? sortingKeyOf(tableProps.columns);
   const [sorting, setSorting] = useState<SortingState>(
     () => readSorting(key) ?? ((tableProps.initialState?.sorting ?? []) as SortingState)
@@ -128,11 +145,15 @@ export default function Table<RowItem extends Record<string, any>>(
         )
       : tableProps.renderTopToolbarCustomActions;
 
+  // a search keeps the sorting: to rank its results, the table clears the sorting while the search
+  // box has text, which would be kept as the sorting the user chose. The rows per page are those
+  // of Headlamp's settings: Headlamp keeps the size chosen in any table as that of all its tables,
+  // so a size of the plugin's own would turn up in Headlamp's lists, whose choices lack it.
   const headlampTable = (
     <HeadlampTable
+      enableGlobalFilterRankedResults={false}
       {...tableProps}
-      columns={onRowClick ? withRowClick(tableProps.columns, onRowClick) : tableProps.columns}
-      rowsPerPage={tableProps.rowsPerPage ?? rowsPerPageOptions}
+      columns={onRowClick ? withRowClick(columns, onRowClick) : columns}
       renderTopToolbarCustomActions={toolbar}
       state={{ ...tableProps.state, sorting }}
       onSortingChange={updater => {

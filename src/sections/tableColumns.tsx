@@ -2,20 +2,21 @@
   Kubescape columns in the Headlamp resource lists of workloads and pods: the critical and
   high CVEs and failed controls of each workload.
 */
+import { Icon } from '@iconify/react';
 import { getCluster } from '@kinvolk/headlamp-plugin/lib/Utils';
-import { Box, Stack } from '@mui/material';
+import { Box, Stack, Tooltip } from '@mui/material';
 import { kubescapeConfigStore } from '../common/config-store';
 import { SeverityCountBox } from '../common/SeverityCountBox';
 import { RoutingName } from '../index';
+import { scannedWorkloadCandidates } from './scannedWorkload';
 import {
-  cachedWorkloadSummaries,
   findWorkloadSummary,
-  loadWorkloadSummaries,
-  scannedWorkloadCandidates,
   SeverityCounts,
   useWorkloadSummaries,
   WorkloadControls,
+  workloadExceptionsError,
   WorkloadSummaries,
+  workloadSummariesError,
   WorkloadVulnerabilities,
 } from './workloadSummaries';
 
@@ -50,17 +51,7 @@ function lookUp(summaries: WorkloadSummaries | undefined, which: Which, item: Li
   );
 }
 
-function cachedCounts(which: Which, item: ListedItem) {
-  return lookUp(cachedWorkloadSummaries(clusterOf(item), item.metadata.namespace), which, item);
-}
-
-// Sorting needs the counts of all rows, also of the namespaces not on the page
-function sortedCounts(which: Which, item: ListedItem) {
-  loadWorkloadSummaries(clusterOf(item), item.metadata.namespace);
-  return cachedCounts(which, item);
-}
-
-// Most critical first, then most high; rows without results last
+// Most critical first, then most high; counts without results last
 function compareCounts(a: SeverityCounts | undefined, b: SeverityCounts | undefined) {
   if (!a || !b) return Number(!a) - Number(!b);
   return b.critical - a.critical || b.high - a.high || b.medium - a.medium;
@@ -89,7 +80,17 @@ function KubescapeCell(props: Readonly<{ item: ListedItem; which: Which }>) {
   const cluster = clusterOf(item);
   const namespace = item.metadata.namespace;
   const summary = lookUp(useWorkloadSummaries(cluster, namespace), which, item);
-  if (!summary) return null;
+  const error = workloadSummariesError(cluster, namespace, which);
+  if (!summary) {
+    // a workload whose results could not be read is not shown as one that was not scanned
+    return error ? (
+      <Tooltip title={`Unable to read the Kubescape results: ${error}`}>
+        <Box component="span" sx={{ display: 'inline-flex', color: 'warning.main' }}>
+          <Icon icon="mdi:alert-circle-outline" width={18} aria-label="Unable to read" />
+        </Box>
+      </Tooltip>
+    ) : null;
+  }
 
   let tooltip;
   let link;
@@ -104,11 +105,23 @@ function KubescapeCell(props: Readonly<{ item: ListedItem; which: Which }>) {
       activeCluster: cluster,
     };
   } else {
-    tooltip = `Failed controls: ${breakdown(summary)}`;
+    const exceptionsError = workloadExceptionsError(cluster, namespace);
+    tooltip = (
+      <>
+        <div>Failed controls: {breakdown(summary)}</div>
+        {exceptionsError && (
+          <div>
+            Unable to read the security exceptions: {exceptionsError}. Controls that exceptions
+            cover may be counted as failed.
+          </div>
+        )}
+      </>
+    );
+    // no activeCluster: the route also names the cluster of the scan in its path, and Headlamp's
+    // Link would fill in all selected clusters there (cluster-b+cluster-a)
     link = {
       routeName: RoutingName.KubescapeWorkloadConfigurationScanDetails,
       params: { cluster, namespace, name: (summary as WorkloadControls).name },
-      activeCluster: cluster,
     };
   }
 
@@ -132,13 +145,12 @@ function column(which: Which, label: string) {
     id: `kubescape-${which}`,
     label,
     gridTemplate: 'min-content',
-    // critical and high, for searching; the counts are sorted by the sort function
-    getValue: (item: ListedItem) => {
-      const counts = cachedCounts(which, item);
-      return counts ? `${counts.critical} ${counts.high}` : '';
-    },
-    sort: (a: ListedItem, b: ListedItem) =>
-      compareCounts(sortedCounts(which, a), sortedCounts(which, b)),
+    // Neither sorted nor searched: Headlamp's table sorts its rows, and takes the values it
+    // searches, once per change of its data, while the counts are read later, a namespace at a
+    // time. Rows whose counts arrived after a sort would stay where it put them, as rows without
+    // results, until the list changes. The Vulnerabilities and Compliance pages sort by them.
+    getValue: () => '',
+    sort: false,
     render: (item: ListedItem) => <KubescapeCell item={item} which={which} />,
   };
 }

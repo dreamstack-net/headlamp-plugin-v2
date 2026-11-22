@@ -8,12 +8,14 @@ import {
   SectionBox,
   Tabs as HeadlampTabs,
 } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
-import { KubeObject } from '@kinvolk/headlamp-plugin/lib/k8s/KubeObject';
+import { getCluster } from '@kinvolk/headlamp-plugin/lib/Utils';
 import Editor from '@monaco-editor/react';
 import { Alert, Box, Typography } from '@mui/material';
 import * as yaml from 'js-yaml';
 import { useEffect, useState } from 'react';
 import { useHistory } from 'react-router-dom';
+import { errorMessage } from '../common/errors';
+import { useStorageObject } from '../common/readOnce';
 import { useEditorTheme } from '../common/theme';
 import { getURLSegments } from '../common/url';
 import { RoutingName } from '../index';
@@ -38,7 +40,7 @@ export function ContainerProfileDetail() {
         if (active) setSource(result);
       })
       .catch(err => {
-        if (active) setError(err?.message ?? String(err));
+        if (active) setError(errorMessage(err));
       });
     return () => {
       active = false;
@@ -78,27 +80,23 @@ function count(containers: ReturnType<typeof getProfileContainers>, field: strin
 function ResolvedProfileDetail({ source }: Readonly<{ source: ProfileResource }>) {
   const [name, namespace] = getURLSegments(-1, -2);
   const history = useHistory();
-  const [item, setItem] = useState<KubeObject | null>(null);
-  const [error, setError] = useState('');
+  const cluster = getCluster() ?? undefined;
   // the graph is laid out once it is shown, so it is only drawn on its tab
   const [tab, setTab] = useState(0);
 
   // older Storage releases keep the behaviour in an ApplicationProfile of its own
   const resourceClass = source.modern ? containerProfileClass : applicationProfileClass;
-  resourceClass.useApiGet(
-    object => {
-      setItem(object);
-      setError('');
-    },
+  // read once: a watch of the storage would replace the profile with one without its spec
+  const { data: profile, error } = useStorageObject<ContainerProfile>(
+    resourceClass,
     name,
     namespace,
-    err => setError(err?.message ?? '')
+    cluster
   );
 
-  if (error) return <Alert severity="error">{error}</Alert>;
-  if (!item) return <Typography variant="body2">Loading profile...</Typography>;
+  if (error) return <Alert severity="error">{errorMessage(error)}</Alert>;
+  if (!profile) return <Typography variant="body2">Loading profile...</Typography>;
 
-  const profile = item.jsonData as ContainerProfile;
   const containers = getProfileContainers(profile);
   const workload = workloadOfProfile(profile);
 
@@ -116,7 +114,7 @@ function ResolvedProfileDetail({ source }: Readonly<{ source: ProfileResource }>
                 kind={workload.kind}
                 name={workload.name}
                 namespace={workload.namespace}
-                cluster={profile.metadata.cluster}
+                cluster={cluster}
               />
             ),
           },
@@ -142,7 +140,8 @@ function ResolvedProfileDetail({ source }: Readonly<{ source: ProfileResource }>
           <RelearnButton
             key="relearn"
             text
-            profile={profile}
+            // in the cluster of the page
+            profile={{ ...profile, metadata: { ...profile.metadata, cluster } }}
             source={source}
             // the profile is gone or no longer used
             onDone={() => history.push(createRouteURL(RoutingName.ApplicationProfiles))}

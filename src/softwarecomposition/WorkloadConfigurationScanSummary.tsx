@@ -32,6 +32,8 @@ export namespace WorkloadConfigurationScanSummary {
       subStatus?: string;
     };
     exceptedByPolicy: boolean; // maintained from the UI
+    // the frameworks (lowercase) whose exceptions alone cover the result; maintained from the UI
+    exceptedInFrameworks?: string[];
   }
   export interface Severities {
     critical: number;

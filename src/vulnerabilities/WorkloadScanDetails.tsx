@@ -2,7 +2,7 @@
   Show vulnerability scan results for a workload. 
 */
 import { Icon } from '@iconify/react';
-import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
+import { ApiError, request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import {
   DateLabel,
   NameValueTable,
@@ -10,10 +10,20 @@ import {
   ShowHideLabel,
 } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
 import { getCluster } from '@kinvolk/headlamp-plugin/lib/Utils';
-import { Button, Chip, FormControlLabel, Link, Stack, Switch } from '@mui/material';
+import {
+  Alert,
+  Button,
+  Chip,
+  FormControlLabel,
+  IconButton,
+  Stack,
+  Switch,
+  Tooltip,
+} from '@mui/material';
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { ErrorMessage } from '../common/ErrorMessage';
+import { errorMessage, errorStatus } from '../common/errors';
 import { vulnerabilityScanCommand } from '../common/operatorCommands';
-import { createExceptionCheck, Permitted, PermittedIconButton } from '../common/permissions';
 import { ScanNowButton } from '../common/ScanNowButton';
 import makeSeverityLabel from '../common/SeverityLabel';
 import HeadlampTable from '../common/Table';
@@ -31,11 +41,29 @@ import {
 } from '../exceptions/vulnerabilityExceptions';
 import { VulnerabilityManifest } from '../softwarecomposition/VulnerabilityManifest';
 import { VulnerabilityManifestSummary } from '../softwarecomposition/VulnerabilityManifestSummary';
-import { getCVESummary } from './CVESummary';
-import { AcceptRiskButton, ExceptionChip, useSecurityExceptions } from './exceptionChips';
+import { DataSourceLink, getCVESummary } from './CVESummary';
+import {
+  AcceptRiskButton,
+  ExceptionChip,
+  exceptionChipValue,
+  ExceptionReadErrors,
+  useSecurityExceptions,
+} from './exceptionChips';
+import { ExploitInfo, matchExploitIds } from './exploitData';
 import { ImageReference } from './ImageReference';
 import { imageSourceLabel } from './imageSource';
 import { imageVersionRows, useImageVersion, useImageVersionSettings } from './ImageVersion';
+import {
+  exploitColumns,
+  exploitCsvHeader,
+  exploitCsvValues,
+  ExploitDataErrors,
+  knownExploitedEmptyMessage,
+  KnownExploitedSwitch,
+  useExploitData,
+  withExploits,
+} from './KnownExploited';
+import { findingKey, relevantFindingKeys, uniqueFindingIds } from './relevance';
 import { getScanTime, getVulnerabilityReportCreatedAt } from './reportTimestamp';
 import { getManifestNamespace } from './scanData';
 
@@ -46,23 +74,32 @@ export default function KubescapeVulnerabilityDetails() {
   const [summary, setSummary] = useState<VulnerabilityManifestSummary | null>(null);
   const [manifestAll, setManifestAll] = useState<VulnerabilityManifest | null>(null);
   const [manifestRelevant, setManifestRelevant] = useState<VulnerabilityManifest | null>(null);
+  // the reports that could not be read, and why
+  const [reportErrors, setReportErrors] = useState<string[]>([]);
   const [scanStarted, setScanStarted] = useState(false);
   // changed to read the scan results again
   const [reloadKey, setReloadKey] = useState(0);
+  const [error, setError] = useState<ApiError | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setSummary(null);
     setManifestAll(null);
     setManifestRelevant(null);
+    setReportErrors([]);
+    setError(null);
     fetchVulnerabilityManifest(name, namespace, cluster)
-      .then(([summary, all, relevant]) => {
+      .then(([summary, all, relevant, errors]) => {
         if (cancelled) return;
         setSummary(summary);
         setManifestAll(all);
         setManifestRelevant(relevant);
+        setReportErrors(errors);
       })
-      .catch(error => console.error(error));
+      .catch(error => {
+        console.error(error);
+        if (!cancelled) setError(error);
+      });
     return () => {
       cancelled = true;
     };
@@ -70,12 +107,21 @@ export default function KubescapeVulnerabilityDetails() {
 
   const wlid = summary?.metadata.annotations?.['kubescape.io/wlid'];
 
+  if (error) {
+    return (
+      <SectionBox title="Vulnerabilities" backLink>
+        <ErrorMessage error={error} />
+      </SectionBox>
+    );
+  }
+
   return (
     summary && (
       <WorkloadVulnerabilities
         summary={summary}
         manifestAll={manifestAll}
         manifestRelevant={manifestRelevant}
+        reportErrors={reportErrors}
         cluster={cluster}
         scanActions={
           wlid &&
@@ -101,19 +147,37 @@ export default function KubescapeVulnerabilityDetails() {
   );
 }
 
-// A finding with the exception that covers it; hidden when kubevuln no longer counts it
-type Finding = VulnerabilityManifest.Match & { exception?: CveException; hidden?: boolean };
+// A finding with the exception that covers it; hidden when kubevuln no longer counts it. The
+// rowId is unique in the list, also for copies of a package at other paths. The exploit data
+// arrives later, with new rows.
+type Finding = VulnerabilityManifest.Match & {
+  exception?: CveException;
+  hidden?: boolean;
+  rowId: string;
+  exploit?: ExploitInfo;
+};
+
+// what the chip of the exception of a finding says about counting it
+function exceptionNote(finding: Finding): string | undefined {
+  if (!finding.exception) return undefined;
+  if (finding.hidden) return 'Kubescape no longer counts this finding.';
+  return isSuppressing(finding.exception.state)
+    ? 'Kubescape stops counting this finding at its next scan, when the riskAcceptance capability is enabled.'
+    : undefined;
+}
 
 function WorkloadVulnerabilities(
   props: Readonly<{
     summary: VulnerabilityManifestSummary;
     manifestAll: VulnerabilityManifest | null;
     manifestRelevant: VulnerabilityManifest | null;
+    // the reports that could not be read, and why
+    reportErrors: string[];
     cluster?: string;
     scanActions: ReactNode;
   }>
 ) {
-  const { summary, manifestAll, manifestRelevant, cluster, scanActions } = props;
+  const { summary, manifestAll, manifestRelevant, reportErrors, cluster, scanActions } = props;
   const workload = useMemo<ScannedWorkload>(
     () => ({
       kind: summary.metadata.labels['kubescape.io/workload-kind'],
@@ -123,7 +187,11 @@ function WorkloadVulnerabilities(
     }),
     [summary]
   );
-  const { exceptions, reload } = useSecurityExceptions([cluster ?? ''], [workload.kind]);
+  const {
+    exceptions,
+    errors: exceptionErrors,
+    reload,
+  } = useSecurityExceptions([cluster ?? ''], [workload.kind]);
   const exceptionData = exceptions.get(cluster ?? '');
   const [accepting, setAccepting] = useState(false);
   const versionSettings = useImageVersionSettings();
@@ -139,18 +207,19 @@ function WorkloadVulnerabilities(
     const covered = exceptionData
       ? workloadCveExceptions(exceptionData, workload)
       : new Map<string, CveException>();
-    return [
-      ...(manifestAll.spec.payload.matches ?? []).map(
-        (match): Finding => ({ ...match, exception: findingException(covered, match) })
-      ),
-      ...(manifestAll.spec.payload.ignoredMatches ?? []).map(
-        (match): Finding => ({
-          ...match,
-          hidden: true,
-          exception: findingException(covered, match) ?? ignoredMatchException(match),
-        })
-      ),
+    const list: Omit<Finding, 'rowId'>[] = [
+      ...(manifestAll.spec.payload.matches ?? []).map(match => ({
+        ...match,
+        exception: findingException(covered, match),
+      })),
+      ...(manifestAll.spec.payload.ignoredMatches ?? []).map(match => ({
+        ...match,
+        hidden: true,
+        exception: findingException(covered, match) ?? ignoredMatchException(match),
+      })),
     ];
+    const rowIds = uniqueFindingIds(list);
+    return list.map((finding, i): Finding => ({ ...finding, rowId: rowIds[i] }));
   }, [manifestAll, exceptionData, workload]);
   // the CVEs that kubevuln counts, which no exception hides
   const openCves = useMemo(
@@ -188,16 +257,17 @@ function WorkloadVulnerabilities(
   return (
     <>
       <SectionBox title="Vulnerabilities" backLink>
+        <ExceptionReadErrors errors={exceptionErrors} />
+        {reportErrors.map(message => (
+          <Alert key={message} severity="error" sx={{ mb: 1 }}>
+            Unable to read {message}
+          </Alert>
+        ))}
         {(scanActions || openCves.length > 0) && (
           <Stack direction="row" spacing={1} sx={{ mb: 1 }}>
             {scanActions}
             {openCves.length > 0 && (
-              <AcceptRiskButton
-                cveIds={openCves}
-                namespace={workload.namespace}
-                cluster={cluster}
-                onClick={() => setAccepting(true)}
-              />
+              <AcceptRiskButton cveIds={openCves} onClick={() => setAccepting(true)} />
             )}
           </Stack>
         )}
@@ -244,7 +314,7 @@ function WorkloadVulnerabilities(
             },
             {
               name: 'Type',
-              value: manifestAll?.spec.payload.source.type,
+              value: manifestAll?.spec.payload.source?.type,
             },
             {
               name: 'CVE',
@@ -288,15 +358,6 @@ function WorkloadVulnerabilities(
   );
 }
 
-function findingId(finding: Finding) {
-  return JSON.stringify([
-    finding.vulnerability.id,
-    finding.artifact.name,
-    finding.artifact.version,
-    !!finding.hidden,
-  ]);
-}
-
 function Matches(
   props: Readonly<{
     findings: Finding[];
@@ -320,30 +381,51 @@ function Matches(
     onExceptionCreated: reload,
   } = props;
 
+  // the EPSS scores of the findings with the highest CVSS score first
+  const cveIds = useMemo(
+    () =>
+      [...findings]
+        .sort((a, b) => cvssScore(b) - cvssScore(a))
+        .flatMap(finding => matchExploitIds(finding)),
+    [findings]
+  );
+  const exploitData = useExploitData(cveIds);
+  const { settings: exploitSettings } = exploitData;
+  const [exploitedOnly, setExploitedOnly] = useState(false);
+  const showExploitedOnly = exploitSettings.knownExploited && exploitedOnly;
+  // new rows when the exploit data arrives, so that the table draws them again
+  const rows = useMemo(
+    () => withExploits(findings, matchExploitIds, exploitData),
+    [findings, exploitData]
+  );
+
   // Severity links count all findings, so they open with the Relevant CVE switch off
   const [severity, clearSeverity] = useURLSearchParam('severity');
-  const results = findings.filter(match => !severity || match.vulnerability.severity === severity);
+  const results = rows.filter(match => !severity || match.vulnerability.severity === severity);
   const [isRelevantCVESwitchChecked, setIsRelevantCVESwitchChecked] = useState(!severity);
   const [selectedCve, setSelectedCve] = useState<string | null>(null);
   const [acceptedCves, setAcceptedCves] = useState<string[] | null>(null);
   const clearSelection = useRef<() => void>(() => {});
 
   // Without a relevant manifest all findings are shown. A relevant manifest without matches
-  // means that none of the findings is relevant.
-  const relevantIds = relevant
-    ? new Set(
-        [
-          ...(relevant.spec.payload.matches ?? []),
-          ...(relevant.spec.payload.ignoredMatches ?? []),
-        ].map(m => m.vulnerability.id)
-      )
-    : undefined;
+  // means that none of the findings is relevant. Relevance is per CVE and package, as a CVE of
+  // several packages can be relevant for only some of them.
+  const relevantKeys = useMemo(
+    () =>
+      relevant
+        ? relevantFindingKeys(relevant.spec.payload.matches, relevant.spec.payload.ignoredMatches)
+        : undefined,
+    [relevant]
+  );
   const isRelevant = (match: VulnerabilityManifest.Match) =>
-    !relevantIds ? 'Unknown' : relevantIds.has(match.vulnerability.id) ? 'Yes' : 'No';
-  const shown =
-    isRelevantCVESwitchChecked && relevantIds
-      ? results.filter(r => relevantIds.has(r.vulnerability.id))
+    !relevantKeys ? 'Unknown' : relevantKeys.has(findingKey(match)) ? 'Yes' : 'No';
+  const relevantShown =
+    isRelevantCVESwitchChecked && relevantKeys
+      ? results.filter(r => relevantKeys.has(findingKey(r)))
       : results;
+  const shown = showExploitedOnly
+    ? relevantShown.filter(finding => finding.exploit?.kev)
+    : relevantShown;
   const fixVersions = (match: VulnerabilityManifest.Match) =>
     Array.isArray(match.vulnerability.fix?.versions)
       ? match.vulnerability.fix.versions.join(', ')
@@ -351,8 +433,16 @@ function Matches(
   const exceptionLabel = (finding: Finding) =>
     finding.exception ? exceptionStateLabels[finding.exception.state] : '';
 
+  let emptyMessage: string | undefined;
+  if (shown.length === 0 && relevantShown.length > 0) {
+    emptyMessage = knownExploitedEmptyMessage(exploitData, 'findings');
+  } else if (shown.length === 0 && results.length > 0) {
+    emptyMessage = `None of the ${results.length} findings is relevant: Kubescape did not see the workload use the vulnerable packages. Switch off Relevant CVE to show them all.`;
+  }
+
   return (
     <SectionBox title="Findings">
+      <ExploitDataErrors data={exploitData} />
       <HeadlampTable
         toolbarStart={
           <>
@@ -360,9 +450,14 @@ function Matches(
               checked={isRelevantCVESwitchChecked}
               control={<Switch color="primary" />}
               label={'Relevant CVE'}
-              onChange={(event: any, checked: boolean) => {
+              onChange={(_event, checked) => {
                 setIsRelevantCVESwitchChecked(checked);
               }}
+            />
+            <KnownExploitedSwitch
+              settings={exploitSettings}
+              checked={exploitedOnly}
+              onChange={setExploitedOnly}
             />
             {severity && (
               <Chip label={`Only ${severity} findings`} onDelete={clearSeverity} size="small" />
@@ -375,6 +470,7 @@ function Matches(
             'Severity',
             'CVE',
             'CVSS',
+            ...exploitCsvHeader(exploitSettings),
             'Artifact',
             'Version',
             'Relevant',
@@ -387,7 +483,8 @@ function Matches(
             shown.map(match => [
               match.vulnerability.severity,
               match.vulnerability.id,
-              match.vulnerability.cvss?.[0]?.metrics.baseScore,
+              match.vulnerability.cvss?.[0]?.metrics?.baseScore,
+              ...exploitCsvValues(match.exploit, exploitSettings),
               match.artifact.name,
               match.artifact.version,
               isRelevant(match),
@@ -398,35 +495,31 @@ function Matches(
             ]),
         }}
         data={shown}
-        emptyMessage={
-          shown.length === 0 && results.length > 0
-            ? `None of the ${results.length} findings is relevant: Kubescape did not see the workload use the vulnerable packages. Switch off Relevant CVE to show them all.`
-            : undefined
-        }
+        emptyMessage={emptyMessage}
         columns={[
           {
             header: 'Severity',
             accessorKey: 'vulnerability.severity',
-            Cell: ({ cell }: any) => makeSeverityLabel(cell.getValue()),
+            Cell: ({ cell }) => makeSeverityLabel(cell.getValue()),
             gridTemplate: 'auto',
           },
           {
             header: 'CVE',
             accessorKey: 'vulnerability.id',
-            Cell: ({ cell }: any) => (
-              <Link target="_blank" href={cell.row.original.vulnerability.dataSource}>
+            Cell: ({ cell }) => (
+              <DataSourceLink href={cell.row.original.vulnerability.dataSource}>
                 {cell.getValue()}
-              </Link>
+              </DataSourceLink>
             ),
             gridTemplate: 'auto',
           },
           {
             id: 'Score',
             header: 'CVSS',
-            accessorFn: (match: VulnerabilityManifest.Match) =>
-              match.vulnerability.cvss ? match.vulnerability.cvss[0].metrics.baseScore : 0,
+            accessorFn: cvssScore,
             gridTemplate: 'auto',
           },
+          ...exploitColumns<Finding>(exploitSettings),
           {
             header: 'Artifact',
             accessorKey: 'artifact.name',
@@ -455,37 +548,45 @@ function Matches(
           {
             id: 'Exception',
             header: 'Exception',
-            accessorFn: exceptionLabel,
-            Cell: ({ row }: any) => {
-              const { exception, hidden } = row.original as Finding;
-              if (!exception) return null;
-              let note: string | undefined;
-              if (hidden) note = 'Kubescape no longer counts this finding.';
-              else if (isSuppressing(exception.state)) {
-                note =
-                  'Kubescape stops counting this finding at its next scan, when the riskAcceptance capability is enabled.';
-              }
-              return <ExceptionChip exception={exception} cluster={cluster} note={note} />;
+            // the label, the name and the rest of what the chip shows, so that the chip is drawn
+            // again for another exception
+            accessorFn: (finding: Finding) =>
+              exceptionChipValue(finding.exception, exceptionNote(finding)),
+            Cell: ({ row }) => {
+              const finding = row.original as Finding;
+              if (!finding.exception) return null;
+              return (
+                <ExceptionChip
+                  exception={finding.exception}
+                  cluster={cluster}
+                  note={exceptionNote(finding)}
+                />
+              );
             },
             gridTemplate: 'auto',
           },
           {
             header: 'Description',
             accessorKey: 'vulnerability.description',
-            Cell: ({ cell }: any) => <ShowHideLabel>{cell.getValue()}</ShowHideLabel>,
+            Cell: ({ cell }) => <ShowHideLabel>{cell.getValue()}</ShowHideLabel>,
           },
           {
+            id: 'actions',
             header: '',
-            accessorFn: () => '',
-            // rendered for the rows on the page only
-            Cell: ({ row }: any) => (
-              <PermittedIconButton
-                check={createExceptionCheck(workloadNamespace)}
-                title="Create Vulnerability Exception"
-                onClick={() => setSelectedCve(row.original.vulnerability.id)}
-              >
-                <Icon icon="mdi:shield-plus-outline" />
-              </PermittedIconButton>
+            // a value per finding, so that the button of each row is its own
+            accessorFn: (finding: Finding) => finding.rowId,
+            // rendered for the rows on the page only; the form also offers the exception as
+            // YAML, so it opens without the permission to create one
+            Cell: ({ row }) => (
+              <Tooltip title="Create Vulnerability Exception">
+                <IconButton
+                  size="small"
+                  aria-label="Create Vulnerability Exception"
+                  onClick={() => setSelectedCve(row.original.vulnerability.id)}
+                >
+                  <Icon icon="mdi:shield-plus-outline" />
+                </IconButton>
+              </Tooltip>
             ),
             gridTemplate: 'min-content',
           },
@@ -499,26 +600,21 @@ function Matches(
           ],
         }}
         enableRowSelection
-        getRowId={findingId}
+        getRowId={finding => finding.rowId}
         renderRowSelectionToolbar={({ table }) => {
           const selected = [
             ...new Set(table.getSelectedRowModel().rows.map(row => row.original.vulnerability.id)),
           ];
           clearSelection.current = () => table.resetRowSelection();
           return (
-            <Permitted check={createExceptionCheck(workloadNamespace)} cluster={cluster}>
-              {allowed => (
-                <Button
-                  variant="contained"
-                  size="small"
-                  disabled={!allowed}
-                  startIcon={<Icon icon="mdi:shield-check-outline" />}
-                  onClick={() => setAcceptedCves(selected)}
-                >
-                  Accept the risk of {selected.length} {selected.length === 1 ? 'CVE' : 'CVEs'}
-                </Button>
-              )}
-            </Permitted>
+            <Button
+              variant="contained"
+              size="small"
+              startIcon={<Icon icon="mdi:shield-check-outline" />}
+              onClick={() => setAcceptedCves(selected)}
+            >
+              Accept the risk of {selected.length} {selected.length === 1 ? 'CVE' : 'CVEs'}
+            </Button>
           );
         }}
       />
@@ -556,51 +652,74 @@ function Matches(
   );
 }
 
-// Full reports carry evaluation times; the summary only supplies their references.
+function cvssScore(match: VulnerabilityManifest.Match): number {
+  return match.vulnerability.cvss?.[0]?.metrics?.baseScore ?? 0;
+}
+
+// Full reports carry evaluation times; the summary only supplies their references. The last
+// item says which of the reports could not be read, and why, for the page to show.
 export async function fetchVulnerabilityManifest(
   name: string,
   namespace: string,
   cluster?: string
 ): Promise<
-  [VulnerabilityManifestSummary, VulnerabilityManifest | null, VulnerabilityManifest | null]
+  [
+    VulnerabilityManifestSummary,
+    VulnerabilityManifest | null,
+    VulnerabilityManifest | null,
+    string[]
+  ]
 > {
   const summary: VulnerabilityManifestSummary = await request(
     `/apis/spdx.softwarecomposition.kubescape.io/v1beta1/namespaces/${namespace}/vulnerabilitymanifestsummaries/${name}`,
     { cluster }
   );
+  const errors: string[] = [];
 
-  async function getManifest(reference?: {
-    name?: string;
-    namespace?: string;
-  }): Promise<VulnerabilityManifest | null> {
+  async function getManifest(
+    what: string,
+    reference?: {
+      name?: string;
+      namespace?: string;
+    }
+  ): Promise<VulnerabilityManifest | null> {
     if (!reference?.name) return null;
     const read = (namespace: string) =>
       request(
         `/apis/spdx.softwarecomposition.kubescape.io/v1beta1/namespaces/${namespace}/vulnerabilitymanifests/${reference.name}`,
         { cluster }
       );
+    const failed = (error: unknown) => {
+      console.error(error);
+      errors.push(`${what} (${reference.name}): ${errorMessage(error)}`);
+      return null;
+    };
     const referenced = getManifestNamespace(reference);
     try {
       return await read(referenced);
-    } catch (error: any) {
-      // the storage may keep the report in the operator namespace instead of the referenced one
-      if (error?.status === 404) {
-        const { kubeScapeNamespace } = await getKubescapeNamespace(cluster ?? getCluster());
-        if (kubeScapeNamespace && kubeScapeNamespace !== referenced) {
-          try {
-            return await read(kubeScapeNamespace);
-          } catch (fallbackError) {
-            console.error(fallbackError);
-            return null;
-          }
-        }
+    } catch (error) {
+      if (errorStatus(error) !== 404) return failed(error);
+      // the storage may keep the report in the operator namespace instead of the referenced one;
+      // like the list of the workloads, it looks in the default namespace of Kubescape while the
+      // operator namespace cannot be looked up
+      const operator = await getKubescapeNamespace(cluster ?? getCluster()).then(
+        found => found.kubeScapeNamespace,
+        () => undefined
+      );
+      const fallback = operator || getManifestNamespace({});
+      if (fallback === referenced) return failed(error);
+      try {
+        return await read(fallback);
+      } catch (fallbackError) {
+        return failed(fallbackError);
       }
-      console.error(error);
-      return null;
     }
   }
 
-  const all = await getManifest(summary.spec.vulnerabilitiesRef?.all);
-  const relevant = await getManifest(summary.spec.vulnerabilitiesRef?.relevant);
-  return [summary, all, relevant];
+  const all = await getManifest('the report of the image', summary.spec.vulnerabilitiesRef?.all);
+  const relevant = await getManifest(
+    'the report of the relevant findings',
+    summary.spec.vulnerabilitiesRef?.relevant
+  );
+  return [summary, all, relevant, errors];
 }

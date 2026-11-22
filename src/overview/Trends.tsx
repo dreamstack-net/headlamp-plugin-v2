@@ -1,13 +1,15 @@
 /*
   Failed controls and CVEs over time, from the Kubescape Prometheus exporter.
 */
-import { SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
+import { Icon } from '@iconify/react';
+import { Link as HeadlampLink, SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
 import {
   Alert,
   Box,
   Button,
   Chip,
   Grid,
+  IconButton,
   MenuItem,
   Paper,
   Stack,
@@ -27,14 +29,31 @@ import {
   CartesianGrid,
   Line,
   LineChart,
+  ReferenceArea,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from 'recharts';
+import { CompactTable } from '../common/CompactTable';
 import { getPrometheusUrl, kubescapeConfigStore } from '../common/config-store';
-import { useHLSelectedClusters } from '../index';
+import { errorMessage } from '../common/errors';
+import { RoutingName, useHLSelectedClusters } from '../index';
 import { dailyRows, detectPrometheus, fetchTrends, TrendKey, TrendRow } from './prometheus';
+import {
+  appearedOrWent,
+  fetchScanSchedule,
+  fetchTrendChanges,
+  largestChange,
+  lastScanStart,
+  likelyCause,
+  NamespaceChange,
+  scanNear,
+  ScanSchedule,
+  TrendChanges,
+  TrendInterval,
+  TrendKind,
+} from './trendChanges';
 
 const ranges = [7, 30, 90];
 
@@ -81,7 +100,10 @@ export function TrendsSection() {
   const [chosenCluster, setChosenCluster] = useState(clusters[0]);
   const cluster = clusters.includes(chosenCluster) ? chosenCluster : clusters[0];
   const [days, setDays] = useState(30);
-  const [rows, setRows] = useState<TrendRow[] | null>(null);
+  // the rows with the cluster they are of: the rows of the cluster chosen before are not shown
+  // under the name of another cluster while that one is read
+  const [trends, setTrends] = useState<{ cluster: string; rows: TrendRow[] } | null>(null);
+  const rows = trends?.cluster === cluster ? trends.rows : null;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [showTable, setShowTable] = useState(false);
@@ -93,12 +115,12 @@ export function TrendsSection() {
     setError('');
     fetchTrends(cluster, days)
       .then(found => {
-        if (active) setRows(found);
+        if (active) setTrends({ cluster, rows: found });
       })
       .catch(err => {
         if (!active) return;
-        setRows(null);
-        setError(err?.message ?? String(err));
+        setTrends(null);
+        setError(errorMessage(err));
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -162,9 +184,9 @@ export function TrendsSection() {
       )}
       {!error && rows?.length === 0 && <NoMetrics cluster={cluster} />}
       {!error && rows && rows.length > 0 && (
-        // while new data loads, the previous charts stay, dimmed
+        // while another range of the cluster loads, the previous charts stay, dimmed
         <Box sx={{ opacity: loading ? 0.5 : 1, transition: 'opacity 0.2s' }}>
-          <TrendCharts rows={rows} />
+          <TrendCharts rows={rows} cluster={cluster} />
           {showTable && <TrendTable rows={rows} />}
         </Box>
       )}
@@ -172,34 +194,64 @@ export function TrendsSection() {
   );
 }
 
-function TrendCharts(props: Readonly<{ rows: TrendRow[] }>) {
-  const { rows } = props;
+// the change of a chart that its panel explains
+interface Selection {
+  kind: TrendKind;
+  interval: TrendInterval;
+}
+
+function TrendCharts(props: Readonly<{ rows: TrendRow[]; cluster: string }>) {
+  const { rows, cluster } = props;
   const theme = useTheme();
   const [critical, high] = seriesColors[theme.palette.mode === 'dark' ? 'dark' : 'light'];
+  const [selection, setSelection] = useState<Selection | null>(null);
+
+  // another range or cluster has other points
+  useEffect(() => setSelection(null), [rows, cluster]);
+
+  const select = (kind: TrendKind) => (interval: TrendInterval) => setSelection({ kind, interval });
 
   return (
-    <Grid container spacing={4}>
-      <Grid item xs={12} lg={6}>
-        <TrendChart
-          title="Failed controls"
-          rows={rows}
-          series={[
-            { key: 'controlsCritical', label: 'Critical', color: critical },
-            { key: 'controlsHigh', label: 'High', color: high },
-          ]}
-        />
+    <>
+      <Grid container spacing={4}>
+        <Grid item xs={12} lg={6}>
+          <TrendChart
+            title="Failed controls"
+            kind="controls"
+            rows={rows}
+            series={[
+              { key: 'controlsCritical', label: 'Critical', color: critical },
+              { key: 'controlsHigh', label: 'High', color: high },
+            ]}
+            selected={selection?.kind === 'controls' ? selection.interval : undefined}
+            onSelect={select('controls')}
+          />
+        </Grid>
+        <Grid item xs={12} lg={6}>
+          <TrendChart
+            title="CVEs"
+            kind="cves"
+            rows={rows}
+            series={[
+              { key: 'cvesCritical', label: 'Critical', color: critical },
+              { key: 'cvesHigh', label: 'High', color: high },
+            ]}
+            selected={selection?.kind === 'cves' ? selection.interval : undefined}
+            onSelect={select('cves')}
+          />
+        </Grid>
       </Grid>
-      <Grid item xs={12} lg={6}>
-        <TrendChart
-          title="CVEs"
-          rows={rows}
-          series={[
-            { key: 'cvesCritical', label: 'Critical', color: critical },
-            { key: 'cvesHigh', label: 'High', color: high },
-          ]}
+      {selection && (
+        <ChangePanel
+          // a new panel for each change, so that the answer of an earlier one is not shown
+          key={`${selection.kind}-${selection.interval.before}-${selection.interval.after}`}
+          cluster={cluster}
+          kind={selection.kind}
+          interval={selection.interval}
+          onClose={() => setSelection(null)}
         />
-      </Grid>
-    </Grid>
+      )}
+    </>
   );
 }
 
@@ -209,8 +261,19 @@ function LineKey(props: Readonly<{ color: string }>) {
   );
 }
 
-function TrendChart(props: Readonly<{ title: string; rows: TrendRow[]; series: Series[] }>) {
-  const { title, rows, series } = props;
+function TrendChart(
+  props: Readonly<{
+    title: string;
+    kind: TrendKind;
+    rows: TrendRow[];
+    series: Series[];
+    // the change whose namespaces the panel shows
+    selected?: TrendInterval;
+    onSelect: (interval: TrendInterval) => void;
+  }>
+) {
+  const { title, kind, rows, series, selected, onSelect } = props;
+  const largest = largestChange(rows, kind);
   const theme = useTheme();
   const muted = theme.palette.text.secondary;
   const surface = theme.palette.background.paper;
@@ -243,9 +306,42 @@ function TrendChart(props: Readonly<{ title: string; rows: TrendRow[]; series: S
           </Stack>
         ))}
       </Stack>
+      <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+        <Typography variant="caption" color="text.secondary">
+          Choose a point to see which namespaces changed there, or
+        </Typography>
+        <Button
+          size="small"
+          disabled={!largest}
+          onClick={() => largest && onSelect(largest)}
+          sx={{ textTransform: 'none', py: 0 }}
+        >
+          explain the largest change
+        </Button>
+      </Stack>
       <ResponsiveContainer width="100%" height={240}>
-        <LineChart data={rows} margin={{ top: 8, right: 40, bottom: 0, left: 0 }}>
+        <LineChart
+          data={rows}
+          margin={{ top: 8, right: 40, bottom: 0, left: 0 }}
+          // a click explains the largest change around the point it is nearest to
+          onClick={(state: any) => {
+            const index = state?.activeTooltipIndex;
+            const interval =
+              typeof index === 'number' ? largestChange(rows, kind, index) : undefined;
+            if (interval) onSelect(interval);
+          }}
+          style={{ cursor: 'pointer' }}
+        >
           <CartesianGrid vertical={false} stroke={theme.palette.divider} />
+          {selected && (
+            <ReferenceArea
+              x1={selected.before}
+              x2={selected.after}
+              fill={muted}
+              fillOpacity={0.15}
+              ifOverflow="extendDomain"
+            />
+          )}
           <XAxis
             dataKey="time"
             type="number"
@@ -329,6 +425,220 @@ function TrendTooltip(props: Readonly<{ time: number; series: Series[]; row: Tre
           </Typography>
         </Stack>
       ))}
+    </Paper>
+  );
+}
+
+/** The change of a total from one point to the other, red when it rose. */
+function Delta(props: Readonly<{ before?: number; after?: number }>) {
+  const diff = (props.after ?? 0) - (props.before ?? 0);
+  let color = 'text.secondary';
+  if (diff > 0) color = 'error.main';
+  else if (diff < 0) color = 'success.main';
+  return (
+    <Box component="span" sx={{ color, fontWeight: 600, whiteSpace: 'nowrap' }}>
+      {diff > 0 ? '+' : ''}
+      {diff.toLocaleString()}
+    </Box>
+  );
+}
+
+function TotalChange(props: Readonly<{ before?: number; after?: number }>) {
+  const { before, after } = props;
+  return (
+    <Stack direction="row" spacing={1} alignItems="baseline" component="span">
+      <Box component="span" sx={{ whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums' }}>
+        {before?.toLocaleString() ?? '–'} → {after?.toLocaleString() ?? '–'}
+      </Box>
+      <Delta before={before} after={after} />
+    </Stack>
+  );
+}
+
+function hoursText(milliseconds: number): string {
+  const hours = Math.round(milliseconds / 3600_000);
+  if (hours < 1) return 'less than an hour';
+  return `${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+}
+
+/** When the daily scan of the chart ran, next to the interval. */
+function ScanLine(
+  props: Readonly<{ schedule: ScanSchedule; kind: TrendKind; interval: TrendInterval }>
+) {
+  const { schedule, kind, interval } = props;
+  const what = kind === 'cves' ? 'vulnerability rescan of all images' : 'configuration scan';
+  const start = lastScanStart(schedule, interval.after);
+  if (start === undefined || schedule.hour === undefined || schedule.minute === undefined) {
+    return (
+      <Typography variant="body2" color="text.secondary">
+        The {what} ({schedule.cronJob}) runs on the schedule {schedule.schedule}.
+      </Typography>
+    );
+  }
+  const at = `${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(
+    2,
+    '0'
+  )} UTC`;
+  return (
+    <Typography variant="body2" color="text.secondary">
+      The daily {what} ({schedule.cronJob}, {at}) last started {formatTime(start)}
+      {start > interval.before
+        ? ', within this interval.'
+        : `, ${hoursText(interval.before - start)} before it.`}
+    </Typography>
+  );
+}
+
+// the namespaces the panel lists before Show all
+const shownNamespaces = 10;
+
+/**
+ * Which namespaces changed between two points of a chart, from the namespace totals of the
+ * exporter, with the time of the daily scan and what most likely caused the change.
+ */
+function ChangePanel(
+  props: Readonly<{
+    cluster: string;
+    kind: TrendKind;
+    interval: TrendInterval;
+    onClose: () => void;
+  }>
+) {
+  const { cluster, kind, interval, onClose } = props;
+  const [found, setFound] = useState<TrendChanges | null>(null);
+  const [schedule, setSchedule] = useState<ScanSchedule | undefined>();
+  const [error, setError] = useState('');
+  const [all, setAll] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    fetchTrendChanges(cluster, kind, interval)
+      .then(result => active && setFound(result))
+      .catch(err => active && setError(errorMessage(err)));
+    fetchScanSchedule(cluster, kind).then(result => active && setSchedule(result));
+    return () => {
+      active = false;
+    };
+  }, [cluster, kind, interval]);
+
+  const what = kind === 'cves' ? 'CVEs' : 'failed controls';
+  const sum = (pick: (item: NamespaceChange) => number | undefined) =>
+    found?.changes.reduce((total, item) => total + (pick(item) ?? 0), 0) ?? 0;
+  const shown = all ? found?.changes : found?.changes.slice(0, shownNamespaces);
+
+  return (
+    <Paper variant="outlined" sx={{ p: 2, mt: 3 }}>
+      <Stack direction="row" spacing={1} alignItems="flex-start">
+        <Box sx={{ flexGrow: 1 }}>
+          <Typography variant="subtitle1" component="h3">
+            What changed in the {what}
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            Between {formatTime(interval.before)} and {formatTime(interval.after)}, in {cluster}
+          </Typography>
+        </Box>
+        <IconButton aria-label="Close" onClick={onClose}>
+          <Icon icon="mdi:close" />
+        </IconButton>
+      </Stack>
+      {error && (
+        <Alert severity="error" sx={{ mt: 1 }}>
+          Unable to read the totals of the namespaces from Prometheus: {error}
+        </Alert>
+      )}
+      {!error && !found && (
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
+          Reading the totals of the namespaces…
+        </Typography>
+      )}
+      {found && (
+        <Stack spacing={1} sx={{ mt: 1 }}>
+          <Typography variant="body2" component="div">
+            <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap>
+              <span>
+                Critical{' '}
+                <Delta
+                  before={sum(item => item.before.critical)}
+                  after={sum(item => item.after.critical)}
+                />
+              </span>
+              <span>
+                High{' '}
+                <Delta
+                  before={sum(item => item.before.high)}
+                  after={sum(item => item.after.high)}
+                />
+              </span>
+              <span>
+                in {found.changes.length} of {found.namespaceCount}{' '}
+                {found.namespaceCount === 1 ? 'namespace' : 'namespaces'}
+              </span>
+            </Stack>
+          </Typography>
+          {schedule && <ScanLine schedule={schedule} kind={kind} interval={interval} />}
+          <Alert severity="info" icon={<Icon icon="mdi:lightbulb-outline" />}>
+            {likelyCause(found, kind, scanNear(schedule, interval))}
+          </Alert>
+          {found.changes.length > 0 && (
+            <CompactTable
+              rows={shown ?? []}
+              rowKey={item => item.namespace}
+              columns={[
+                {
+                  header: 'Namespace',
+                  cell: item => {
+                    const state = appearedOrWent(item);
+                    return (
+                      <Stack direction="row" spacing={1} alignItems="center">
+                        {state === 'gone' ? (
+                          <span>{item.namespace}</span>
+                        ) : (
+                          <HeadlampLink
+                            routeName={
+                              kind === 'cves'
+                                ? RoutingName.VulnerabilitiesNamespaceSummary
+                                : RoutingName.KubescapeConfigurationScanNamespaceSummary
+                            }
+                            params={{ namespace: item.namespace }}
+                            activeCluster={cluster}
+                          >
+                            {item.namespace}
+                          </HeadlampLink>
+                        )}
+                        {state && (
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            color={state === 'new' ? 'warning' : 'default'}
+                            label={state}
+                          />
+                        )}
+                      </Stack>
+                    );
+                  },
+                },
+                {
+                  header: 'Critical',
+                  cell: item => (
+                    <TotalChange before={item.before.critical} after={item.after.critical} />
+                  ),
+                },
+                {
+                  header: 'High',
+                  cell: item => <TotalChange before={item.before.high} after={item.after.high} />,
+                },
+              ]}
+            />
+          )}
+          {!all && found.changes.length > shownNamespaces && (
+            <Box>
+              <Button size="small" onClick={() => setAll(true)}>
+                Show all {found.changes.length} namespaces
+              </Button>
+            </Box>
+          )}
+        </Stack>
+      )}
     </Paper>
   );
 }

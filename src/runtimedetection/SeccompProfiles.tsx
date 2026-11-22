@@ -11,13 +11,16 @@ import { getCluster } from '@kinvolk/headlamp-plugin/lib/Utils';
 import { Alert, Box, Button, Typography } from '@mui/material';
 import { useSnackbar } from 'notistack';
 import { useEffect, useState } from 'react';
+import { getAllowedNamespaces } from '../common/clusterContext';
 import { ClusterErrors } from '../common/ClusterErrors';
 import { clusterColumns, useItemsInClusters } from '../common/clusters';
+import { errorMessage } from '../common/errors';
 import { saveToFile } from '../common/filedialog';
 import HeadlampTable from '../common/Table';
 import { getURLSegments } from '../common/url';
 import { RoutingName } from '../index';
-import { fetchObject, listQuery } from '../model';
+import { fetchObject, listQueryWithErrors, seccompProfileStorageClass } from '../model';
+import { fullSpecListQuery } from '../query';
 import { SeccompProfile } from '../softwarecomposition/SeccompProfile';
 import {
   allowedSyscalls,
@@ -33,9 +36,14 @@ function workloadName(profile: SeccompProfile) {
 }
 
 export function SeccompProfilesTab() {
-  const { items, errors, loading, clusters } = useItemsInClusters<SeccompProfile>(async cluster =>
-    listQuery(await discoverSeccompProfileClass(cluster), cluster)
-  );
+  const { items, errors, loading, clusters } = useItemsInClusters<SeccompProfile>(async cluster => {
+    const profileClass = await discoverSeccompProfileClass(cluster);
+    // the storage lists only the metadata of its objects, unless the list asks for the spec;
+    // either way, namespaces that could not be read are shown with the cluster errors
+    return profileClass === seccompProfileStorageClass
+      ? fullSpecListQuery(cluster, profileClass, getAllowedNamespaces(cluster))
+      : listQueryWithErrors(profileClass, cluster);
+  });
 
   return (
     <>
@@ -47,15 +55,23 @@ export function SeccompProfilesTab() {
       {!loading && errors.length === 0 && items.length === 0 && (
         <Typography variant="body2">No seccomp profiles found.</Typography>
       )}
-      {errors.length < clusters.length && (
+      {/* also for a cluster that was read in part, whose error names what could not be read */}
+      {(items.length > 0 || errors.length < clusters.length) && (
         <HeadlampTable
           data={items}
+          getRowId={(profile: SeccompProfile) =>
+            JSON.stringify([
+              profile.metadata.cluster,
+              profile.metadata.namespace,
+              profile.metadata.name,
+            ])
+          }
           columns={[
             {
               id: 'name',
               header: 'Name',
               accessorFn: workloadName,
-              Cell: ({ cell, row }: any) => (
+              Cell: ({ cell, row }) => (
                 <HeadlampLink
                   routeName={RoutingName.SeccompProfileDetail}
                   activeCluster={row.original.metadata.cluster}
@@ -126,7 +142,7 @@ export function SeccompProfileDetail() {
         if (active) setProfile(result);
       })
       .catch(err => {
-        if (active) setError(err?.message ?? String(err));
+        if (active) setError(errorMessage(err));
       });
     return () => {
       active = false;

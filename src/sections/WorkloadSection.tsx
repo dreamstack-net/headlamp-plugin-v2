@@ -4,6 +4,7 @@
 import { Link, NameValueTable, SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
 import { KubeObject } from '@kinvolk/headlamp-plugin/lib/k8s/KubeObject';
 import { useEffect, useState } from 'react';
+import { useStorageObject } from '../common/readOnce';
 import { getControlsSummary } from '../compliance/ControlsSummary';
 import { RoutingName } from '../index';
 import {
@@ -12,7 +13,9 @@ import {
   workloadConfigurationScanSummaryClass,
 } from '../model';
 import { getCVESummary } from '../vulnerabilities/CVESummary';
-import { findScannedWorkload, WorkloadRef } from './scannedWorkload';
+import { ExceptionsNote } from './ExceptionsNote';
+import { findScannedWorkload, scannedWorkloadCandidates, WorkloadRef } from './scannedWorkload';
+import { useFailedControlCounts } from './workloadSummaries';
 
 // Workload kinds with Kubescape results, with the location of their pod spec. Pods show the
 // results of the workload that runs them.
@@ -60,6 +63,12 @@ function KubescapeInfo(props: Readonly<{ resource: KubeObject }>) {
   const { resource } = props;
   const isPod = resource.kind === 'Pod';
   const [podWorkload, setPodWorkload] = useState<WorkloadRef | null>(null);
+  // the workload of a pod follows from its name and owners, which stay the same while the pod
+  // is watched and its status changes
+  const metadata = resource.jsonData.metadata;
+  const ownerKey = isPod
+    ? JSON.stringify([metadata.namespace, metadata.name, metadata.ownerReferences ?? []])
+    : '';
 
   useEffect(() => {
     if (!isPod) return;
@@ -70,15 +79,17 @@ function KubescapeInfo(props: Readonly<{ resource: KubeObject }>) {
     return () => {
       active = false;
     };
-  }, [isPod, resource.jsonData, resource.cluster]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPod, ownerKey, resource.cluster]);
 
   if (isPod && !podWorkload) {
     return <></>;
   }
+  // the workload itself, or for a Job of a CronJob the CronJob, which its owner names
   return (
     <ScanResults
       resource={resource}
-      workload={podWorkload ?? { kind: resource.kind, name: resource.jsonData.metadata.name }}
+      workload={podWorkload ?? scannedWorkloadCandidates({ kind: resource.kind, metadata })[0]}
     />
   );
 }
@@ -91,9 +102,19 @@ function ScanResults(props: Readonly<{ resource: KubeObject; workload: WorkloadR
   const scanName = `${workload.kind.toLowerCase()}-${workload.name.toLowerCase()}`;
   const [vulnerabilityScans, setVulnerabilityScans] = useState<any[] | null>(null);
 
-  const [configurationScan] = workloadConfigurationScanSummaryClass.useGet(scanName, namespace, {
-    cluster: resource.cluster,
-  });
+  // read once: a watch of the storage would replace the summary with one without its controls
+  const { data: configurationScan } = useStorageObject(
+    workloadConfigurationScanSummaryClass,
+    scanName,
+    namespace,
+    resource.cluster
+  );
+  // the failed controls without those that exceptions exclude, also where the plugin applies
+  // the exceptions itself
+  const { counts: controlCounts, exceptionsError } = useFailedControlCounts(
+    resource.cluster,
+    configurationScan
+  );
 
   const podSpec = podSpecGetters[kind]?.(resource.jsonData.spec);
   const manifestNames: string[] = [
@@ -145,7 +166,14 @@ function ScanResults(props: Readonly<{ resource: KubeObject; workload: WorkloadR
           Compliance
         </Link>
       ),
-      value: getControlsSummary(configurationScan.jsonData),
+      value: controlCounts ? (
+        <>
+          {getControlsSummary(controlCounts)}
+          <ExceptionsNote error={exceptionsError} />
+        </>
+      ) : (
+        'Reading the security exceptions…'
+      ),
     });
   }
 
@@ -159,6 +187,9 @@ function ScanResults(props: Readonly<{ resource: KubeObject; workload: WorkloadR
               name: vulnerabilityScan.metadata.name,
               namespace: namespace,
             }}
+            // the page reads the first cluster of the address, which in Headlamp's details drawer
+            // is not the cluster of the workload
+            activeCluster={resource.cluster}
           >
             {`Vulnerabilities / ${
               vulnerabilityScan.metadata.labels

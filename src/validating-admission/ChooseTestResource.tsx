@@ -1,4 +1,3 @@
-import { getAllowedNamespaces } from '@kinvolk/headlamp-plugin/lib/k8s/cluster';
 import {
   Autocomplete,
   FormControl,
@@ -9,10 +8,12 @@ import {
   ToggleButtonGroup,
 } from '@mui/material';
 import * as yaml from 'js-yaml';
-import { useContext, useEffect, useState } from 'react';
-import { getKubescapePluginUrl } from '../common/PluginHelper';
+import { useEffect, useRef, useState } from 'react';
+import { getAllowedNamespaces } from '../common/clusterContext';
+import { errorMessage } from '../common/errors';
 import { fetchResource, listResources, resourceKinds, ResourceRef } from './clusterResources';
-import { CurrentEvalContext } from './ValidatingAdmissionPolicy';
+import { fetchPluginFile } from './samples';
+import { useEvalContext } from './ValidatingAdmissionPolicy';
 
 export function ChooseTestResource() {
   const [source, setSource] = useState<'samples' | 'cluster'>('samples');
@@ -35,19 +36,30 @@ export function ChooseTestResource() {
 }
 
 function ChooseSampleResource() {
-  const { setResource } = useContext<any>(CurrentEvalContext);
+  const { setResource } = useEvalContext();
   const [testFiles, setTestFiles] = useState<unknown[]>([]);
   const [testFileNames, setTestFileNames] = useState<string[]>([]);
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    getKubescapePluginUrl().then(baseUrl => {
-      fetch(baseUrl + '/vap-test-files.yaml')
-        .then(response => response.text())
-        .then(data => setTestFiles(yaml.loadAll(data)));
-      fetch(baseUrl + '/vap-test-files-index.yaml')
-        .then(response => response.text())
-        .then(data => setTestFileNames(data.split(/\r?\n/)));
-    });
+    let active = true;
+    // the index names the resources of the test files in their order
+    Promise.all([
+      fetchPluginFile('vap-test-files.yaml'),
+      fetchPluginFile('vap-test-files-index.yaml'),
+    ])
+      .then(([files, index]) => {
+        if (!active) return;
+        setTestFiles(yaml.loadAll(files));
+        // the index ends with a line break, which is no name
+        setTestFileNames(index.split(/\r?\n/).filter(name => name.trim() !== ''));
+      })
+      .catch(err => {
+        if (active) setError(`Unable to read the test resources: ${errorMessage(err)}`);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const handleChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -61,7 +73,14 @@ function ChooseSampleResource() {
 
   return (
     <FormControl variant="outlined" sx={{ width: 480 }}>
-      <TextField select value={selectedValue} onChange={handleChange} label="Choose Test Resource">
+      <TextField
+        select
+        value={selectedValue}
+        onChange={handleChange}
+        label="Choose Test Resource"
+        error={!!error}
+        helperText={error}
+      >
         {testFileNames.map((fileName, indx) => (
           <MenuItem key={indx} value={fileName}>
             {fileName}
@@ -78,14 +97,17 @@ function refLabel(ref: ResourceRef) {
 
 /** Picks an object of the current cluster as the test resource. */
 function ChooseClusterResource() {
-  const { setResource } = useContext<any>(CurrentEvalContext);
+  const { setResource } = useEvalContext();
   const [kind, setKind] = useState('Deployment');
   const [refs, setRefs] = useState<ResourceRef[] | null>(null);
   const [error, setError] = useState('');
   const [selected, setSelected] = useState<ResourceRef | null>(null);
+  // the read of the resource chosen last; the answers for earlier choices are not used
+  const latestRead = useRef(0);
 
   useEffect(() => {
     let active = true;
+    latestRead.current++;
     setRefs(null);
     setSelected(null);
     setError('');
@@ -94,19 +116,28 @@ function ChooseClusterResource() {
       .catch(err => {
         if (!active) return;
         setRefs([]);
-        setError(`Unable to list ${resourceKinds[kind].plural}: ${err?.message ?? err}`);
+        setError(`Unable to list ${resourceKinds[kind].plural}: ${errorMessage(err)}`);
       });
     return () => {
       active = false;
+      latestRead.current++;
     };
   }, [kind]);
 
   const choose = (ref: ResourceRef | null) => {
+    const read = ++latestRead.current;
     setSelected(ref);
+    setError('');
     if (!ref) return;
     fetchResource(kind, ref)
-      .then(object => setResource(object))
-      .catch(err => setError(`Unable to read ${refLabel(ref)}: ${err?.message ?? err}`));
+      .then(object => {
+        if (read === latestRead.current) setResource(object);
+      })
+      .catch(err => {
+        if (read === latestRead.current) {
+          setError(`Unable to read ${refLabel(ref)}: ${errorMessage(err)}`);
+        }
+      });
   };
 
   return (

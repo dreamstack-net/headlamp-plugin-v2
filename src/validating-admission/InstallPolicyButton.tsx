@@ -14,19 +14,20 @@ import {
 } from '@mui/material';
 import * as yaml from 'js-yaml';
 import { useEffect, useState } from 'react';
+import { errorMessage } from '../common/errors';
 import { Permitted } from '../common/permissions';
 import {
   bindingFor,
   bindingName,
-  BindingNotInstalledError,
+  checkInstall,
   checkPolicy,
   installPolicy,
-  installProblem,
   isInstalled,
   paramsCreationProblem,
   paramsName,
   ParamsState,
   paramsState,
+  PartlyInstalledError,
   PolicyObject,
   ValidationAction,
 } from './install';
@@ -46,7 +47,7 @@ const listBindingsCheck = {
 };
 
 function errorText(error: any) {
-  return error?.message ?? String(error);
+  return errorMessage(error);
 }
 
 function parse(text: string | undefined): any {
@@ -54,6 +55,19 @@ function parse(text: string | undefined): any {
     return text ? yaml.load(text) : null;
   } catch {
     return null;
+  }
+}
+
+/** The policy of the editor, or why the editor holds none that can be read. */
+function readPolicy(text: string | undefined): { policy: any; unreadable?: string } {
+  if (!text?.trim()) return { policy: null, unreadable: 'The policy editor is empty.' };
+  try {
+    return { policy: yaml.load(text) };
+  } catch (error) {
+    return {
+      policy: null,
+      unreadable: `The policy editor does not hold valid YAML: ${errorText(error)}`,
+    };
   }
 }
 
@@ -76,7 +90,8 @@ export function InstallPolicyButton(
   }>
 ) {
   const { getPolicyYaml, getParamsYaml, disabled } = props;
-  const [policy, setPolicy] = useState<PolicyObject | null>(null);
+  // what the policy editor held when the dialog was opened, null while it is closed
+  const [opened, setOpened] = useState<ReturnType<typeof readPolicy> | null>(null);
 
   return (
     <>
@@ -85,17 +100,18 @@ export function InstallPolicyButton(
           <Button
             variant="outlined"
             disabled={disabled || !allowed}
-            onClick={() => setPolicy(parse(getPolicyYaml()))}
+            onClick={() => setOpened(readPolicy(getPolicyYaml()))}
           >
             Install in cluster
           </Button>
         )}
       </Permitted>
-      {policy !== null && (
+      {opened !== null && (
         <InstallDialog
-          policy={policy}
+          policy={opened.policy}
+          unreadable={opened.unreadable}
           params={parse(getParamsYaml())}
-          onClose={() => setPolicy(null)}
+          onClose={() => setOpened(null)}
         />
       )}
     </>
@@ -103,10 +119,16 @@ export function InstallPolicyButton(
 }
 
 function InstallDialog(
-  props: Readonly<{ policy: PolicyObject; params: any; onClose: () => void }>
+  props: Readonly<{
+    policy: PolicyObject;
+    // why the editor holds no policy to read: it is empty, or not YAML
+    unreadable?: string;
+    params: any;
+    onClose: () => void;
+  }>
 ) {
-  const { policy, params, onClose } = props;
-  const problem = checkPolicy(policy);
+  const { policy, unreadable, params, onClose } = props;
+  const problem = unreadable ?? checkPolicy(policy);
   const [actions, setActions] = useState<Record<ValidationAction, boolean>>({
     Warn: true,
     Audit: true,
@@ -120,6 +142,8 @@ function InstallDialog(
   const [installed, setInstalled] = useState<boolean | null>(null);
   // why installing could reject requests, null when it cannot, undefined while it is checked
   const [conflict, setConflict] = useState<string | null | undefined>(undefined);
+  // whether the plugin's binding exists, which installing replaces rather than creates
+  const [bindingInstalled, setBindingInstalled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{
     severity: 'success' | 'warning' | 'error';
@@ -147,8 +171,11 @@ function InstallDialog(
     isInstalled(policy)
       .then(setInstalled)
       .catch(() => setInstalled(null));
-    installProblem(policy)
-      .then(setConflict)
+    checkInstall(policy)
+      .then(found => {
+        setBindingInstalled(found.bindingInstalled);
+        setConflict(found.problem);
+      })
       .catch(error =>
         setConflict(`Unable to check the bindings of the policy: ${errorText(error)}`)
       );
@@ -170,6 +197,34 @@ function InstallDialog(
     !busy &&
     !result;
 
+  // what installing reads and writes: it reads the policy and its binding to tell whether they
+  // exist, creates them or replaces those that exist, and creates the parameters when asked
+  const namedCheck = (resource: string, verb: string, name: string) => ({
+    group: 'admissionregistration.k8s.io',
+    resource,
+    verb,
+    name,
+  });
+  // a policy without a name (problem) installs nothing
+  const installChecks = problem
+    ? []
+    : [
+        namedCheck('validatingadmissionpolicies', 'get', policy.metadata.name),
+        namedCheck('validatingadmissionpolicybindings', 'get', bindingName(policy)),
+        installed
+          ? namedCheck('validatingadmissionpolicies', 'update', policy.metadata.name)
+          : createCheck('validatingadmissionpolicies'),
+        bindingInstalled
+          ? namedCheck('validatingadmissionpolicybindings', 'update', bindingName(policy))
+          : createCheck('validatingadmissionpolicybindings'),
+        ...(willCreateParams
+          ? [{ group: 'kubescape.io', resource: 'controlconfigurations', verb: 'create' }]
+          : []),
+      ];
+  const auditAnnotations: unknown[] = Array.isArray(policy?.spec?.auditAnnotations)
+    ? policy.spec!.auditAnnotations
+    : [];
+
   const install = async () => {
     setBusy(true);
     const binding = bindingFor(policy, chosen, namespace.trim() || undefined);
@@ -186,10 +241,10 @@ function InstallDialog(
       });
     } catch (error) {
       setResult(
-        error instanceof BindingNotInstalledError
+        error instanceof PartlyInstalledError
           ? {
               severity: 'warning',
-              text: `${error.message}. Close this dialog and install again to add the binding.`,
+              text: `${error.message}. Close this dialog and install again to add the rest.`,
             }
           : { severity: 'error', text: `Unable to install the policy: ${errorText(error)}` }
       );
@@ -207,11 +262,23 @@ function InstallDialog(
         ) : (
           <Stack spacing={2} sx={{ mt: 1 }}>
             <Typography>
-              Installs <b>{policy.metadata.name}</b> as it is in the policy editor, with the binding{' '}
-              <b>{bindingName(policy)}</b>. The binding only warns or audits, so no request is
-              rejected. Deny is not offered here: change the binding with kubectl once the warnings
-              show that the policy is right.
+              Installs <b>{policy.metadata.name}</b> as it is in the policy editor, but with
+              failurePolicy Ignore, and the binding <b>{bindingName(policy)}</b>, which only warns
+              or audits. With failurePolicy Ignore the API server admits a request when the
+              parameters of the policy cannot be read or an audit annotation fails, which it would
+              otherwise reject whatever the binding does, so the policy rejects no request. A
+              validation or match condition that fails is then no violation either, which the
+              binding would otherwise warn about or audit. Deny is not offered here: change the
+              binding and the failurePolicy with kubectl once the warnings show that the policy is
+              right.
             </Typography>
+            {auditAnnotations.length > 0 && (
+              <Alert severity="info">
+                The values of the audit annotations are installed converted with string(): the API
+                server rejects a request for a value that is not a string or null, also with
+                failurePolicy Ignore. A value without a string form, such as null, is left out.
+              </Alert>
+            )}
             {conflict && <Alert severity="error">{conflict}</Alert>}
             {installed && !conflict && (
               <Alert severity="info">
@@ -237,7 +304,7 @@ function InstallDialog(
               size="small"
               value={namespace}
               onChange={event => setNamespace(event.target.value)}
-              helperText="Only check requests in this namespace; empty for all namespaces."
+              helperText="Only check requests for objects in this namespace; cluster-scoped objects, such as ClusterRoles, and the Namespace itself are then not checked. Empty for all requests."
             />
             {paramsProblem && <Alert severity="warning">{paramsProblem}</Alert>}
             {paramsStatus === 'missing' && paramsConflict && (
@@ -252,7 +319,7 @@ function InstallDialog(
                     onChange={(_, checked) => setCreateParams(checked)}
                   />
                 }
-                label={`Create the ControlConfiguration ${paramsName} from the Params tab; without it every request gets a warning that the parameters are missing.`}
+                label={`Create the ControlConfiguration ${paramsName} from the Params tab; without it the policy checks no request until the parameters exist.`}
               />
             )}
           </Stack>
@@ -268,7 +335,7 @@ function InstallDialog(
           {result && result.severity !== 'error' ? 'Close' : 'Cancel'}
         </Button>
         {!problem && (
-          <Permitted check={createCheck('validatingadmissionpolicybindings')}>
+          <Permitted check={installChecks}>
             {allowed => (
               <Button variant="contained" disabled={!ready || !allowed} onClick={install}>
                 {busy ? 'Installing…' : 'Install'}

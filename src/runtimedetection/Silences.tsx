@@ -24,6 +24,7 @@ import {
 } from '@mui/material';
 import { useState } from 'react';
 import { getCurrentUser, useCurrentUser } from '../common/currentUser';
+import { errorMessage } from '../common/errors';
 import { Permitted } from '../common/permissions';
 import { ContextBadge } from '../exceptions/shared';
 import { alertNamespace, alertPod, alertWorkload } from './alertFields';
@@ -57,7 +58,7 @@ function ruleName(labels: Record<string, string>) {
 }
 
 function errorText(error: any) {
-  return error?.message ?? String(error);
+  return errorMessage(error);
 }
 
 function matchersText(matchers: SilenceMatcher[]) {
@@ -253,6 +254,30 @@ export function SilenceDialog(
   );
 }
 
+/**
+ * The button that silences the rule of an alert, for a caller that opens the dialog itself: a
+ * dialog of a button in a table would go with its row when the row leaves the page.
+ */
+export function SilenceIconButton(
+  props: Readonly<{ alert: AlertmanagerAlert; onClick: () => void }>
+) {
+  const { alert, onClick } = props;
+
+  return (
+    <Permitted check={alertmanagerProxyCheck()} cluster={alert.cluster}>
+      {allowed => (
+        <Tooltip title={allowed ? 'Silence' : ''}>
+          <span>
+            <IconButton size="small" aria-label="Silence" disabled={!allowed} onClick={onClick}>
+              <Icon icon="mdi:bell-off-outline" />
+            </IconButton>
+          </span>
+        </Tooltip>
+      )}
+    </Permitted>
+  );
+}
+
 /** Opens the dialog that silences the rule of an alert. */
 export function SilenceButton(
   props: Readonly<{ alert: AlertmanagerAlert; onDone: (notice: SilenceNotice) => void }>
@@ -261,34 +286,19 @@ export function SilenceButton(
   const [open, setOpen] = useState(false);
 
   return (
-    <Permitted check={alertmanagerProxyCheck()} cluster={alert.cluster}>
-      {allowed => (
-        <>
-          <Tooltip title={allowed ? 'Silence' : ''}>
-            <span>
-              <IconButton
-                size="small"
-                aria-label="Silence"
-                disabled={!allowed}
-                onClick={() => setOpen(true)}
-              >
-                <Icon icon="mdi:bell-off-outline" />
-              </IconButton>
-            </span>
-          </Tooltip>
-          {open && (
-            <SilenceDialog
-              alert={alert}
-              onClose={() => setOpen(false)}
-              onDone={notice => {
-                setOpen(false);
-                onDone(notice);
-              }}
-            />
-          )}
-        </>
+    <>
+      <SilenceIconButton alert={alert} onClick={() => setOpen(true)} />
+      {open && (
+        <SilenceDialog
+          alert={alert}
+          onClose={() => setOpen(false)}
+          onDone={notice => {
+            setOpen(false);
+            onDone(notice);
+          }}
+        />
       )}
-    </Permitted>
+    </>
   );
 }
 

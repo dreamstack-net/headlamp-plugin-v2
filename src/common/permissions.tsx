@@ -18,58 +18,75 @@ export interface AccessCheck {
   name?: string;
 }
 
-const answers = new Map<string, Promise<boolean | undefined>>();
+// Answers are kept briefly: logging out and in as another user, whose permissions differ, does
+// not reload the plugin
+const answerLifetime = 10_000;
+
+// the answer, and until when it is kept (Infinity while it is asked)
+const answers = new Map<string, { answer: Promise<boolean | undefined>; until: number }>();
 
 /**
  * Whether the user may do it, or undefined when the cluster does not tell. Answers are
- * remembered for the session.
+ * remembered for ten seconds.
  */
 export function canI(
   check: AccessCheck,
   cluster: string | null = getCluster()
 ): Promise<boolean | undefined> {
   const key = JSON.stringify([cluster, check]);
-  let answer = answers.get(key);
-  if (!answer) {
-    // any failure, even a synchronous one, means that the answer is unknown
-    answer = Promise.resolve()
-      .then(() =>
-        post(
-          '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',
-          {
-            apiVersion: 'authorization.k8s.io/v1',
-            kind: 'SelfSubjectAccessReview',
-            spec: { resourceAttributes: check },
-          },
-          false,
-          cluster ? { cluster } : undefined
-        )
+  const kept = answers.get(key);
+  if (kept && Date.now() < kept.until) return kept.answer;
+
+  const entry = { answer: Promise.resolve<boolean | undefined>(undefined), until: Infinity };
+  const forget = () => {
+    if (answers.get(key) === entry) answers.delete(key);
+  };
+  // any failure, even a synchronous one, means that the answer is unknown
+  entry.answer = Promise.resolve()
+    .then(() =>
+      post(
+        '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',
+        {
+          apiVersion: 'authorization.k8s.io/v1',
+          kind: 'SelfSubjectAccessReview',
+          spec: { resourceAttributes: check },
+        },
+        false,
+        cluster ? { cluster } : undefined
       )
-      .then((review: any) => {
-        const allowed = review?.status?.allowed;
-        if (typeof allowed === 'boolean') return allowed;
-        answers.delete(key);
-        return undefined;
-      })
-      .catch(() => {
-        answers.delete(key);
-        return undefined;
-      });
-    answers.set(key, answer);
-  }
-  return answer;
+    )
+    .then((review: any) => {
+      const allowed = review?.status?.allowed;
+      if (typeof allowed === 'boolean') {
+        entry.until = Date.now() + answerLifetime;
+        return allowed;
+      }
+      forget();
+      return undefined;
+    })
+    .catch(() => {
+      forget();
+      return undefined;
+    });
+  answers.set(key, entry);
+  return entry.answer;
 }
 
-/** Hook around {@link canI}; undefined while asking, or when there is nothing to check. */
+/**
+ * Hook around {@link canI}; undefined while asking, or when there is nothing to check. The answer
+ * to another check or cluster is never returned, also not while the new one is asked.
+ */
 export function useCanI(check: AccessCheck | null, cluster?: string | null): boolean | undefined {
-  const [allowed, setAllowed] = useState<boolean | undefined>();
-  const key = JSON.stringify([cluster, check]);
+  const [answer, setAnswer] = useState<{ key: string; allowed: boolean | undefined }>();
+  // without a cluster, the one of the address, which can change while the page stays
+  const target = cluster === undefined ? getCluster() : cluster;
+  const key = JSON.stringify([target, check]);
 
   useEffect(() => {
     if (!check) return;
     let active = true;
-    canI(check, cluster === undefined ? getCluster() : cluster).then(answer => {
-      if (active) setAllowed(answer);
+    canI(check, target).then(allowed => {
+      if (active) setAnswer({ key, allowed });
     });
     return () => {
       active = false;
@@ -78,22 +95,27 @@ export function useCanI(check: AccessCheck | null, cluster?: string | null): boo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
 
-  return check ? allowed : undefined;
+  return check && answer?.key === key ? answer.allowed : undefined;
 }
 
 /**
  * The first of the checks that the user is denied, or undefined while asking, or when every check
- * is allowed or unanswered.
+ * is allowed or unanswered. The answer to other checks or another cluster is never returned,
+ * also not while the new ones are asked.
  */
-function useDeniedCheck(checks: AccessCheck[], cluster?: string | null): AccessCheck | undefined {
-  const [denied, setDenied] = useState<AccessCheck | undefined>();
-  const key = JSON.stringify([cluster, checks]);
+export function useDeniedCheck(
+  checks: AccessCheck[],
+  cluster?: string | null
+): AccessCheck | undefined {
+  const [answer, setAnswer] = useState<{ key: string; denied: AccessCheck | undefined }>();
+  // without a cluster, the one of the address, which can change while the page stays
+  const target = cluster === undefined ? getCluster() : cluster;
+  const key = JSON.stringify([target, checks]);
 
   useEffect(() => {
     let active = true;
-    const target = cluster === undefined ? getCluster() : cluster;
     Promise.all(checks.map(check => canI(check, target))).then(answers => {
-      if (active) setDenied(checks[answers.indexOf(false)]);
+      if (active) setAnswer({ key, denied: checks[answers.indexOf(false)] });
     });
     return () => {
       active = false;
@@ -102,7 +124,7 @@ function useDeniedCheck(checks: AccessCheck[], cluster?: string | null): AccessC
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
 
-  return denied;
+  return answer?.key === key ? answer.denied : undefined;
 }
 
 /** Explains which permission the user is missing. */

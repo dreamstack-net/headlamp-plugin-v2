@@ -8,7 +8,7 @@ import {
   useImageVersion,
   useImageVersionSettings,
 } from './ImageVersion';
-import { possiblyPrivatePermit } from './imageVersionSources';
+import { endOfLifePermit, imageVersionsPermit, possiblyPrivatePermit } from './imageVersionSources';
 
 const mocks = vi.hoisted(() => ({
   config: {} as Record<string, unknown>,
@@ -123,6 +123,52 @@ it('stops the lookups of images that may be private once the settings no longer 
   expect(next.aborted).toBe(false);
   changeImageVersionSetting({ possiblyPrivateImages: true }, 'imageVersions', false);
   expect(next.aborted).toBe(true);
+});
+
+it('stops the lookups of the newest versions and of the end of life once they are switched off', () => {
+  const versions = imageVersionsPermit();
+  const endOfLife = endOfLifePermit();
+  // switching a setting on, or the images that may be private off, leaves these lookups
+  changeImageVersionSetting({ imageVersions: true }, 'endOfLife', true);
+  changeImageVersionSetting({ possiblyPrivateImages: true }, 'possiblyPrivateImages', false);
+  expect([versions.aborted, endOfLife.aborted]).toEqual([false, false]);
+
+  // the end of life switched off stops what would still ask endoflife.date, and nothing else
+  const privateNames = possiblyPrivatePermit();
+  expect(
+    changeImageVersionSetting({ imageVersions: true, endOfLife: true }, 'endOfLife', false)
+  ).toEqual({ imageVersions: true, endOfLife: false });
+  expect([versions.aborted, endOfLife.aborted, privateNames.aborted]).toEqual([false, true, false]);
+
+  // the newest versions switched off stop every lookup
+  const nextEndOfLife = endOfLifePermit();
+  expect(nextEndOfLife.aborted).toBe(false);
+  changeImageVersionSetting({ imageVersions: true }, 'imageVersions', false);
+  expect([versions.aborted, nextEndOfLife.aborted, privateNames.aborted]).toEqual([
+    true,
+    true,
+    true,
+  ]);
+  expect(imageVersionsPermit().aborted).toBe(false);
+});
+
+it('starts no lookup after its setting was switched off', async () => {
+  // the lookups of a view first wait for version-checker
+  const view = render(<Details image="nginx:1.29.3" />);
+  changeImageVersionSetting(switchedOn, 'endOfLife', false);
+  await waitFor(() => expect(mocks.lookup).toHaveBeenCalledTimes(1));
+  expect(mocks.lookup).toHaveBeenCalledWith('nginx:1.29.3', {
+    latest: true,
+    endOfLife: false,
+    possiblyPrivate: undefined,
+  });
+  view.unmount();
+
+  mocks.lookup.mockClear();
+  render(<Details image="redis:8.2.0" />);
+  changeImageVersionSetting(switchedOn, 'imageVersions', false);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  expect(mocks.lookup).not.toHaveBeenCalled();
 });
 
 it('neither shows nor asks endoflife.date when the end of life is not switched on', async () => {

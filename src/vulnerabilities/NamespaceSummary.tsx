@@ -1,13 +1,15 @@
 /* 
   Show the vulnerability issues for workloads in a single namespace.  
 */
+import { ApiError } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import {
   Link as HeadlampLink,
   NameValueTable,
   SectionBox,
 } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
-import { KubeObject } from '@kinvolk/headlamp-plugin/lib/k8s/cluster';
-import { useState } from 'react';
+import { Typography } from '@mui/material';
+import { ErrorMessage } from '../common/ErrorMessage';
+import { useStorageObject } from '../common/readOnce';
 import HeadlampTable from '../common/Table';
 import { getLastURLSegment } from '../common/url';
 import { RoutingName } from '../index';
@@ -16,15 +18,28 @@ import { VulnerabilitySummary } from '../softwarecomposition/VulnerabilitySummar
 
 export default function VulnerabilitiesNamespaceSummary() {
   const namespace = getLastURLSegment();
-  const [kubeObject, setKubeObject] = useState<KubeObject | null>(null);
+  // read once, as the storage refuses to watch the summaries of a namespace (405)
+  const { data: vulnerabilitySummary, error } = useStorageObject<VulnerabilitySummary>(
+    vulnerabilitySummaryClass,
+    namespace,
+    undefined,
+    undefined
+  );
 
-  vulnerabilitySummaryClass.useApiGet(setKubeObject, namespace);
-
-  if (!kubeObject) {
-    return <div></div>;
+  if (!vulnerabilitySummary) {
+    return (
+      <SectionBox title="Namespace Vulnerabilities" backLink>
+        {error ? (
+          <ErrorMessage error={error as ApiError} />
+        ) : (
+          <Typography variant="body2" color="text.secondary">
+            Reading the vulnerability summary of the namespace…
+          </Typography>
+        )}
+      </SectionBox>
+    );
   }
 
-  const vulnerabilitySummary: VulnerabilitySummary = kubeObject.jsonData;
   return (
     <>
       <SectionBox title="Namespace Vulnerabilities">
@@ -58,7 +73,7 @@ function VulnerabilityScans(
             header: 'Workload',
             accessorFn: (item: VulnerabilitySummary.VulnerabilityReference) =>
               item.name.split('-')?.slice(1).join('-'),
-            Cell: ({ cell }: any) => {
+            Cell: ({ cell }) => {
               return (
                 <HeadlampLink
                   routeName={RoutingName.KubescapeVulnerabilityDetails}

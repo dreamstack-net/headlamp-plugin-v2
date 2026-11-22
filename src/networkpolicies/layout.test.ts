@@ -1,6 +1,9 @@
 import { Edge, MarkerType, Node } from '@xyflow/react';
-import { GeneratedNetworkPolicy } from '../softwarecomposition/GeneratedNetworkPolicy';
-import { createNodes, isClusterRange, layoutElements, policyPeers } from './layout';
+import {
+  GeneratedNetworkPolicy,
+  NetworkPolicy,
+} from '../softwarecomposition/GeneratedNetworkPolicy';
+import { createNodes, isAllPeers, isClusterRange, layoutElements, policyPeers } from './layout';
 import { compactPorts, portsText } from './ports';
 
 function makePolicy(
@@ -91,24 +94,38 @@ describe('createNodes', () => {
     expect(edges).toHaveLength(2);
   });
 
-  it('skips ingress rules with no from field', () => {
+  // the storage generates such a rule for traffic whose peer it could not name; it allows the
+  // ports from or to any peer
+  it('shows an ingress rule with no from field as all sources', () => {
     const policy = makePolicy({
       ingress: [{ ports: [{ protocol: 'TCP', port: '80' }] }],
     });
     const { nodes, edges } = createNodes(policy);
 
-    expect(nodes).toHaveLength(1); // only main
-    expect(edges).toHaveLength(0);
+    expect(nodes).toHaveLength(2);
+    expect(nodes[1]).toMatchObject({
+      type: 'sourceNode',
+      data: { peer: {}, peers: [{}], ports: [{ protocol: 'TCP', port: '80' }] },
+    });
+    expect(isAllPeers(nodes[1].data.peer as NetworkPolicy.Peer)).toBe(true);
+    expect(edges).toEqual([expect.objectContaining({ source: '1', target: 'main' })]);
   });
 
-  it('skips egress rules with no to field', () => {
+  it('shows an egress rule with no to field as all destinations, with the ports of all such rules', () => {
     const policy = makePolicy({
-      egress: [{ ports: [{ protocol: 'TCP', port: '443' }] }],
+      egress: [
+        { ports: [{ protocol: 'TCP', port: '443' }] },
+        { ports: [{ protocol: 'UDP', port: '53' }], to: [] },
+      ],
     });
     const { nodes, edges } = createNodes(policy);
 
-    expect(nodes).toHaveLength(1); // only main
-    expect(edges).toHaveLength(0);
+    expect(nodes).toHaveLength(2);
+    expect(nodes[1]).toMatchObject({ type: 'targetNode', data: { peer: {} } });
+    expect(portsText(compactPorts(nodes[1].data.ports as NetworkPolicy.Port[]))).toBe(
+      'TCP:443, UDP:53'
+    );
+    expect(edges).toEqual([expect.objectContaining({ source: 'main', target: '1' })]);
   });
 
   const cronJobRun = (run: number) => ({
@@ -179,6 +196,32 @@ describe('createNodes', () => {
 });
 
 describe('policyPeers', () => {
+  it('shows the pods of a StatefulSet as one peer, and keeps labels that are all per run', () => {
+    const replica = (index: number) => ({
+      podSelector: {
+        matchLabels: {
+          app: 'db',
+          'statefulset.kubernetes.io/pod-name': `db-${index}`,
+          'apps.kubernetes.io/pod-index': `${index}`,
+        },
+      },
+    });
+    const onlyRun = { podSelector: { matchLabels: { 'job-name': 'backup-1' } } };
+    const peers = policyPeers(
+      makePolicy({
+        egress: [
+          { ports: [{ protocol: 'TCP', port: '5432' }], to: [replica(0), replica(1), onlyRun] },
+        ],
+      })
+    );
+
+    expect(peers.map(({ peer, peers }) => [peer, peers.length])).toEqual([
+      [{ podSelector: { matchLabels: { app: 'db' } } }, 2],
+      // without the label it would stand for every pod of the namespace
+      [onlyRun, 1],
+    ]);
+  });
+
   it('gives each peer of a direction the ports of all its rules', () => {
     const api = { podSelector: { matchLabels: { app: 'api' } } };
     expect(

@@ -33,15 +33,17 @@ import { useSnackbar } from 'notistack';
 import { useState } from 'react';
 import { ErrorContainer } from '../common/ErrorContainer';
 import { ErrorMessage } from '../common/ErrorMessage';
+import { errorMessage as messageOf } from '../common/errors';
 import { saveToFile } from '../common/filedialog';
 import { frameworkCheck, PermittedIconButton } from '../common/permissions';
 import { getKubescapePluginUrl } from '../common/PluginHelper';
 import { StatusLabel, StatusLabelProps } from '../common/StatusLabel';
-import { getURLSegments } from '../common/url';
+import { getURLSegments, useURLSearchParam } from '../common/url';
 import { complianceSeverity } from '../compliance/Compliance';
 import { checkUniqueness, useKubescapeNamespace } from '../custom-objects/api-queries';
 import { customObjectLabel } from '../model';
 import { Control, defaultFrameworkNames, FrameWork, Rule, useRegoData } from '../rego';
+import { parseControlIDs } from './customFrameworks';
 
 declare global {
   interface Window {
@@ -66,36 +68,42 @@ export function FrameworkNew() {
 
 export function FrameworkEdit() {
   const [configMapName] = getURLSegments(-1);
+  // the namespace the list found the ConfigMap in; the Kubescape namespace when not given
+  const [namespaceParam] = useURLSearchParam('namespace');
   const { kubeScapeNamespace, error, loading } = useKubescapeNamespace();
-  if (loading) return <></>;
-  if (!kubeScapeNamespace)
+  const namespace = namespaceParam || kubeScapeNamespace;
+  if (!namespaceParam && loading) return <></>;
+  if (!namespace)
     return <ErrorMessage error={new ApiError(error ?? 'Kubescape namespace not found')} />;
 
-  return (
-    <FrameworkEditLoader configMapName={configMapName} kubeScapeNamespace={kubeScapeNamespace} />
-  );
+  return <FrameworkEditLoader configMapName={configMapName} namespace={namespace} />;
 }
 
-function FrameworkEditLoader(
-  props: Readonly<{ configMapName: string; kubeScapeNamespace: string }>
-) {
-  const { configMapName, kubeScapeNamespace } = props;
-  const [configMap] = K8s.ResourceClasses.ConfigMap.useGet(configMapName, kubeScapeNamespace);
+function FrameworkEditLoader(props: Readonly<{ configMapName: string; namespace: string }>) {
+  const { configMapName, namespace } = props;
+  const [configMap, error] = K8s.ResourceClasses.ConfigMap.useGet(configMapName, namespace);
   const { controls, loading: regoLoading } = useRegoData();
 
+  // a ConfigMap that is gone or that the user may not read, instead of an empty page
+  if (error && !configMap) return <ErrorMessage error={error} />;
+
   if (configMap && !regoLoading) {
-    const controlsIDs: string[] = JSON.parse(configMap.jsonData.data.controlsIDs);
+    // a ConfigMap edited by hand may hold anything; the framework then has no controls
+    const ids = new Set(
+      parseControlIDs(configMap.jsonData.data?.controlsIDs, configMap.jsonData.metadata?.name)
+    );
 
     const framework = {
-      name: configMap?.jsonData.data.name,
-      description: configMap?.jsonData.data.description,
-      controls: controls.filter(c => controlsIDs?.some(controlID => controlID === c.controlID)),
+      name: configMap.jsonData.data?.name ?? '',
+      description: configMap.jsonData.data?.description,
+      controls: controls.filter(c => ids.has(c.controlID)),
     };
     return (
       <FrameworkEditor
         framework={framework}
-        configMap={configMap?.jsonData}
-        kubeScapeNamespace={kubeScapeNamespace}
+        configMap={configMap.jsonData}
+        // an existing ConfigMap is saved in its own namespace
+        kubeScapeNamespace={configMap.jsonData.metadata?.namespace ?? namespace}
       />
     );
   }
@@ -112,14 +120,23 @@ function FrameworkEditor(
   const [frameworkControls, setFrameworkControls] = useState<Control[]>(props.framework.controls);
   const { enqueueSnackbar } = useSnackbar();
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const { frameworks } = useRegoData();
 
   const handleSave = async () => {
     if (!framework.name) {
       return setErrorMessage('Name must not be empty');
     }
-    if (!/^[a-z0-9]([-a-z0-9 ]*[a-z0-9])?$/.test(framework.name.toLocaleLowerCase())) {
+    // not in the language of the user: a Turkish I would become a dotless i
+    if (!/^[a-z0-9]([-a-z0-9 ]*[a-z0-9])?$/.test(framework.name.toLowerCase())) {
       return setErrorMessage(
         'Only lettters, numbers, spaces and dashes are allowed in the name (e.g. "Dev Framework")'
+      );
+    }
+    // the pages look a name up in the default frameworks first, so a custom framework with
+    // such a name could not be chosen; exceptions compare the names of frameworks without case
+    if (frameworks.some(f => f.name.toLowerCase() === framework.name.toLowerCase())) {
+      return setErrorMessage(
+        `${framework.name} is the name of a default framework. Please provide another name.`
       );
     }
     if (!frameworkControls || frameworkControls.length === 0) {
@@ -143,7 +160,7 @@ function FrameworkEditor(
         // The name passed the check above, so this only leaves lowercase letters, digits and
         // dashes. Label values are limited to 63 characters and must end alphanumeric.
         const kubernetesName = framework.name
-          .toLocaleLowerCase()
+          .toLowerCase()
           .replace(/\s+/g, '-')
           .substring(0, 63)
           .replace(/-+$/, '');
@@ -180,14 +197,17 @@ function FrameworkEditor(
       }
       enqueueSnackbar(`${framework.name} saved successfully`, { variant: 'success' });
       setErrorMessage('');
-    } catch (err: any) {
-      setErrorMessage(`Failed to save ${framework.name}: ${err?.message ?? err}`);
+    } catch (err) {
+      setErrorMessage(`Failed to save ${framework.name}: ${messageOf(err)}`);
     }
   };
 
   const handleDownload = async () => {
     const frameworkForDownload = {
       ...framework,
+      // the controls selected now, as copies: they get their rules below, and the controls of
+      // the plugin's data are shared with the other pages
+      controls: frameworkControls.map(c => ({ ...c })),
       controlsIDs: frameworkControls.map(c => c.controlID),
     } as FrameWork;
 
@@ -301,21 +321,34 @@ function Controls(
     sorting
   );
 
+  // the controls that are shown and selected; the header checkbox selects or deselects those
+  // shown, and keeps the selected controls that the filter hides
+  const selectedIDs = new Set(frameworkControls.map(control => control.controlID));
+  const shownSelected = filteredControls.filter(control => selectedIDs.has(control.controlID));
+  const allShownSelected =
+    filteredControls.length > 0 && shownSelected.length === filteredControls.length;
+
   /**
-   * Handles the selection or deselection of all controls.
+   * Handles the selection or deselection of all controls that are shown.
    * @param event - The change event from the checkbox input.
    */
   const handleSelectAll = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (event.target.checked) {
-      setFrameworkControls(filteredControls);
+      setFrameworkControls([
+        ...frameworkControls,
+        ...filteredControls.filter(control => !selectedIDs.has(control.controlID)),
+      ]);
     } else {
-      setFrameworkControls([]);
+      const shownIDs = new Set(filteredControls.map(control => control.controlID));
+      setFrameworkControls(frameworkControls.filter(control => !shownIDs.has(control.controlID)));
     }
   };
 
   const handleCheckboxChange = (event: React.ChangeEvent<HTMLInputElement>, control: Control) => {
     if (event.target.checked) {
-      setFrameworkControls([...frameworkControls, control]);
+      if (!selectedIDs.has(control.controlID)) {
+        setFrameworkControls([...frameworkControls, control]);
+      }
     } else {
       setFrameworkControls(frameworkControls.filter(c => c.controlID !== control.controlID));
     }
@@ -329,7 +362,8 @@ function Controls(
     const values = typeof value === 'string' ? value.split(',') : value;
 
     if (values.includes('all')) {
-      if (values.length >= frameworks.length) {
+      // the values are the frameworks selected and the entry itself
+      if (values.length > frameworks.length) {
         setSelectedFrameworkNames([]);
       } else {
         setSelectedFrameworkNames(frameworks.map(f => f.name));
@@ -351,7 +385,7 @@ function Controls(
           checked={showSelectedControls}
           control={<Switch color="primary" />}
           label={'Selected controls'}
-          onChange={(event: any, checked: boolean) => {
+          onChange={(_event, checked) => {
             setShowSelectedControls(checked);
           }}
         />
@@ -391,8 +425,10 @@ function Controls(
               }}
             >
               <Checkbox
-                checked={filteredControls.length === frameworkControls.length}
+                checked={allShownSelected}
+                indeterminate={shownSelected.length > 0 && !allShownSelected}
                 onChange={event => handleSelectAll(event)}
+                inputProps={{ 'aria-label': 'Select the controls shown' }}
               />
             </TableCell>
             <HeaderCell title="ID" width="10%" field="controlID" onSort={handleSort} />

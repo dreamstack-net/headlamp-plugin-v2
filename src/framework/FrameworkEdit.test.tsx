@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { vi } from 'vitest';
 import { FrameworkEdit, FrameworkNew } from './FrameworkEdit';
@@ -10,10 +10,36 @@ const mocks = vi.hoisted(() => ({
   saveConfigMap: vi.fn(),
   enqueueSnackbar: vi.fn(),
   existing: {} as any,
+  // why the ConfigMap could not be read
+  getError: null as (Error & { status?: number }) | null,
+  useGet: vi.fn(),
+  // the namespace parameter of the URL
+  namespace: null as string | null,
+  saveToFile: vi.fn(),
+  // the controls of the plugin's data, which the pages share
+  controls: [
+    {
+      controlID: 'C-0016',
+      name: 'Allow privilege escalation',
+      baseScore: 6,
+      rulesNames: ['rule-allow-privilege-escalation'],
+    },
+    // a control that is in none of the frameworks the editor shows by default
+    { controlID: 'C-0099', name: 'Another control', baseScore: 3 },
+  ],
 }));
 
 vi.mock('@kinvolk/headlamp-plugin/lib', () => ({
-  K8s: { ResourceClasses: { ConfigMap: { useGet: () => [{ jsonData: mocks.existing }] } } },
+  K8s: {
+    ResourceClasses: {
+      ConfigMap: {
+        useGet: (...args: any[]) => {
+          mocks.useGet(...args);
+          return mocks.getError ? [null, mocks.getError] : [{ jsonData: mocks.existing }];
+        },
+      },
+    },
+  },
 }));
 vi.mock('@kinvolk/headlamp-plugin/lib/ApiProxy', () => ({
   ApiError: Error,
@@ -36,15 +62,18 @@ vi.mock('../custom-objects/api-queries', () => ({
   checkUniqueness: async () => true,
   useKubescapeNamespace: () => ({ kubeScapeNamespace: 'kubescape', error: null, loading: false }),
 }));
-vi.mock('../common/filedialog', () => ({ saveToFile: vi.fn() }));
+vi.mock('../common/filedialog', () => ({ saveToFile: mocks.saveToFile }));
 vi.mock('../common/PluginHelper', () => ({ getKubescapePluginUrl: async () => '' }));
 vi.mock('../compliance/Compliance', () => ({ complianceSeverity: () => 'High' }));
-vi.mock('../common/url', () => ({ getURLSegments: () => ['dev-framework-abc123'] }));
+vi.mock('../common/url', () => ({
+  getURLSegments: () => ['dev-framework-abc123'],
+  useURLSearchParam: () => [mocks.namespace, () => {}],
+}));
 vi.mock('../model', () => ({ customObjectLabel: 'kubescape.io/custom-object' }));
 vi.mock('../rego', () => ({
   defaultFrameworkNames: ['NSA'],
   useRegoData: () => ({
-    controls: [{ controlID: 'C-0016', name: 'Allow privilege escalation', baseScore: 6 }],
+    controls: mocks.controls,
     frameworks: [{ name: 'NSA', controls: [{ controlID: 'C-0016' }] }],
     loading: false,
   }),
@@ -69,6 +98,10 @@ beforeEach(() => {
         : mocks.saveConfigMap(url, body)
     );
   mocks.put.mockReset();
+  mocks.useGet.mockReset();
+  mocks.saveToFile.mockReset();
+  mocks.getError = null;
+  mocks.namespace = null;
   mocks.existing = {
     apiVersion: 'v1',
     kind: 'ConfigMap',
@@ -133,6 +166,103 @@ it('keeps the label of a long name within 63 characters and the full name in the
   expect(configMap.data.name).toBe(name);
 });
 
+it('accepts a name with a capital I where the language of the user lowers it to a dotless i', async () => {
+  // as in a Turkish browser
+  const lower = vi
+    .spyOn(String.prototype, 'toLocaleLowerCase')
+    .mockImplementation(function (this: string) {
+      return this.replace(/I/g, 'ı').toLowerCase();
+    });
+  try {
+    await createFramework('Internal');
+
+    await waitFor(() => expect(mocks.saveConfigMap).toHaveBeenCalledTimes(1));
+    const configMap = mocks.saveConfigMap.mock.calls[0][1];
+    expect(configMap.metadata.labels['app.kubernetes.io/name']).toBe('internal');
+    expect(configMap.metadata.name).toMatch(dns1123Subdomain);
+  } finally {
+    lower.mockRestore();
+  }
+});
+
+it('refuses the name of a default framework, whatever its case', async () => {
+  // the pages would always show the default framework of that name
+  await createFramework('nsa');
+
+  expect(
+    await screen.findByText('nsa is the name of a default framework. Please provide another name.')
+  ).toBeTruthy();
+  expect(mocks.saveConfigMap).not.toHaveBeenCalled();
+});
+
+it('downloads the controls selected now with their rules, and leaves the shared controls alone', async () => {
+  const rules = [{ name: 'rule-allow-privilege-escalation' }, { name: 'another-rule' }];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({ ok: true, text: async () => JSON.stringify(rules) }))
+  );
+  try {
+    render(
+      <MemoryRouter>
+        <FrameworkNew />
+      </MemoryRouter>
+    );
+    fireEvent.change(screen.getByPlaceholderText('Enter Framework Name'), {
+      target: { value: 'Dev' },
+    });
+    // C-0016, as in createFramework
+    fireEvent.click(screen.getAllByRole('checkbox')[2]);
+    fireEvent.click(screen.getByRole('button', { name: 'Download custom framework file' }));
+
+    await waitFor(() => expect(mocks.saveToFile).toHaveBeenCalledTimes(1));
+    const [json, fileName] = mocks.saveToFile.mock.calls[0];
+    expect(fileName).toBe('Dev.json');
+    const downloaded = JSON.parse(json);
+    expect(downloaded.controlsIDs).toEqual(['C-0016']);
+    expect(downloaded.controls).toEqual([
+      { ...mocks.controls[0], rules: [{ name: 'rule-allow-privilege-escalation' }] },
+    ]);
+    expect(mocks.controls[0]).not.toHaveProperty('rules');
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+it('selects every framework with the first entry of the filter, unless all are selected', async () => {
+  render(
+    <MemoryRouter>
+      <FrameworkNew />
+    </MemoryRouter>
+  );
+  const options = () => screen.getAllByRole('option');
+  fireEvent.mouseDown(screen.getByRole('combobox'));
+  expect(screen.getByText('C-0016')).toBeTruthy();
+
+  // without NSA, the only framework, no controls are shown
+  fireEvent.click(options()[1]);
+  expect(screen.queryByText('C-0016')).toBeNull();
+  fireEvent.click(options()[0]);
+  expect(screen.getByText('C-0016')).toBeTruthy();
+  // all are selected: the entry deselects them
+  fireEvent.click(options()[0]);
+  expect(screen.queryByText('C-0016')).toBeNull();
+});
+
+it('says why the ConfigMap of a framework could not be read', async () => {
+  mocks.getError = Object.assign(new Error('configmaps "dev-framework-abc123" not found'), {
+    status: 404,
+  });
+  render(
+    <MemoryRouter>
+      <FrameworkEdit />
+    </MemoryRouter>
+  );
+
+  expect(screen.getByText('Resource not found')).toBeTruthy();
+  expect(screen.getByText('configmaps "dev-framework-abc123" not found')).toBeTruthy();
+  expect(screen.queryByPlaceholderText('Enter Framework Name')).toBeNull();
+});
+
 it('shows a failed creation and keeps the form usable', async () => {
   mocks.saveConfigMap.mockRejectedValueOnce(
     new Error('Unprocessable Entity - ConfigMap "dev-framework-x" is invalid')
@@ -183,3 +313,64 @@ it('shows a failed update of an existing framework', async () => {
     'Dev Framework'
   );
 });
+
+it('keeps the selected controls that the filter hides when the shown ones are deselected', async () => {
+  mocks.existing.data.controlsIDs = '["C-0016","C-0099"]';
+  mocks.put.mockImplementation((_url: string, body: any) => Promise.resolve(body));
+  render(
+    <MemoryRouter>
+      <FrameworkEdit />
+    </MemoryRouter>
+  );
+  const selectShown = screen.getByRole('checkbox', { name: 'Select the controls shown' });
+  expect((selectShown as HTMLInputElement).checked).toBe(true);
+
+  fireEvent.click(selectShown);
+  fireEvent.click(await saveButton());
+
+  await waitFor(() => expect(mocks.put).toHaveBeenCalled());
+  expect(JSON.parse(mocks.put.mock.calls[0][1].data.controlsIDs)).toEqual(['C-0099']);
+});
+
+it('edits a ConfigMap in the namespace the list found it in', async () => {
+  mocks.namespace = 'security';
+  mocks.existing.metadata.namespace = 'security';
+  mocks.put.mockImplementation((_url: string, body: any) => Promise.resolve(body));
+  render(
+    <MemoryRouter>
+      <FrameworkEdit />
+    </MemoryRouter>
+  );
+
+  expect(mocks.useGet).toHaveBeenCalledWith('dev-framework-abc123', 'security');
+  fireEvent.click(await saveButton());
+  await waitFor(() =>
+    expect(mocks.put).toHaveBeenCalledWith(
+      '/api/v1/namespaces/security/configmaps/dev-framework-abc123',
+      expect.anything()
+    )
+  );
+});
+
+it.each([['not json'], ['{"C-0016": true}'], [undefined]])(
+  'opens a hand-edited ConfigMap with controlsIDs %j as a framework without controls',
+  async controlsIDs => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.existing.data.controlsIDs = controlsIDs;
+    render(
+      <MemoryRouter>
+        <FrameworkEdit />
+      </MemoryRouter>
+    );
+    // the save button asks whether the user may change the framework
+    await act(async () => {});
+
+    expect(mocks.useGet).toHaveBeenCalledWith('dev-framework-abc123', 'kubescape');
+    expect((screen.getByPlaceholderText('Enter Framework Name') as HTMLInputElement).value).toBe(
+      'Dev'
+    );
+    const selectShown = screen.getByRole('checkbox', { name: 'Select the controls shown' });
+    expect((selectShown as HTMLInputElement).checked).toBe(false);
+    error.mockRestore();
+  }
+);

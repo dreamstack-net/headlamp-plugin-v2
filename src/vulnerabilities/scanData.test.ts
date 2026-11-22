@@ -3,8 +3,10 @@ import {
   getImageScans,
   getManifestReferenceKey,
   ImageScan,
+  ofSeveralClusters,
   toImageScan,
   toWorkloadScan,
+  workloadLabel,
   WorkloadScan,
 } from './scanData';
 import { manifest, summary, T0, T1, T2 } from './testFixtures';
@@ -91,6 +93,14 @@ it('finds the reports in the operator namespace when the summary refers to the w
   expect(toWorkloadScan(s, images).imageScan).toBe(exact);
 });
 
+it('keeps the image the summary names, also without a report', () => {
+  const s = summary();
+  s.metadata.annotations = { 'kubescape.io/image-tag': 'docker.io/library/nginx:1.21.6' };
+  expect(toWorkloadScan(s, new Map()).image).toBe('docker.io/library/nginx:1.21.6');
+  s.metadata.annotations = {};
+  expect(toWorkloadScan(s, new Map()).image).toBeUndefined();
+});
+
 it('uses cluster and referenced namespace in keys, with the legacy namespace default', () => {
   expect(getManifestReferenceKey('cluster-a', { name: 'image-123', namespace: 'reports' })).toBe(
     getImageScanKey(toImageScan(manifest()))
@@ -108,4 +118,33 @@ it('deduplicates only the same cluster/namespace/name tuple', () => {
   const c = { ...a, namespace: 'other-reports' };
   const workloads = [a, a, b, c].map(imageScan => ({ imageScan } as WorkloadScan));
   expect(getImageScans(workloads)).toEqual([a, b, c]);
+});
+
+it('finds the new report by name after a cluster was read again with as many reports', () => {
+  const read = (createdAt: string) => {
+    const scan = toImageScan(manifest(createdAt));
+    return { ...scan, namespace: 'kubescape' };
+  };
+  const images = new Map<string, ImageScan>();
+  const first = read(T1);
+  images.set(getImageScanKey(first), first);
+  // the summary refers to the workload namespace, so the report is found by its name
+  const s = summary();
+  expect(toWorkloadScan(s, images).imageScan).toBe(first);
+
+  // the cluster is read again: the same number of reports, but new objects
+  images.delete(getImageScanKey(first));
+  const second = read(T2);
+  images.set(getImageScanKey(second), second);
+
+  expect(toWorkloadScan(s, images).imageScan).toBe(second);
+});
+
+it('names the container of a workload by namespace, and by cluster when there are several', () => {
+  const scan = { cluster: 'a', namespace: 'shop', name: 'web', container: 'app' };
+  expect(workloadLabel(scan, false)).toBe('shop/web/app');
+  expect(workloadLabel(scan, true)).toBe('a/shop/web/app');
+  expect(ofSeveralClusters([scan, { cluster: 'a' }])).toBe(false);
+  expect(ofSeveralClusters([scan, { cluster: 'b' }])).toBe(true);
+  expect(ofSeveralClusters([])).toBe(false);
 });

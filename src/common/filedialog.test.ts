@@ -85,9 +85,15 @@ it('downloads the file instead when the picked file cannot be written', async ()
     },
   }));
   const enqueueSnackbar = vi.fn();
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
 
   await saveToFile('content', 'export.csv', enqueueSnackbar);
 
+  expect(consoleError).toHaveBeenCalledWith(
+    'Error writing the file:',
+    expect.objectContaining({ name: 'NotAllowedError' })
+  );
+  consoleError.mockRestore();
   expect(await downloads[0].content).toBe('content');
   expect(enqueueSnackbar.mock.calls[0][1]).toEqual({ variant: 'warning' });
 });

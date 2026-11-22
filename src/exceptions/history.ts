@@ -6,6 +6,7 @@
   history. Anyone who can update the exception can change both, so the audit log of the
   Kubernetes API server remains the record to rely on.
 */
+import { post } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { getCurrentUser } from '../common/currentUser';
 import {
   ClusterSecurityException,
@@ -83,4 +84,53 @@ export async function recordChangeByCurrentUser<T extends AnyException>(
   cluster?: string
 ): Promise<T> {
   return recordChange(exception, existing, await getCurrentUser(cluster));
+}
+
+/**
+ * Creates a ClusterSecurityException in each of the clusters, as the user of each, for the
+ * pages that list findings of several clusters; no cluster is the current one. The failures
+ * name their cluster, and the exception exists in the other clusters.
+ */
+export async function createClusterException(
+  exception: ClusterSecurityException,
+  clusters: string[] | undefined
+): Promise<{ created: string[]; failed: Array<{ cluster: string; message: string }> }> {
+  const targets: Array<string | undefined> = clusters?.length ? clusters : [undefined];
+  const results = await Promise.allSettled(
+    targets.map(async cluster =>
+      post(
+        '/apis/kubescape.io/v1beta1/clustersecurityexceptions',
+        await recordChangeByCurrentUser(exception, undefined, cluster),
+        true,
+        cluster ? { cluster } : undefined
+      )
+    )
+  );
+  const created: string[] = [];
+  const failed: Array<{ cluster: string; message: string }> = [];
+  results.forEach((result, i) => {
+    const cluster = targets[i] ?? '';
+    if (result.status === 'fulfilled') created.push(cluster);
+    else failed.push({ cluster, message: result.reason?.message ?? String(result.reason) });
+  });
+  return { created, failed };
+}
+
+/** The message of a create in several clusters, for the snackbar. */
+export function createdInClustersMessage(
+  what: string,
+  { created, failed }: Awaited<ReturnType<typeof createClusterException>>
+): { message: string; variant: 'success' | 'error' | 'warning' } {
+  const failures = failed
+    .map(({ cluster, message }) => (cluster ? `${cluster}: ${message}` : message))
+    .join('; ');
+  if (failed.length === 0) {
+    const where = created.length > 1 ? ` in clusters ${created.join(', ')}` : '';
+    return { message: `${what} created${where}`, variant: 'success' };
+  }
+  if (created.length === 0) return { message: `Failed to create: ${failures}`, variant: 'error' };
+  return {
+    message: `${what} created in ${created.join(', ')}, but not in ${failures}`,
+    variant: 'warning',
+  };
 }

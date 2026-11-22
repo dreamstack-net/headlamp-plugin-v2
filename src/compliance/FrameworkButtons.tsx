@@ -12,10 +12,11 @@ import {
   Select,
   SelectChangeEvent,
   Stack,
+  Typography,
 } from '@mui/material';
 import React from 'react';
 import { kubescapeConfigStore } from '../common/config-store';
-import { defaultFrameworkNames, FrameWork, useRegoData } from '../rego';
+import { activeFrameworkNames, FrameWork, useRegoData } from '../rego';
 import { configurationScanContext } from './Compliance';
 import { frameworkComplianceScore } from './workload-scanning';
 
@@ -23,20 +24,25 @@ export function FrameworkButtons(
   props: Readonly<{
     frameworkName: string;
     customFrameworks: FrameWork[];
+    // whether the custom frameworks of the cluster were read
+    customFrameworksRead?: boolean;
   }>
 ) {
-  const { frameworkName, customFrameworks } = props;
+  const { frameworkName, customFrameworks, customFrameworksRead } = props;
   const { frameworks } = useRegoData();
 
   function frameworkChange(event: React.ChangeEvent<HTMLInputElement>, value: string) {
     kubescapeConfigStore.update({ framework: value });
   }
 
-  const activeFrameworks = kubescapeConfigStore.get().activeFrameworks as string[];
-  const selectedFrameworkNames =
-    activeFrameworks && activeFrameworks.length > 0 ? activeFrameworks : defaultFrameworkNames;
+  const selectedFrameworkNames = activeFrameworkNames(
+    kubescapeConfigStore.get()?.activeFrameworks,
+    customFrameworks
+  );
 
   const labels: JSX.Element[] = [];
+  // chosen in the settings, such as the custom frameworks of other clusters
+  const missing: string[] = [];
 
   selectedFrameworkNames
     .toSorted((a, b) => a.localeCompare(b))
@@ -60,6 +66,8 @@ export function FrameworkButtons(
             }
           />
         );
+      } else if (frameworks.length > 0 && customFrameworksRead) {
+        missing.push(name);
       }
     });
 
@@ -75,7 +83,14 @@ export function FrameworkButtons(
 
     const values = typeof value === 'string' ? value.split(',') : value;
 
-    kubescapeConfigStore.update({ activeFrameworks: values });
+    // The framework that the page shows goes with its radio button: unchecked here, the page
+    // would stay limited to a framework that can no longer be chosen or left
+    const shown = activeFrameworkNames(values, customFrameworks);
+    const opened = kubescapeConfigStore.get()?.framework ?? '';
+    kubescapeConfigStore.update({
+      activeFrameworks: values,
+      ...(opened !== '' && !shown.includes(opened) ? { framework: '' } : {}),
+    });
   };
 
   return (
@@ -91,6 +106,11 @@ export function FrameworkButtons(
           {labels}
         </RadioGroup>
       </FormControl>
+      {missing.length > 0 && (
+        <Typography variant="caption" color="text.secondary" sx={{ maxWidth: 260 }}>
+          Not in this cluster: {missing.join(', ')}
+        </Typography>
+      )}
       <FormControl variant="filled" sx={{ m: 1, minWidth: 160 }} size="small">
         <InputLabel id="select-label" sx={{ height: 40 }}>
           Frameworks

@@ -102,6 +102,8 @@ export function matchAlertProfile(
     return !!name && target.versionNames.includes(name);
   });
   if (ofVersion) return { profile: ofVersion, ofPodVersion: true };
+  // an alert that names no workload has none: a profile without the label is not its profile
+  if (!target.workload) return undefined;
   const newest = ofContainer
     .filter(profile => profile.metadata.labels?.['kubescape.io/workload-name'] === target.workload)
     .sort((a, b) =>
@@ -123,9 +125,16 @@ export async function findAlertProfile(
   const cluster = alert.cluster || undefined;
   const options = { ...(cluster ? { cluster } : {}), autoLogoutOnAuthError: false };
   const source = await discoverProfileResource('behavior', cluster);
+  // the labels come from Alertmanager, which anyone who can reach it can post alerts to, so they
+  // are encoded rather than taken as parts of the path
+  const namespacePath = `namespaces/${encodeURIComponent(namespace)}`;
   const [list, podObject] = await Promise.all([
-    request(`${storagePath}/namespaces/${namespace}/${source.plural}`, options),
-    pod ? request(`/api/v1/namespaces/${namespace}/pods/${pod}`, options).catch(() => null) : null,
+    request(`${storagePath}/${namespacePath}/${source.plural}`, options),
+    pod
+      ? request(`/api/v1/${namespacePath}/pods/${encodeURIComponent(pod)}`, options).catch(
+          () => null
+        )
+      : null,
   ]);
   const match = matchAlertProfile((list?.items ?? []) as ContainerProfile[], {
     container: alert.labels.container_name ?? alert.labels.container,
@@ -160,7 +169,9 @@ export async function fetchLearnedDomains(
   if (!match.source?.modern) return undefined;
   const { name, namespace, cluster } = match.profile.metadata;
   const profile: ContainerProfile = await request(
-    `${storagePath}/namespaces/${namespace}/${match.source.plural}/${name}`,
+    `${storagePath}/namespaces/${encodeURIComponent(namespace)}/${
+      match.source.plural
+    }/${encodeURIComponent(name)}`,
     { ...(cluster ? { cluster } : {}), autoLogoutOnAuthError: false }
   );
   const containers = getProfileContainers(profile);
@@ -187,20 +198,44 @@ export function registeredDomain(name: string): string {
 }
 
 export interface DomainComparison {
-  // whether the profile has the domain, itself or by a *. wildcard
+  // whether the profile has the domain, itself or by a wildcard
   learned: boolean;
   // the learned names under the same registered domain
   related: string[];
 }
 
+/** The labels of a name, or undefined for a name with an empty label, which matches nothing. */
+function domainLabels(name: string): string[] | undefined {
+  const labels = withoutDot(name).split('.');
+  return labels.includes('') ? undefined : labels;
+}
+
+/**
+ * Whether an entry of a profile with wildcards matches the labels of a name, as the node-agent
+ * matches them (matchDNSPattern in go/rules/match.go): label by label, where ⋯ and a * that is
+ * not the last label are one label, and a last * is one label or more. So *.example.com has
+ * cdn.example.com, but neither example.com nor a.cdn.example.com.
+ */
+function entryMatches(entry: string, name: string[]): boolean {
+  const pattern = domainLabels(entry);
+  if (!pattern || pattern.includes('**') || (pattern.length === 1 && pattern[0] === '*')) {
+    return false;
+  }
+  for (const [index, label] of pattern.entries()) {
+    if (label === '*' && index === pattern.length - 1 && index !== 0) return name.length > index;
+    if (index >= name.length) return false;
+    if (label !== '*' && label !== '⋯' && label !== name[index]) return false;
+  }
+  return pattern.length === name.length;
+}
+
 /** How a domain an alert is about compares to the domains the profile learned. */
 export function compareDomain(domain: string, learned: string[]): DomainComparison {
   const name = withoutDot(domain);
+  const labels = domainLabels(name);
   const base = registeredDomain(name);
   return {
-    learned: learned.some(
-      entry => entry === name || (entry.startsWith('*.') && name.endsWith(entry.slice(1)))
-    ),
+    learned: learned.some(entry => entry === name || (!!labels && entryMatches(entry, labels))),
     related: learned.filter(entry => entry !== name && registeredDomain(entry) === base),
   };
 }

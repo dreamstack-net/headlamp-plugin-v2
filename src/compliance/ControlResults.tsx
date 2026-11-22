@@ -8,31 +8,125 @@ import {
   SectionBox,
   TableColumn,
 } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
-import { FormControlLabel, IconButton, Link, Switch, Tooltip } from '@mui/material';
-import { useState } from 'react';
+import { Alert, FormControlLabel, IconButton, Link, Switch, Tooltip } from '@mui/material';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  KubescapeConfig,
+  kubescapeConfigStore,
+  selectedFrameworkName,
+} from '../common/config-store';
+import { errorMessage } from '../common/errors';
 import { makeNamespaceLink } from '../common/Namespace';
 import { KubescapeSettings, useSessionStorage } from '../common/sessionStorage';
 import Table from '../common/Table';
 import { getLastURLSegment } from '../common/url';
 import { GuidedComplianceExceptionForm } from '../exceptions/GuidedComplianceExceptionForm';
 import { RoutingName, useHLSelectedClusters } from '../index';
+import type { ClusterError } from '../model';
 import { useRegoData } from '../rego';
 import { WorkloadConfigurationScanSummary } from '../softwarecomposition/WorkloadConfigurationScanSummary';
-import { configurationScanContext } from './Compliance';
+import { configurationScanContext, readConfigurationScans } from './Compliance';
+import { ControlExceptionErrors } from './ControlExceptionErrors';
+import { isControlExcepted } from './workload-scanning';
+
+type Scan = WorkloadConfigurationScanSummary;
+
+// identifies the scan of a workload in all selected clusters
+function scanKey(scan: Scan) {
+  return JSON.stringify([scan.metadata.cluster, scan.metadata.namespace, scan.metadata.name]);
+}
+
+function controlOf(scan: Scan, controlID: string) {
+  return Object.values(scan.spec.controls).find(c => c.controlID === controlID);
+}
+
+/**
+ * Whether an exception excludes the workload or its result of the control; the exceptions
+ * limited to a framework apply in the framework of the Compliance page.
+ */
+export function isExcluded(scan: Scan, controlID: string, frameworkName?: string) {
+  const control = controlOf(scan, controlID);
+  return scan.exceptedByPolicy || (!!control && isControlExcepted(control, frameworkName));
+}
+
+/** The status of the result of the control, 'excluded' when an exception excludes it. */
+export function statusOf(scan: Scan, controlID: string, frameworkName?: string) {
+  return isExcluded(scan, controlID, frameworkName)
+    ? 'excluded'
+    : controlOf(scan, controlID)?.status.status ?? '';
+}
 
 export default function KubescapeControlResults() {
   const controlID = getLastURLSegment();
   const clusters = useHLSelectedClusters();
+  const clusterKey = clusters.join(',');
   const { controls, loading } = useRegoData();
 
   const [isFailedControlSwitchChecked, setIsFailedControlSwitchChecked] =
     useSessionStorage<boolean>(KubescapeSettings.FailedControls, true);
-  const [resourceList, setResourceList] = useState<WorkloadConfigurationScanSummary[]>(
-    getFailedResources(controlID, isFailedControlSwitchChecked)
+  // the scans the other pages read; this page reads them itself when it is opened directly,
+  // and again after an exception was created here
+  const [scans, setScans] = useState<Scan[]>(() => [...configurationScanContext.workloadScans]);
+  const [reading, setReading] = useState(false);
+  const [readError, setReadError] = useState<string | null>(null);
+  // the clusters whose exceptions could not be read
+  const [exceptionErrors, setExceptionErrors] = useState<ClusterError[]>(
+    () => configurationScanContext.exceptionErrors
   );
-  const [exceptionFormWorkload, setExceptionFormWorkload] =
-    useState<WorkloadConfigurationScanSummary | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [exceptionFormWorkload, setExceptionFormWorkload] = useState<Scan | null>(null);
   const control = controls.find(element => element.controlID === controlID);
+
+  useEffect(() => {
+    if (clusters.length === 0) return;
+    let active = true;
+    const continueReading = { current: true };
+    readConfigurationScans(
+      clusters,
+      (kubescapeConfigStore.get() ?? {}) as KubescapeConfig,
+      continueReading,
+      busy => active && setReading(busy),
+      () => {}
+    )
+      .then(found => {
+        if (!active) return;
+        setScans(found);
+        setExceptionErrors(configurationScanContext.exceptionErrors);
+      })
+      .catch(error => active && setReadError(errorMessage(error)));
+    return () => {
+      active = false;
+      continueReading.current = false;
+    };
+    // clusterKey covers clusters, which is a new array on every render
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusterKey, reloadKey]);
+
+  // the exceptions limited to a framework apply in the framework of the Compliance page
+  const frameworkName = selectedFrameworkName();
+  // the workloads that the control checked, and of them the ones the table shows
+  const affected = useMemo(
+    () => scans.filter(scan => !!controlOf(scan, controlID)),
+    [scans, controlID]
+  );
+  const resourceList = useMemo(
+    () =>
+      isFailedControlSwitchChecked
+        ? affected.filter(
+            scan =>
+              !isExcluded(scan, controlID, frameworkName) &&
+              controlOf(scan, controlID)?.status.status !==
+                WorkloadConfigurationScanSummary.Status.Passed
+          )
+        : affected,
+    [affected, controlID, isFailedControlSwitchChecked, frameworkName]
+  );
+  const passed = affected.filter(
+    scan =>
+      !isExcluded(scan, controlID, frameworkName) &&
+      controlOf(scan, controlID)?.status.status === WorkloadConfigurationScanSummary.Status.Passed
+  ).length;
+  const excluded = affected.filter(scan => isExcluded(scan, controlID, frameworkName)).length;
 
   if (loading) {
     return <></>;
@@ -41,14 +135,15 @@ export default function KubescapeControlResults() {
     return <p>The control {controlID} was not found.</p>;
   }
 
-  const setIsFailedControlSwitchChecked2 = (checked: boolean) => {
-    setIsFailedControlSwitchChecked(checked);
-    setResourceList(getFailedResources(controlID, checked));
-  };
-
   return (
     <>
       <SectionBox title={`${controlID}: ${control.name}`} backLink>
+        {readError && (
+          <Alert severity="error" sx={{ mb: 1 }}>
+            Unable to read the configuration scans: {readError}
+          </Alert>
+        )}
+        {!reading && <ControlExceptionErrors errors={exceptionErrors} clusters={clusters} />}
         <NameValueTable
           rows={[
             {
@@ -76,9 +171,11 @@ export default function KubescapeControlResults() {
             },
             {
               name: 'Passed',
-              value: `${getPassedResources(resourceList, controlID).length} of ${
-                resourceList.length
-              }`,
+              value: reading
+                ? 'Reading the scans…'
+                : `${passed} of ${affected.length}${
+                    excluded > 0 ? `, ${excluded} excluded by exceptions` : ''
+                  }`,
             },
           ]}
         />
@@ -89,28 +186,27 @@ export default function KubescapeControlResults() {
           checked={isFailedControlSwitchChecked}
           control={<Switch color="primary" />}
           label={'Failed controls'}
-          onChange={(event: any, checked: boolean) => {
-            setIsFailedControlSwitchChecked2(checked);
+          onChange={(_event, checked) => {
+            setIsFailedControlSwitchChecked(checked);
           }}
         />
         <Table
           data={resourceList}
+          loading={reading && resourceList.length === 0}
+          getRowId={scanKey}
           columns={[
             {
+              id: 'Status',
               header: 'Status',
-              accessorFn: (workloadScan: WorkloadConfigurationScanSummary) => {
-                const ctl = Object.values(workloadScan.spec.controls).find(
-                  c => c.controlID === controlID
-                );
-                if (workloadScan.exceptedByPolicy || ctl?.exceptedByPolicy) {
-                  return 'excluded';
-                }
-                return ctl?.status.status;
-              },
+              accessorFn: (scan: Scan) => statusOf(scan, controlID, frameworkName),
             },
             {
+              id: 'Name',
               header: 'Name',
-              Cell: ({ cell }: any) => (
+              accessorFn: (scan: Scan) => scan.metadata.labels['kubescape.io/workload-name'],
+              // no activeCluster: the route also names the cluster of the scan in its path, and
+              // Headlamp's Link would fill in all selected clusters there (cluster-b+cluster-a)
+              Cell: ({ cell }) => (
                 <HeadlampLink
                   routeName={RoutingName.KubescapeWorkloadConfigurationScanDetails}
                   params={{
@@ -122,47 +218,50 @@ export default function KubescapeControlResults() {
                   {cell.getValue()}
                 </HeadlampLink>
               ),
-              accessorFn: (workloadScan: WorkloadConfigurationScanSummary) =>
-                workloadScan.metadata.labels['kubescape.io/workload-name'],
             },
             {
               header: 'Kind',
-              accessorFn: (workloadScan: WorkloadConfigurationScanSummary) =>
-                workloadScan.metadata.labels['kubescape.io/workload-kind'],
+              accessorFn: (scan: Scan) => scan.metadata.labels['kubescape.io/workload-kind'],
             },
             {
               header: 'Namespace',
-              accessorFn: (workloadScan: WorkloadConfigurationScanSummary) =>
-                workloadScan.metadata.labels['kubescape.io/workload-namespace'],
-              Cell: ({ cell }: any) => (cell.getValue() ? makeNamespaceLink(cell.getValue()) : ''),
+              accessorFn: (scan: Scan) => scan.metadata.labels['kubescape.io/workload-namespace'],
+              Cell: ({ cell, row }) =>
+                cell.getValue()
+                  ? makeNamespaceLink(cell.getValue(), row.original.metadata.cluster)
+                  : '',
             },
-            clusters.length > 1
-              ? {
-                  header: 'Cluster',
-                  accessorKey: 'metadata.cluster',
-                }
-              : ({} as TableColumn<WorkloadConfigurationScanSummary>),
+            // only with several clusters; an empty object would be a column without a header
+            ...(clusters.length > 1
+              ? [{ header: 'Cluster', accessorKey: 'metadata.cluster' } as TableColumn<Scan>]
+              : []),
             {
               header: 'Scan name',
-              accessorFn: (workloadScan: WorkloadConfigurationScanSummary) =>
-                workloadScan.metadata.name,
+              accessorFn: (scan: Scan) => scan.metadata.name,
             },
             {
+              id: 'fix',
               header: '',
-              accessorFn: (workloadScan: WorkloadConfigurationScanSummary) => {
+              // the status, so that the cell is drawn again when it changes
+              accessorFn: (scan: Scan) => statusOf(scan, controlID, frameworkName),
+              enableSorting: false,
+              Cell: ({ row }) => {
+                const scan: Scan = row.original;
                 if (
-                  Object.values(workloadScan.spec.controls).find(c => c.controlID === controlID)
-                    ?.status.status === WorkloadConfigurationScanSummary.Status.Passed
-                )
-                  return;
+                  controlOf(scan, controlID)?.status.status ===
+                  WorkloadConfigurationScanSummary.Status.Passed
+                ) {
+                  return null;
+                }
+                // no activeCluster, as for the link of the name
                 return (
                   <HeadlampLink
                     routeName={RoutingName.KubescapeWorkloadConfigurationScanFixes}
                     params={{
-                      name: workloadScan.metadata.name,
-                      namespace: workloadScan.metadata.namespace,
-                      cluster: workloadScan.metadata.cluster,
-                      control: control.controlID,
+                      name: scan.metadata.name,
+                      namespace: scan.metadata.namespace,
+                      cluster: scan.metadata.cluster,
+                      control: controlID,
                     }}
                   >
                     Fix
@@ -171,22 +270,27 @@ export default function KubescapeControlResults() {
               },
             },
             {
+              id: 'exception',
               header: '',
-              accessorFn: (workloadScan: WorkloadConfigurationScanSummary) => {
-                const scanControl = Object.values(workloadScan.spec.controls).find(
-                  c => c.controlID === controlID
-                );
+              accessorFn: (scan: Scan) => statusOf(scan, controlID, frameworkName),
+              enableSorting: false,
+              Cell: ({ row }) => {
+                const scan: Scan = row.original;
                 if (
-                  !scanControl ||
-                  workloadScan.exceptedByPolicy ||
-                  scanControl.exceptedByPolicy ||
-                  scanControl.status.status !== WorkloadConfigurationScanSummary.Status.Failed
+                  statusOf(scan, controlID, frameworkName) !==
+                  WorkloadConfigurationScanSummary.Status.Failed
                 ) {
                   return null;
                 }
+                // the form checks whether the user may create the exception; without
+                // permission, it still offers its YAML for GitOps
                 return (
                   <Tooltip title="Create Security Exception">
-                    <IconButton size="small" onClick={() => setExceptionFormWorkload(workloadScan)}>
+                    <IconButton
+                      size="small"
+                      aria-label="Create Security Exception"
+                      onClick={() => setExceptionFormWorkload(scan)}
+                    >
                       <Icon icon="mdi:shield-plus-outline" />
                     </IconButton>
                   </Tooltip>
@@ -205,43 +309,11 @@ export default function KubescapeControlResults() {
             exceptionFormWorkload.metadata.labels['kubescape.io/workload-namespace']
           }
           workloadKind={exceptionFormWorkload.metadata.labels['kubescape.io/workload-kind']}
+          cluster={exceptionFormWorkload.metadata.cluster}
           onClose={() => setExceptionFormWorkload(null)}
+          onCreated={() => setReloadKey(key => key + 1)}
         />
       )}
     </>
-  );
-}
-
-function getFailedResources(controlID: string, isFailedControlSwitchChecked: boolean) {
-  const workloadsAffected = configurationScanContext.workloadScans.filter(w =>
-    Object.values(w.spec.controls).some(scan => scan.controlID === controlID)
-  );
-
-  if (isFailedControlSwitchChecked) {
-    return workloadsAffected.filter(
-      w =>
-        !w.exceptedByPolicy &&
-        Object.values(w.spec.controls).some(
-          scan =>
-            scan.controlID === controlID &&
-            !scan.exceptedByPolicy &&
-            scan.status.status !== WorkloadConfigurationScanSummary.Status.Passed
-        )
-    );
-  } else {
-    return workloadsAffected;
-  }
-}
-
-function getPassedResources(
-  workloadScanData: WorkloadConfigurationScanSummary[],
-  controlID: string
-): WorkloadConfigurationScanSummary[] {
-  return workloadScanData.filter(w =>
-    Object.values(w.spec.controls).some(
-      scan =>
-        scan.controlID === controlID &&
-        scan.status.status === WorkloadConfigurationScanSummary.Status.Passed
-    )
   );
 }

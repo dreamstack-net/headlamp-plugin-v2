@@ -10,9 +10,9 @@ import {
   NetworkPolicy,
 } from '../softwarecomposition/GeneratedNetworkPolicy';
 import { Direction, FlowResult, FlowStatus } from './compare';
-import { flowStatusColors, flowStatusDescriptions } from './ExistingPolicies';
+import { allPeersText, flowStatusColors, flowStatusDescriptions } from './ExistingPolicies';
 import { K8sNamespace, LogosKubernetes, TablerWorld } from './icons';
-import { isClusterRange, withoutPerPodLabels } from './layout';
+import { isAllPeers, isClusterRange, withoutPerPodLabels } from './layout';
 import { compactPorts, portsText } from './ports';
 
 const sourceHandle = <Handle type="source" position={Position.Right} id="source" />;
@@ -59,12 +59,12 @@ export function nodeFlowStatuses(nodes: Node[], flows: FlowResult[] | undefined)
     ];
     if (found.length === 0) continue;
     const kinds = new Set(found.map(flow => flow.status));
-    const status: FlowStatus =
-      kinds.size === 1
-        ? found[0].status
-        : kinds.has('allowed') || kinds.has('partly')
-        ? 'partly'
-        : 'blocked';
+    let status: FlowStatus = found[0].status;
+    if (kinds.size > 1) {
+      if (kinds.has('allowed') || kinds.has('partly')) status = 'partly';
+      else if (kinds.has('blocked')) status = 'blocked';
+      else status = 'unknown';
+    }
     statuses.set(node.id, {
       status,
       allowedBy: [...new Set(found.flatMap(flow => flow.allowedBy))],
@@ -132,14 +132,17 @@ const MainNode = (props: NodeProps<ConnectedNode>) => {
   const hasEgress =
     data.policy.spec.spec.egress && Object.entries(data.policy.spec.spec.egress).length > 0;
 
+  // a policy without the labels of its workload is named by its own name and namespace
+  const labels = data.policy.metadata.labels ?? {};
+
   return (
     <div className="network-node">
       <div className="title">
-        <LogosKubernetes /> {data.policy.metadata.labels['kubescape.io/workload-namespace']}
+        <LogosKubernetes /> {workloadNamespace(data.policy)}
       </div>
       <div className="text">
-        {data.policy.metadata.labels['kubescape.io/workload-kind']}{' '}
-        {data.policy.metadata.labels['kubescape.io/workload-name']}
+        {labels['kubescape.io/workload-kind']}{' '}
+        {labels['kubescape.io/workload-name'] ?? data.policy.metadata.name}
       </div>
       {hasIngress ? targetHandle : ''}
       {hasEgress ? sourceHandle : ''}
@@ -158,31 +161,44 @@ const ConnectedNode = (props: NodeProps<ConnectedNode>) => {
   }
 
   const differing = data.differingLabels?.join(', ');
-  const tooltip =
-    count > 1 ? (
-      <>
-        <StatusLine flowStatus={flowStatus} />
-        <div>
-          {differing
-            ? `${count} pods that differ in ${differing}, with these labels in common:`
-            : `${count} peers that only differ in per-pod labels, such as the pods of each CronJob run:`}
-        </div>
-        <TooltipText>{yaml.dump(data.peer)}</TooltipText>
-        <PortsTooltipLine ports={data.ports} />
-      </>
-    ) : (
-      <>
-        <StatusLine flowStatus={flowStatus} />
-        <TooltipText>{yaml.dump(data.peers?.[0] ?? data.peer)}</TooltipText>
-        <PortsTooltipLine ports={data.ports} />
-      </>
-    );
+  const direction = type === 'sourceNode' ? 'ingress' : 'egress';
+  const allPeers = isAllPeers(data.peer);
+  const tooltip = allPeers ? (
+    <>
+      <StatusLine flowStatus={flowStatus} />
+      <div>
+        A rule without peers, which allows these ports {direction === 'ingress' ? 'from' : 'to'} any
+        peer: Kubescape could not name the peer of this traffic.
+      </div>
+      <PortsTooltipLine ports={data.ports} />
+    </>
+  ) : count > 1 ? (
+    <>
+      <StatusLine flowStatus={flowStatus} />
+      <div>
+        {differing
+          ? `${count} pods that differ in ${differing}, with these labels in common:`
+          : `${count} peers that only differ in per-pod labels, such as the pods of each CronJob run:`}
+      </div>
+      <TooltipText>{yaml.dump(data.peer)}</TooltipText>
+      <PortsTooltipLine ports={data.ports} />
+    </>
+  ) : (
+    <>
+      <StatusLine flowStatus={flowStatus} />
+      <TooltipText>{yaml.dump(data.peers?.[0] ?? data.peer)}</TooltipText>
+      <PortsTooltipLine ports={data.ports} />
+    </>
+  );
 
   return (
     <Tooltip title={tooltip} slotProps={tooltipProps}>
       <Box className="network-node" style={statusStyle}>
         <div className="title">
-          {peerIcon(data.peer)} {peerOrigin(data.peer, workloadNamespace(data.policy))}
+          {peerIcon(data.peer)}{' '}
+          {allPeers
+            ? allPeersText(direction)
+            : peerOrigin(data.peer, workloadNamespace(data.policy))}
           {count > 1 && <span className="count"> ×{count}</span>}
         </div>
         <div className="text">{namespaceSelector(data.peer)}</div>
@@ -345,6 +361,7 @@ export function peerOrigin(peer: NetworkPolicy.Peer, namespace: string): string 
 }
 
 function peerIcon(peer: NetworkPolicy.Peer): JSX.Element {
+  if (isAllPeers(peer)) return <TablerWorld />;
   if (peer.namespaceSelector || !peer.ipBlock) {
     return <K8sNamespace />;
   }

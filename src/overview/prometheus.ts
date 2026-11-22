@@ -37,6 +37,17 @@ function isPrometheus(service: Service) {
   );
 }
 
+// Whether the name or the labels of a service say that it is the Prometheus server itself
+function isNamedServer(service: Service) {
+  const labels = service.metadata.labels ?? {};
+  return (
+    /(^|-)prometheus(-server|-operated)?$/.test(service.metadata.name) ||
+    labels['app.kubernetes.io/name'] === 'prometheus' ||
+    labels.app === 'prometheus' ||
+    labels['operated-prometheus'] === 'true'
+  );
+}
+
 /**
  * The addresses (namespace/service:port) of the Prometheus servers, the most likely first:
  * services with a cluster IP before headless ones such as prometheus-operated.
@@ -51,10 +62,13 @@ export function prometheusAddresses(services: Service[]): string[] {
     )
     .map(service => {
       const ports = service.spec?.ports ?? [];
+      // The port of the server, or the first port of a service that is named or labelled as the
+      // server. Other services with prometheus in their name are not servers: kube-prometheus-stack
+      // names the services of its scrape targets in kube-system after itself (…-kubelet, …-coredns)
       const port =
         ports.find(p => p.port === 9090) ??
         ports.find(p => ['web', 'http-web', 'http'].includes(p.name ?? '')) ??
-        ports[0];
+        (isNamedServer(service) ? ports[0] : undefined);
       return port && `${service.metadata.namespace}/${service.metadata.name}:${port.port}`;
     })
     .filter((address): address is string => !!address && isValidAlertmanagerAddress(address));
@@ -97,8 +111,11 @@ export async function fetchTrends(
         end: String(end),
         step: String(step),
       });
+      // a 401 of a proxy in front of Prometheus, such as kube-rbac-proxy, is not the end of the
+      // user's session, at which Headlamp would log them out
       const response = await request(`${prometheusUrl}/api/v1/query_range?${params.toString()}`, {
         cluster,
+        autoLogoutOnAuthError: false,
       });
       for (const series of response?.data?.result ?? []) {
         for (const [time, value] of series.values ?? []) {

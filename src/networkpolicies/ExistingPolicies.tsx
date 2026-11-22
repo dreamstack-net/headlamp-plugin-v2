@@ -20,7 +20,7 @@ import {
   policyDirections,
   ruleKey,
 } from './compare';
-import { withoutPerPodLabels } from './layout';
+import { isAllPeers, withoutPerPodLabels } from './layout';
 import { ComparisonResult, workloadOf } from './policyComparison';
 import { compactPorts, portsText } from './ports';
 
@@ -29,6 +29,7 @@ export const flowStatusLabels: Record<FlowStatus, string> = {
   partly: 'Partly allowed',
   blocked: 'Not allowed',
   unrestricted: 'Not restricted',
+  unknown: 'Unknown',
 };
 
 // the palette colors of the statuses
@@ -37,6 +38,7 @@ export const flowStatusColors: Record<FlowStatus, 'success' | 'warning' | 'error
   partly: 'warning',
   blocked: 'error',
   unrestricted: 'default',
+  unknown: 'default',
 };
 
 export const flowStatusDescriptions: Record<FlowStatus, string> = {
@@ -44,15 +46,22 @@ export const flowStatusDescriptions: Record<FlowStatus, string> = {
   partly: 'The current NetworkPolicies allow only part of this traffic',
   blocked: 'The current NetworkPolicies do not allow this traffic',
   unrestricted: 'No NetworkPolicy restricts this direction, so all traffic is allowed',
+  unknown:
+    'No pod or namespace of this peer could be found, or the generated policy names no peer and the current NetworkPolicies allow these ports only for some peers, so whether they allow this traffic is not known',
 };
 
 // blocked traffic first
-const statusOrder: FlowStatus[] = ['blocked', 'partly', 'allowed', 'unrestricted'];
+const statusOrder: FlowStatus[] = ['blocked', 'partly', 'unknown', 'allowed', 'unrestricted'];
 
 const directionLabels: Record<Direction, string> = { ingress: 'Ingress', egress: 'Egress' };
 
 function selectorText(selector: NetworkPolicy.LabelSelector) {
   return formatLabelSelector(selector).replaceAll(',', ', ');
+}
+
+/** The peer of a rule without peers, which allows its ports from or to any peer. */
+export function allPeersText(direction: Direction) {
+  return direction === 'ingress' ? 'All sources' : 'All destinations';
 }
 
 /** A peer of a policy in words, as the policy in the namespace selects it. */
@@ -76,15 +85,29 @@ export function peerText(peer: NetworkPolicy.Peer, namespace: string): string {
   return `${pods} in ${namespaces}`;
 }
 
-// Whether the labels of the generated policy decided the status, as no pod has them now
+// Whether the labels of the generated policy decided the status, as no pod has them now, or the
+// name of a namespace whose labels could not be read
 function isApproximate(flow: FlowResult) {
   return flow.approximate && flow.status !== 'unrestricted';
 }
 
+const generatedLabels = 'so the labels of the generated policy were compared';
+
+// Why the peer could not be compared as it is in the cluster, and what was compared instead
+const approximateNotes = {
+  labels: `No pod has these labels now, ${generatedLabels}`,
+  namespace: `No namespace that the peer selects could be found, ${generatedLabels}`,
+  'not-looked-up': `The pods of this peer were not looked up, as only those of the first 50 peers are, ${generatedLabels}`,
+  // not the same as no pod having the labels: the user may not read the pods of the namespace
+  'pods-unreadable': `The pods of this peer could not be read, ${generatedLabels}`,
+  'namespace-labels':
+    'The labels of the namespace of this peer could not be read, so the namespace selectors of the policies were compared with its name only',
+};
+
 function StatusChip(props: Readonly<{ flow: FlowResult }>) {
   const { flow } = props;
   const note = isApproximate(flow)
-    ? '. No pod has these labels now, so the labels of the generated policy were compared.'
+    ? `. ${approximateNotes[flow.approximateReason ?? 'labels']}.`
     : '';
   return (
     <Tooltip title={`${flowStatusDescriptions[flow.status]}${note}`}>
@@ -175,7 +198,7 @@ export function ExistingPolicies(
     );
   }
 
-  const { flows, selecting, restricting, ruleUse } = comparison;
+  const { flows, selecting, selectingSomePods, restricting, ruleUse } = comparison;
   const notAllowed = flows.filter(flow => flow.status === 'blocked' || flow.status === 'partly');
   const approximate = flows.some(isApproximate);
 
@@ -198,10 +221,27 @@ export function ExistingPolicies(
           )}
         </Alert>
       )}
+      {selectingSomePods.length > 0 && (
+        <Alert severity="warning">
+          Not all pods of {name} that run now are selected by{' '}
+          {selectingSomePods.map(policy => policy.metadata.name).join(', ')}. The comparison counts
+          such a policy for the whole workload, so the pods it leaves out are less restricted than
+          shown.
+        </Alert>
+      )}
       {result.approximateWorkload && (
         <Alert severity="info">
           The {name} workload could not be read, so the policies were matched against the pod labels
           of the generated policy.
+        </Alert>
+      )}
+      {result.podsNotRead && (
+        <Alert severity="info">
+          {result.podsNotRead === 'no-selector'
+            ? `The pods of ${name} are not read, as it has no selector,`
+            : `The pods of ${name} could not be read,`}{' '}
+          so the policies were matched against its pod template only: labels and named ports that
+          controllers or admission webhooks give its pods are not compared.
         </Alert>
       )}
 
@@ -219,7 +259,10 @@ export function ExistingPolicies(
             },
             {
               header: 'Peer',
-              accessorFn: (flow: FlowResult) => peerText(withoutPerPodLabels(flow.peer), namespace),
+              accessorFn: (flow: FlowResult) =>
+                isAllPeers(flow.peer)
+                  ? allPeersText(flow.direction)
+                  : peerText(withoutPerPodLabels(flow.peer), namespace),
               gridTemplate: 'auto',
             },
             {
@@ -231,7 +274,7 @@ export function ExistingPolicies(
               id: 'Status',
               header: 'Current policies',
               accessorFn: (flow: FlowResult) => statusOrder.indexOf(flow.status),
-              Cell: ({ row }: any) => <StatusChip flow={row.original} />,
+              Cell: ({ row }) => <StatusChip flow={row.original} />,
               gridTemplate: 'min-content',
             },
             {
@@ -244,8 +287,9 @@ export function ExistingPolicies(
         />
         {approximate && (
           <Typography variant="caption" color="text.secondary">
-            * No pod has the labels of this peer now, so the labels of the generated policy were
-            compared.
+            * These peers were compared by the labels of the generated policy, or by the name of
+            their namespace, as their pods or namespaces could not be found or read; the status says
+            why.
           </Typography>
         )}
       </Box>

@@ -16,15 +16,37 @@ import {
 } from '@mui/material';
 import { useEffect, useState } from 'react';
 import { useHistory } from 'react-router-dom';
+import { errorMessage as messageOf } from '../common/errors';
 import { Permitted } from '../common/permissions';
 import { getURLSegments } from '../common/url';
 
 const SEVERITIES = ['', 'Critical', 'High', 'Medium', 'Low'];
 const API_PATH = '/apis/kubescape.io/v1/runtimerulealertbindings';
 
-type LabelEntry = { key: string; value: string };
-type ExprEntry = { key: string; operator: string; values: string };
-type RuleEntry = { ruleName: string; severity: string };
+export type LabelEntry = { key: string; value: string };
+export type ExprEntry = { key: string; operator: string; values: string };
+// a rule of the binding; original is the rule as it was, whose other fields (ruleID, ruleTags,
+// parameters such as the ignored mounts of a file rule) are kept while it names the same rule
+export type RuleEntry = { ruleName: string; severity: string; original?: Record<string, any> };
+
+/** How a rule that is bound by its id or tags rather than its name is named in the form. */
+function ruleReference(rule: RuleEntry): string | undefined {
+  if (rule.ruleName.trim() || !rule.original) return undefined;
+  if (rule.original.ruleID) return `Rule ID ${rule.original.ruleID}`;
+  if (rule.original.ruleTags?.length) return `Rules tagged ${rule.original.ruleTags.join(', ')}`;
+  return undefined;
+}
+
+/** The rule as it is saved: the fields of the form over those it had. */
+export function ruleToSave(rule: RuleEntry): Record<string, any> {
+  const name = rule.ruleName.trim();
+  const original = rule.original ?? {};
+  // a rule that was replaced by another name keeps nothing of the one it was
+  const kept = !name || name === (original.ruleName ?? '') ? { ...original } : {};
+  delete kept.severity;
+  if (name) kept.ruleName = name;
+  return { ...kept, ...(rule.severity ? { severity: rule.severity } : {}) };
+}
 
 const OPERATORS = ['In', 'NotIn', 'Exists', 'DoesNotExist'];
 
@@ -42,6 +64,48 @@ function expressionsToEntries(matchExpressions: any[] | undefined): ExprEntry[] 
 
 function entriesToMatchLabels(entries: LabelEntry[]): Record<string, string> {
   return Object.fromEntries(entries.filter(e => e.key).map(e => [e.key, e.value]));
+}
+
+export interface BindingFormValues {
+  name: string;
+  nsLabels: LabelEntry[];
+  nsExpressions: ExprEntry[];
+  podLabels: LabelEntry[];
+  podExpressions: ExprEntry[];
+  rules: RuleEntry[];
+}
+
+/**
+ * The binding as it is saved: the fields of the form over the binding as it was read, whose
+ * labels, annotations and resourceVersion (such as those of Helm or Argo CD) and other fields
+ * are kept.
+ */
+export function bindingToSave(existing: any, form: BindingFormValues): any {
+  return {
+    ...existing,
+    apiVersion: 'kubescape.io/v1',
+    kind: 'RuntimeRuleAlertBinding',
+    metadata: {
+      ...existing?.metadata,
+      name: form.name.trim(),
+    },
+    spec: {
+      ...existing?.spec,
+      namespaceSelector: {
+        matchLabels: entriesToMatchLabels(form.nsLabels),
+        ...(form.nsExpressions.length
+          ? { matchExpressions: entriesToMatchExpressions(form.nsExpressions) }
+          : {}),
+      },
+      podSelector: {
+        matchLabels: entriesToMatchLabels(form.podLabels),
+        ...(form.podExpressions.length
+          ? { matchExpressions: entriesToMatchExpressions(form.podExpressions) }
+          : {}),
+      },
+      rules: form.rules.map(ruleToSave),
+    },
+  };
 }
 
 function entriesToMatchExpressions(entries: ExprEntry[]): any[] {
@@ -197,7 +261,7 @@ function RuleBindingForm({
   initialPodLabels = [],
   initialPodExpressions = [],
   initialRules = [],
-  resourceVersion,
+  existing,
   isEdit = false,
 }: Readonly<{
   initialName?: string;
@@ -206,7 +270,8 @@ function RuleBindingForm({
   initialPodLabels?: LabelEntry[];
   initialPodExpressions?: ExprEntry[];
   initialRules?: RuleEntry[];
-  resourceVersion?: string;
+  // the binding as it was read, whose metadata and other fields are kept
+  existing?: any;
   isEdit?: boolean;
 }>) {
   const history = useHistory();
@@ -238,7 +303,9 @@ function RuleBindingForm({
 
   const handleSave = async () => {
     if (!name.trim()) return setErrorMessage('Name is required');
-    if (rules.some(r => !r.ruleName.trim())) return setErrorMessage('All rules must have a name');
+    if (rules.some(r => !r.ruleName.trim() && !ruleReference(r))) {
+      return setErrorMessage('All rules must have a name');
+    }
     const hasEmptyInNotIn = [...nsExpressions, ...podExpressions].some(
       e =>
         (e.operator === 'In' || e.operator === 'NotIn') &&
@@ -249,32 +316,14 @@ function RuleBindingForm({
     );
     if (hasEmptyInNotIn) return setErrorMessage('In/NotIn expressions require at least one value');
 
-    const body: any = {
-      apiVersion: 'kubescape.io/v1',
-      kind: 'RuntimeRuleAlertBinding',
-      metadata: {
-        name: name.trim(),
-        ...(resourceVersion ? { resourceVersion } : {}),
-      },
-      spec: {
-        namespaceSelector: {
-          matchLabels: entriesToMatchLabels(nsLabels),
-          ...(nsExpressions.length
-            ? { matchExpressions: entriesToMatchExpressions(nsExpressions) }
-            : {}),
-        },
-        podSelector: {
-          matchLabels: entriesToMatchLabels(podLabels),
-          ...(podExpressions.length
-            ? { matchExpressions: entriesToMatchExpressions(podExpressions) }
-            : {}),
-        },
-        rules: rules.map(r => ({
-          ruleName: r.ruleName.trim(),
-          ...(r.severity ? { severity: r.severity } : {}),
-        })),
-      },
-    };
+    const body = bindingToSave(existing, {
+      name,
+      nsLabels,
+      nsExpressions,
+      podLabels,
+      podExpressions,
+      rules,
+    });
 
     try {
       if (isEdit) {
@@ -283,8 +332,8 @@ function RuleBindingForm({
         await post(API_PATH, body);
       }
       history.goBack();
-    } catch (err: any) {
-      setErrorMessage(err.message ?? String(err));
+    } catch (err) {
+      setErrorMessage(messageOf(err));
     }
   };
 
@@ -347,7 +396,14 @@ function RuleBindingForm({
                 value={r.ruleName}
                 onInputChange={(_, val) => updateRule(idx, 'ruleName', val)}
                 renderInput={params => (
-                  <TextField {...params} size="small" label="Rule Name" required />
+                  <TextField
+                    {...params}
+                    size="small"
+                    label="Rule Name"
+                    required={!ruleReference(r)}
+                    placeholder={ruleReference(r)}
+                    helperText={ruleReference(r)}
+                  />
                 )}
                 sx={{ flex: 2 }}
               />
@@ -400,46 +456,35 @@ export function RuleBindingNew() {
 
 export function RuleBindingEdit() {
   const [name] = getURLSegments(-1);
-  const [loaded, setLoaded] = useState(false);
-  const [nsLabels, setNsLabels] = useState<LabelEntry[]>([]);
-  const [nsExpressions, setNsExpressions] = useState<ExprEntry[]>([]);
-  const [podLabels, setPodLabels] = useState<LabelEntry[]>([]);
-  const [podExpressions, setPodExpressions] = useState<ExprEntry[]>([]);
-  const [rules, setRules] = useState<RuleEntry[]>([]);
-  const [resourceVersion, setResourceVersion] = useState('');
+  const [binding, setBinding] = useState<any>(null);
   const [error, setError] = useState('');
 
   useEffect(() => {
+    let active = true;
     request(`${API_PATH}/${name}`)
-      .then((b: any) => {
-        setResourceVersion(b.metadata.resourceVersion ?? '');
-        setNsLabels(labelsToEntries(b.spec?.namespaceSelector?.matchLabels));
-        setNsExpressions(expressionsToEntries(b.spec?.namespaceSelector?.matchExpressions));
-        setPodLabels(labelsToEntries(b.spec?.podSelector?.matchLabels));
-        setPodExpressions(expressionsToEntries(b.spec?.podSelector?.matchExpressions));
-        setRules(
-          (b.spec?.rules ?? []).map((r: any) => ({
-            ruleName: r.ruleName ?? '',
-            severity: r.severity ?? '',
-          }))
-        );
-        setLoaded(true);
-      })
-      .catch((err: any) => setError(err.message ?? String(err)));
+      .then((b: any) => active && setBinding(b))
+      .catch((err: unknown) => active && setError(messageOf(err)));
+    return () => {
+      active = false;
+    };
   }, [name]);
 
   if (error) return <Alert severity="error">{error}</Alert>;
-  if (!loaded) return null;
+  if (!binding) return null;
 
   return (
     <RuleBindingForm
       initialName={name}
-      initialNsLabels={nsLabels}
-      initialNsExpressions={nsExpressions}
-      initialPodLabels={podLabels}
-      initialPodExpressions={podExpressions}
-      initialRules={rules}
-      resourceVersion={resourceVersion}
+      initialNsLabels={labelsToEntries(binding.spec?.namespaceSelector?.matchLabels)}
+      initialNsExpressions={expressionsToEntries(binding.spec?.namespaceSelector?.matchExpressions)}
+      initialPodLabels={labelsToEntries(binding.spec?.podSelector?.matchLabels)}
+      initialPodExpressions={expressionsToEntries(binding.spec?.podSelector?.matchExpressions)}
+      initialRules={(binding.spec?.rules ?? []).map((r: any) => ({
+        ruleName: r.ruleName ?? '',
+        severity: r.severity ?? '',
+        original: r,
+      }))}
+      existing={binding}
       isEdit
     />
   );

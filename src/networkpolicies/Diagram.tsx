@@ -24,6 +24,7 @@ import {
 } from '@xyflow/react';
 import * as yaml from 'js-yaml';
 import { CSSProperties, useEffect, useMemo, useState } from 'react';
+import { errorMessage } from '../common/errors';
 import { useEditorTheme } from '../common/theme';
 import { getURLSegments } from '../common/url';
 import { RoutingName } from '../index';
@@ -58,7 +59,7 @@ function useGeneratedPolicy(name: string, namespace: string, cluster: string) {
         if (active) setPolicy(found);
       })
       .catch(err => {
-        if (active) setError(err?.message ?? String(err));
+        if (active) setError(errorMessage(err));
       });
     return () => {
       active = false;
@@ -141,14 +142,19 @@ function WorkloadGraph(props: Readonly<{ policy: GeneratedNetworkPolicy; cluster
 
 function GeneratedPolicyTabs(props: Readonly<{ policy: GeneratedNetworkPolicy; cluster: string }>) {
   const { policy, cluster } = props;
-  // read once for the diagram and the tab of the current policies
-  const comparison = usePolicyComparison(policy, cluster);
+  // read once for the diagram and the tab of the current policies, and again after a
+  // NetworkPolicy was created or replaced here
+  const [reload, setReload] = useState(0);
+  const comparison = usePolicyComparison(policy, cluster, reload);
   // the workload, as the Name column of the list shows it
   const workload = workloadOf(policy).name || policy.metadata.name;
 
   return (
     <SectionBox title={`Generated Network Policy - ${workload}`} backLink>
-      <NetworkPolicyActions generatedNetworkPolicy={policy} />
+      <NetworkPolicyActions
+        generatedNetworkPolicy={policy}
+        onApplied={() => setReload(count => count + 1)}
+      />
       <HeadlampTabs
         tabs={[
           {

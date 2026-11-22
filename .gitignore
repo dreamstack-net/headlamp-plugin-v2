@@ -8,3 +8,10 @@ hack
 integration-test 
 kubescape-headlamp-plugin.code-workspace
 .code-workspace
+# Python bytecode of the scripts
+__pycache__/
+# end-to-end tests: the plugin build, Headlamp's kubeconfig and Playwright's results
+e2e/.plugins/
+e2e/.headlamp/
+test-results/
+playwright-report/

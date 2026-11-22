@@ -45,6 +45,51 @@ it('finds the Prometheus servers, not the rest of the stack', () => {
   ]);
 });
 
+it('leaves out the scrape targets that kube-prometheus-stack names after itself', () => {
+  expect(
+    prometheusAddresses([
+      service('monitoring-kube-prometheus-prometheus', [{ name: 'http-web', port: 9090 }]),
+      // headless services in kube-system, for the ServiceMonitors of the stack
+      service(
+        'monitoring-kube-prometheus-kubelet',
+        [
+          { name: 'https-metrics', port: 10250 },
+          { name: 'cadvisor', port: 4194 },
+        ],
+        'None'
+      ),
+      service('monitoring-kube-prometheus-coredns', [{ name: 'http-metrics', port: 9153 }], 'None'),
+      service(
+        'monitoring-kube-prometheus-kube-proxy',
+        [{ name: 'http-metrics', port: 10249 }],
+        'None'
+      ),
+    ])
+  ).toEqual(['monitoring/monitoring-kube-prometheus-prometheus:9090']);
+});
+
+it('takes a server on another port by its port name, its own name or its labels', () => {
+  const labelled = {
+    ...service('metrics-store', [{ port: 8080 }]),
+    metadata: {
+      name: 'metrics-store',
+      namespace: 'monitoring',
+      labels: { 'app.kubernetes.io/name': 'prometheus' },
+    },
+  };
+  expect(
+    prometheusAddresses([
+      service('prometheus-server', [{ name: 'http', port: 80 }]),
+      service('prometheus', [{ port: 8080 }]),
+      labelled,
+    ])
+  ).toEqual([
+    'monitoring/prometheus:8080',
+    'monitoring/metrics-store:8080',
+    'monitoring/prometheus-server:80',
+  ]);
+});
+
 it('samples about 150 points, at most one an hour', () => {
   expect(trendStep(7)).toBe(4032);
   expect(trendStep(1)).toBe(3600);
@@ -88,7 +133,8 @@ it('reads the cluster totals into one row per time', async () => {
     String(30 * 24 * 3600),
     String(trendStep(30)),
   ]);
-  expect(options).toEqual({ cluster: 'cluster-a' });
+  // a 401 of the service behind the proxy does not log the user out
+  expect(options).toEqual({ cluster: 'cluster-a', autoLogoutOnAuthError: false });
 });
 
 it('reads nothing without a Prometheus address', async () => {

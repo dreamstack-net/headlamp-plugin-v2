@@ -27,7 +27,11 @@ export async function fetchKubescapeAlerts(cluster?: string): Promise<Alertmanag
   if (!alertmanagerUrl) return [];
 
   const url = `${alertmanagerUrl}/api/v2/alerts?filter=alertname%3D%22KubescapeRuleViolated%22&active=true&silenced=false&inhibited=false`;
-  const data = await request(url, cluster ? { cluster } : {});
+  // a 401 of a proxy in front of Alertmanager does not end the user's session
+  const data = await request(url, {
+    ...(cluster ? { cluster } : {}),
+    autoLogoutOnAuthError: false,
+  });
   const alerts: AlertmanagerAlert[] = Array.isArray(data) ? data : [];
   return alerts
     .map(alert => ({ ...alert, cluster }))
@@ -203,10 +207,10 @@ export async function fetchKubescapeSilences(cluster?: string): Promise<Silence[
   if (!alertmanagerUrl) return [];
 
   const filter = new URLSearchParams({ filter: 'alertname="KubescapeRuleViolated"' });
-  const data = await request(
-    `${alertmanagerUrl}/api/v2/silences?${filter.toString()}`,
-    cluster ? { cluster } : {}
-  );
+  const data = await request(`${alertmanagerUrl}/api/v2/silences?${filter.toString()}`, {
+    ...(cluster ? { cluster } : {}),
+    autoLogoutOnAuthError: false,
+  });
   const silences: Silence[] = Array.isArray(data) ? data : [];
   return silences
     .filter(silence => silence.status?.state !== 'expired')
@@ -216,24 +220,30 @@ export async function fetchKubescapeSilences(cluster?: string): Promise<Silence[
 
 /** Ends the silence, so its alerts show again. */
 export async function expireSilence(silence: Silence): Promise<void> {
-  await remove(
-    `${requireAlertmanagerUrl()}/api/v2/silence/${silence.id}`,
-    silence.cluster ? { cluster: silence.cluster } : undefined
-  );
+  await remove(`${requireAlertmanagerUrl()}/api/v2/silence/${silence.id}`, {
+    ...(silence.cluster ? { cluster: silence.cluster } : {}),
+    // a 401 of a proxy in front of the Alertmanager does not end the session
+    autoLogoutOnAuthError: false,
+    // Alertmanager answers 200 without a body, which Headlamp would fail to read as JSON
+    isJSON: false,
+  });
 }
 
 /**
  * Proxying requests to the Alertmanager service: create for creating silences, delete for
- * ending them.
+ * ending them. The service is named as the request names it, with its port: a role may allow
+ * the proxy of that service only (resourceNames), and a check without a name is then denied.
  */
 export function alertmanagerProxyCheck(verb: 'create' | 'delete' = 'create'): AccessCheck | null {
   const address = kubescapeConfigStore.get()?.alertmanagerUrl;
   if (!address || !isValidAlertmanagerAddress(address)) return null;
+  const [namespace, name] = address.split('/');
   return {
     group: '',
     resource: 'services',
     subresource: 'proxy',
     verb,
-    namespace: address.split('/')[0],
+    namespace,
+    name,
   };
 }

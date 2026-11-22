@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from '@mui/material';
 import { ReactNode, useState } from 'react';
+import { errorMessage } from './errors';
 
 export interface DeleteTarget {
   // what the object is, such as "Rules object"
@@ -41,8 +42,8 @@ export function ConfirmDeleteDialog(
     try {
       await onDelete();
       onClose();
-    } catch (err: any) {
-      setError(err?.message ?? String(err));
+    } catch (err) {
+      setError(errorMessage(err));
       setBusy(false);
     }
   };

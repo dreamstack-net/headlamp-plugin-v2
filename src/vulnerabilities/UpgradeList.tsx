@@ -9,7 +9,7 @@ import { KubescapeSettings, useSessionStorage } from '../common/sessionStorage';
 import { severityColors, SeverityCountStack } from '../common/SeverityCountBox';
 import HeadlampTable from '../common/Table';
 import { RoutingName } from '../index';
-import { WorkloadScan } from './scanData';
+import { getImageScanKey, WorkloadScan } from './scanData';
 import { countBySeverity, getPackageUpgrades, PackageUpgrade } from './upgrades';
 
 export default function UpgradeListView(props: Readonly<{ workloadScans: WorkloadScan[] }>) {
@@ -37,7 +37,7 @@ export default function UpgradeListView(props: Readonly<{ workloadScans: Workloa
               checked={relevantOnly}
               control={<Switch color="primary" />}
               label="Relevant"
-              onChange={(event: any, checked: boolean) => setRelevantOnly(checked)}
+              onChange={(_event, checked) => setRelevantOnly(checked)}
             />
           }
           csvExport={{
@@ -69,7 +69,8 @@ export default function UpgradeListView(props: Readonly<{ workloadScans: Workloa
             {
               header: 'Image',
               accessorFn: (upgrade: PackageUpgrade) => upgrade.imageScan.imageName,
-              Cell: ({ row }: any) => (
+              // the report the link opens is part of the id of the row
+              Cell: ({ cell, row }) => (
                 <HeadlampLink
                   routeName={RoutingName.ImageVulnerabilityDetails}
                   activeCluster={row.original.imageScan.cluster}
@@ -78,7 +79,7 @@ export default function UpgradeListView(props: Readonly<{ workloadScans: Workloa
                     namespace: row.original.imageScan.namespace,
                   }}
                 >
-                  {row.original.imageScan.imageName}
+                  {cell.getValue()}
                 </HeadlampLink>
               ),
               gridTemplate: 'auto',
@@ -101,12 +102,10 @@ export default function UpgradeListView(props: Readonly<{ workloadScans: Workloa
             {
               id: 'Fixes',
               header: 'Fixes',
-              // sorts like the list: by critical, then high, ... CVEs fixed
-              accessorFn: (upgrade: PackageUpgrade) =>
-                Object.keys(severityColors)
-                  .map(severity => String(countBySeverity(upgrade, severity)).padStart(5, '0'))
-                  .join('.'),
-              Cell: ({ row }: any) => (
+              // sorts like the list: by critical, then high, ... CVEs fixed; then the CVEs of the
+              // tooltips, so that they are drawn again when they change
+              accessorFn: fixesValue,
+              Cell: ({ row }) => (
                 <SeverityCountStack
                   count={severity => countBySeverity(row.original, severity)}
                   tooltip={severity => cveList(row.original, severity)}
@@ -117,18 +116,37 @@ export default function UpgradeListView(props: Readonly<{ workloadScans: Workloa
             {
               header: 'Workloads',
               accessorFn: (upgrade: PackageUpgrade) => upgrade.workloads.join('\n'),
-              Cell: ({ cell }: any) => (
-                <div style={{ whiteSpace: 'pre-line' }}>{cell.getValue()}</div>
-              ),
+              Cell: ({ cell }) => <div style={{ whiteSpace: 'pre-line' }}>{cell.getValue()}</div>,
               gridTemplate: 'auto',
             },
           ]}
           initialState={{ sorting: [{ id: 'Fixes', desc: true }] }}
+          // the cells of a row draw the image and the CVEs of the upgrade of the row
+          getRowId={upgradeRowId}
           reflectInURL="upgrades"
         />
       </SectionBox>
     </>
   );
+}
+
+/** Identifies the upgrade of a package in an image, of which an image has one per version. */
+export function upgradeRowId(upgrade: PackageUpgrade): string {
+  return JSON.stringify([
+    getImageScanKey(upgrade.imageScan),
+    upgrade.packageName,
+    upgrade.installedVersion,
+  ]);
+}
+
+// the counts of the CVEs fixed, most severe first and padded to sort as text, then the CVEs
+// with their severity, which the tooltips list
+function fixesValue(upgrade: PackageUpgrade): string {
+  const counts = Object.keys(severityColors)
+    .map(severity => String(countBySeverity(upgrade, severity)).padStart(5, '0'))
+    .join('.');
+  const cves = [...upgrade.cves].map(([id, severity]) => `${id} (${severity})`);
+  return `${counts} ${cves.join(' ')}`;
 }
 
 function cveList(upgrade: PackageUpgrade, severity: string) {

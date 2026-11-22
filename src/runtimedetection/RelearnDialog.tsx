@@ -20,7 +20,8 @@ import {
   Typography,
 } from '@mui/material';
 import { useSnackbar } from 'notistack';
-import { ReactNode, useEffect, useState } from 'react';
+import { ReactNode, useEffect, useRef, useState } from 'react';
+import { errorMessage } from '../common/errors';
 import { Permitted, useCanI } from '../common/permissions';
 import type { ContainerProfile } from '../softwarecomposition/ContainerProfile';
 import type { ProfileResource } from '../softwarecomposition/profileApi';
@@ -90,11 +91,21 @@ export function RelearnDialog(
   const { enqueueSnackbar } = useSnackbar();
   const [profiles, setProfiles] = useState<ContainerProfile[] | null>(null);
   const [restart, setRestart] = useState(restartable);
-  const [cleanup, setCleanup] = useState(true);
+  // deleting the profiles is proposed when a restart replaces the pods that they belong to
+  const [cleanup, setCleanup] = useState(restartable);
+  // whether the user chose that themselves, which reading the workload then leaves as it is
+  const cleanupChosen = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // whether the restart is done, so that trying again after deleting the profiles failed does
+  // not roll the workload out a second time
+  const [restarted, setRestarted] = useState(false);
   const canRestart = useCanI(restartCheck(workload), workload.cluster);
-  const canDelete = useCanI(deleteProfilesCheck(workload, source), workload.cluster);
+  // one check, or two for the halves of a profile on older Storage releases
+  const deleteChecks = deleteProfilesCheck(workload, source);
+  const canDeleteFirst = useCanI(deleteChecks[0], workload.cluster);
+  const canDeleteSecond = useCanI(deleteChecks[1] ?? null, workload.cluster);
+  const canDelete = canDeleteFirst === false || canDeleteSecond === false ? false : canDeleteFirst;
   // how the restart replaces the pods, once the workload is read
   const [impact, setImpact] = useState<RestartImpact | null>(null);
 
@@ -110,7 +121,12 @@ export function RelearnDialog(
       fetchWorkload(workload)
         .catch(() => undefined)
         .then(object => {
-          if (active) setImpact(restartImpact(workload.kind, object));
+          if (!active) return;
+          const read = restartImpact(workload.kind, object);
+          setImpact(read);
+          // pods that the restart leaves running still use their profiles, so deleting those is
+          // no longer proposed; a workload without pods has none that would lose its profile
+          if (read.leavesPodsRunning && !cleanupChosen.current) setCleanup(false);
         });
     }
     return () => {
@@ -118,8 +134,15 @@ export function RelearnDialog(
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const doRestart = restart && restartable && canRestart !== false;
+  // the restart that was chosen, done or still to do
+  const restarting = restarted || (restart && restartable && canRestart !== false);
+  const doRestart = restarting && !restarted;
   const doCleanup = cleanup && canDelete !== false && !!profiles;
+  // whether new pods replace those of the profiles; otherwise the running pods keep running
+  // without a profile, as Kubescape only learns a container from its start
+  const replacesPods = restarting && impact?.replacesPods !== false;
+  // what the button does is not known until the workload and the profiles to delete are read
+  const reading = (doRestart && !impact) || (cleanup && canDelete !== false && !profiles);
   const subject = `${workload.kind} ${workload.name}`;
 
   const relearn = async () => {
@@ -129,6 +152,7 @@ export function RelearnDialog(
     try {
       if (doRestart) {
         await restartWorkload(workload);
+        setRestarted(true);
         done.push(`Restarted ${subject}: its new pods are learned from their start.`);
       }
       // the profiles were read before the restart, so the one of the new pods stays
@@ -138,8 +162,8 @@ export function RelearnDialog(
       }
       enqueueSnackbar(done.join(' '), { variant: 'success' });
       onDone();
-    } catch (err: any) {
-      setError(`${done.length > 0 ? `${done.join(' ')} ` : ''}Then failed: ${err?.message ?? err}`);
+    } catch (err) {
+      setError(`${done.length > 0 ? `${done.join(' ')} ` : ''}Then failed: ${errorMessage(err)}`);
       setBusy(false);
     }
   };
@@ -166,10 +190,14 @@ export function RelearnDialog(
             <Permitted check={restartCheck(workload)} cluster={workload.cluster}>
               {allowed => (
                 <Choice
-                  checked={restart && allowed}
-                  disabled={!allowed}
+                  checked={restarted || (restart && allowed)}
+                  disabled={!allowed || restarted}
                   onChange={setRestart}
-                  label={`Restart the ${workload.kind} now`}
+                  label={
+                    restarted
+                      ? `Restarted the ${workload.kind}`
+                      : `Restart the ${workload.kind} now`
+                  }
                   description="Replaces every pod of the workload, as kubectl rollout restart does. The new pods get a new profile that is learned from their start."
                 />
               )}
@@ -182,12 +210,15 @@ export function RelearnDialog(
             </Typography>
           )}
 
-          <Permitted check={deleteProfilesCheck(workload, source)} cluster={workload.cluster}>
+          <Permitted check={deleteChecks} cluster={workload.cluster}>
             {allowed => (
               <Choice
                 checked={cleanup && allowed}
                 disabled={!allowed || !profiles}
-                onChange={setCleanup}
+                onChange={checked => {
+                  cleanupChosen.current = true;
+                  setCleanup(checked);
+                }}
                 label={
                   profiles
                     ? `Delete the ${plural(profiles.length, 'recorded profile')} of this workload`
@@ -208,12 +239,21 @@ export function RelearnDialog(
                 This restarts {subject}
                 {workload.cluster ? ` in cluster ${workload.cluster}` : ''}
               </AlertTitle>
-              Every pod of the workload is replaced, which can interrupt what it serves.{' '}
+              {replacesPods &&
+                'Every pod of the workload is replaced, which can interrupt what it serves. '}
               {impact ? impact.text : 'Reading the workload…'}
-              <Box sx={{ mt: 1 }}>
-                Until the new profile is learned, the rules that compare with the profile do not
-                alert on this workload.
-              </Box>
+              {replacesPods && (
+                <Box sx={{ mt: 1 }}>
+                  Until the new profile is learned, the rules that compare with the profile do not
+                  alert on this workload.
+                </Box>
+              )}
+            </Alert>
+          )}
+          {doCleanup && !replacesPods && (
+            <Alert severity="warning">
+              The pods that keep running lose their profile and are not learned again until they
+              start anew: until then the rules that compare with a profile do not alert on them.
             </Alert>
           )}
           {error && <Alert severity="error">{error}</Alert>}
@@ -224,10 +264,14 @@ export function RelearnDialog(
         <Button
           variant="contained"
           color={doRestart ? 'error' : 'primary'}
-          disabled={busy || (!doRestart && !doCleanup)}
+          disabled={busy || reading || (!doRestart && !doCleanup)}
           onClick={relearn}
         >
-          {doRestart ? 'Restart and relearn' : 'Delete profiles'}
+          {doRestart
+            ? 'Restart and relearn'
+            : restarted
+            ? 'Retry deleting profiles'
+            : 'Delete profiles'}
         </Button>
       </DialogActions>
     </Dialog>

@@ -2,5 +2,82 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "description": "Dependabot updates npm, Go modules and actions; Renovate the Kubescape data and the versions of the end-to-end setup",
+  "enabledManagers": [
+    "custom.regex"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The versions of the Kubescape data that the plugin ships",
+      "managerFilePatterns": [
+        "/^scripts/data-sources\\.json$/"
+      ],
+      "matchStrings": [
+        "\"celAdmissionLibrary\": \"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "kubescape/cel-admission-library",
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "The versions of the Kubescape data that the plugin ships",
+      "managerFilePatterns": [
+        "/^scripts/data-sources\\.json$/"
+      ],
+      "matchStrings": [
+        "\"regolibrary\": \"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "kubescape/regolibrary",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "The kubescape-operator chart of the end-to-end cluster",
+      "managerFilePatterns": [
+        "/^e2e/setup-kind.sh$/"
+      ],
+      "matchStrings": [
+        "KUBESCAPE_CHART_VERSION:-(?<currentValue>[^}]+)}"
+      ],
+      "depNameTemplate": "kubescape-operator",
+      "registryUrlTemplate": "https://kubescape.github.io/helm-charts/",
+      "datasourceTemplate": "helm"
+    },
+    {
+      "customType": "regex",
+      "description": "The kube-prometheus-stack chart of the end-to-end cluster",
+      "managerFilePatterns": [
+        "/^e2e/setup-kind.sh$/"
+      ],
+      "matchStrings": [
+        "PROMETHEUS_CHART_VERSION:-(?<currentValue>[^}]+)}"
+      ],
+      "depNameTemplate": "kube-prometheus-stack",
+      "registryUrlTemplate": "https://prometheus-community.github.io/helm-charts",
+      "datasourceTemplate": "helm"
+    },
+    {
+      "customType": "regex",
+      "description": "The Headlamp image the end-to-end tests run, by tag and digest",
+      "managerFilePatterns": [
+        "/^e2e/headlamp.sh$/"
+      ],
+      "matchStrings": [
+        "HEADLAMP_IMAGE:-(?<depName>ghcr.io/headlamp-k8s/headlamp):(?<currentValue>[^@}]+)@(?<currentDigest>sha256:[a-f0-9]+)"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Releases of the end-to-end setup only after two weeks, so a broken release can be withdrawn first",
+      "matchFileNames": [
+        "e2e/**"
+      ],
+      "minimumReleaseAge": "14 days"
+    }
   ]
 }

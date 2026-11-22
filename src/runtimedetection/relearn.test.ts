@@ -2,6 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import type { ContainerProfile } from '../softwarecomposition/ContainerProfile';
 import {
   deleteProfiles,
+  deleteProfilesCheck,
   fetchWorkloadProfiles,
   restartCheck,
   restartImpact,
@@ -92,6 +93,34 @@ it('tells how a restart replaces the pods, and when the workload is down', () =>
     impact('StatefulSet', { replicas: 3, updateStrategy: { type: 'OnDelete' } })
   ).toMatchObject({ replacesPods: false, text: expect.stringContaining('OnDelete') });
   expect(impact('Deployment', { replicas: 0 }).replacesPods).toBe(false);
+  // only pods that keep running would lose the profile they are checked against
+  expect(impact('Deployment', { replicas: 0 }).leavesPodsRunning).toBeUndefined();
+  expect(
+    impact('StatefulSet', { replicas: 3, updateStrategy: { type: 'OnDelete' } }).leavesPodsRunning
+  ).toBe(true);
+  expect(impact('Deployment', { replicas: 3, paused: true }).leavesPodsRunning).toBe(true);
+  // a paused Deployment rolls nothing out, and a partition keeps the pods below it
+  expect(impact('Deployment', { replicas: 3, paused: true })).toMatchObject({
+    severity: 'warning',
+    replacesPods: false,
+    text: expect.stringContaining('paused'),
+  });
+  expect(impact('Deployment', { replicas: 3, paused: false }).replacesPods).toBe(true);
+  expect(
+    impact('StatefulSet', {
+      replicas: 3,
+      updateStrategy: { type: 'RollingUpdate', rollingUpdate: { partition: 2 } },
+    })
+  ).toMatchObject({
+    replacesPods: false,
+    text: expect.stringContaining('the pods numbered below 2 keep running'),
+  });
+  expect(
+    impact('StatefulSet', {
+      replicas: 3,
+      updateStrategy: { type: 'RollingUpdate', rollingUpdate: { partition: 0 } },
+    }).replacesPods
+  ).toBe(true);
   expect(impact('DaemonSet', {}, { desiredNumberScheduled: 21 }).text).toContain(
     'each of its 21 nodes'
   );
@@ -141,4 +170,23 @@ it('deletes profiles, and both halves of an older profile', async () => {
 
   mocks.remove.mockReset().mockRejectedValue(Object.assign(new Error('denied'), { status: 403 }));
   await expect(deleteProfiles([profile('a')], modern)).rejects.toThrow('denied');
+});
+
+it('goes on deleting when a profile is gone already', async () => {
+  mocks.remove.mockImplementation(async (url: string) => {
+    if (url.endsWith('/a')) throw Object.assign(new Error('not found'), { status: 404 });
+  });
+  await deleteProfiles([profile('a'), profile('b')], modern);
+  expect(mocks.remove).toHaveBeenCalledTimes(2);
+});
+
+it('checks that both halves of an older profile may be deleted', () => {
+  const workload = workloadOfProfile(profile('a'))!;
+  expect(deleteProfilesCheck(workload, modern).map(check => check.resource)).toEqual([
+    'containerprofiles',
+  ]);
+  expect(deleteProfilesCheck(workload, legacy).map(check => check.resource)).toEqual([
+    'applicationprofiles',
+    'networkneighborhoods',
+  ]);
 });

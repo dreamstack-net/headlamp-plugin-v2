@@ -1,9 +1,6 @@
-import { post } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import {
   Box,
-  Button,
   Dialog,
-  DialogActions,
   DialogContent,
   DialogTitle,
   FormControl,
@@ -15,20 +12,30 @@ import {
 } from '@mui/material';
 import { useSnackbar } from 'notistack';
 import { useState } from 'react';
+import { createExceptionCheck } from '../common/permissions';
 import { SetupCheck } from '../common/SetupCheck';
 import { ClusterSecurityException } from '../softwarecomposition/SecurityException';
-import { recordChangeByCurrentUser } from './history';
-import { ContextBadge, MetadataFields, sanitizeName } from './shared';
+import { ExceptionDialogActions } from './ExceptionDialogActions';
+import { saveExceptionYaml } from './exceptionYaml';
+import {
+  createClusterException,
+  createdInClustersMessage,
+  recordChangeByCurrentUser,
+} from './history';
+import { ContextBadge, expiryTimestamp, MetadataFields, sanitizeName } from './shared';
 
 export interface GuidedClusterComplianceExceptionFormProps {
   controlID: string;
+  // the clusters whose results the page shows, the current one by default
+  clusters?: string[];
   onClose: () => void;
+  onCreated?: () => void;
 }
 
 export function GuidedClusterComplianceExceptionForm(
   props: Readonly<GuidedClusterComplianceExceptionFormProps>
 ) {
-  const { controlID, onClose } = props;
+  const { controlID, clusters, onClose, onCreated } = props;
   const { enqueueSnackbar } = useSnackbar();
 
   const [action, setAction] = useState<'ignore' | 'alert_only'>('ignore');
@@ -36,34 +43,45 @@ export function GuidedClusterComplianceExceptionForm(
   const [reason, setReason] = useState('');
   const [expiresDate, setExpiresDate] = useState('');
 
-  const handleSubmit = async () => {
+  // The exception that Create sends to each cluster, or undefined after saying what is missing
+  const buildException = (): ClusterSecurityException | undefined => {
     if (!name) {
       enqueueSnackbar('Name is required', { variant: 'error' });
-      return;
+      return undefined;
     }
-
-    const spec = {
-      ...(reason && { reason }),
-      ...(expiresDate && { expiresAt: `${expiresDate}T00:00:00Z` }),
-      match: {},
-      posture: [{ controlID, action }],
+    return {
+      apiVersion: 'kubescape.io/v1beta1',
+      kind: 'ClusterSecurityException',
+      metadata: { name },
+      spec: {
+        ...(reason && { reason }),
+        ...(expiresDate && { expiresAt: expiryTimestamp(expiresDate) }),
+        match: {},
+        posture: [{ controlID, action }],
+      },
     };
+  };
 
-    try {
-      await post(
-        '/apis/kubescape.io/v1beta1/clustersecurityexceptions',
-        await recordChangeByCurrentUser<ClusterSecurityException>({
-          apiVersion: 'kubescape.io/v1beta1',
-          kind: 'ClusterSecurityException',
-          metadata: { name },
-          spec,
-        })
-      );
-      enqueueSnackbar('Security exception created', { variant: 'success' });
+  const handleSubmit = async () => {
+    const exception = buildException();
+    if (!exception) return;
+    const result = await createClusterException(exception, clusters);
+    const { message, variant } = createdInClustersMessage('Security exception', result);
+    enqueueSnackbar(message, { variant });
+    if (result.created.length > 0) {
+      onCreated?.();
       onClose();
-    } catch (err: any) {
-      enqueueSnackbar(`Failed to create: ${err?.message ?? err}`, { variant: 'error' });
     }
+  };
+
+  // the exception that Create would send, with the user of the first cluster as its author
+  const handleDownload = async () => {
+    const exception = buildException();
+    if (!exception) return;
+    await saveExceptionYaml(
+      await recordChangeByCurrentUser(exception, undefined, clusters?.[0]),
+      enqueueSnackbar
+    );
   };
 
   return (
@@ -79,10 +97,14 @@ export function GuidedClusterComplianceExceptionForm(
             onReasonChange={setReason}
             expiresDate={expiresDate}
             onExpiresDateChange={setExpiresDate}
+            cluster={clusters?.[0]}
           />
 
           <ContextBadge label="Control" value={controlID} />
           <ContextBadge label="Scope" value="All namespaces — cluster-wide" />
+          {clusters && clusters.length > 1 && (
+            <ContextBadge label="Clusters" value={clusters.join(', ')} />
+          )}
 
           <FormControl fullWidth>
             <InputLabel>Action</InputLabel>
@@ -111,12 +133,14 @@ export function GuidedClusterComplianceExceptionForm(
           </FormControl>
         </Stack>
       </DialogContent>
-      <DialogActions>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button onClick={handleSubmit} variant="contained">
-          Create
-        </Button>
-      </DialogActions>
+      <ExceptionDialogActions
+        onCancel={onClose}
+        onDownload={handleDownload}
+        onSubmit={handleSubmit}
+        submitLabel="Create"
+        check={createExceptionCheck()}
+        clusters={clusters}
+      />
     </Dialog>
   );
 }

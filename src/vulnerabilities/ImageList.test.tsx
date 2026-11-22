@@ -6,7 +6,7 @@ import { useState } from 'react';
 import { vi } from 'vitest';
 import ImageList from './ImageList';
 import { toImageScan, WorkloadScan } from './scanData';
-import { manifest, T1, T2 } from './testFixtures';
+import { manifest, match, T1, T2 } from './testFixtures';
 
 const request = vi.hoisted(() => vi.fn());
 const versions = vi.hoisted(() => ({ config: {} as Record<string, unknown>, lookup: vi.fn() }));
@@ -51,6 +51,8 @@ vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', async () => {
 const tableTheme = createTheme(theme, { palette: { tables: { head: { borderColor: '#ddd' } } } });
 afterEach(cleanup);
 beforeEach(() => {
+  // the table keeps the sorting of the user for the session
+  window.sessionStorage.clear();
   // both are off until they are switched on
   versions.config = { imageVersions: true, endOfLife: true };
   versions.lookup.mockReset();
@@ -192,4 +194,47 @@ it('leaves out the end of life, or all version columns, as the settings say', as
     expect(versions.lookup).not.toHaveBeenCalled();
     next.unmount();
   }
+});
+
+it('sorts the counts of the images by their numbers in a table of ten rows or fewer', () => {
+  const withHighs = (name: string, highs: number) => {
+    const scan = workload(name);
+    scan.imageScan!.matches = Array.from({ length: highs }, (_, i) => match(`CVE-${i}`));
+    return scan;
+  };
+  // Headlamp's table picks how to sort from the rows after the tenth: with fewer, these values
+  // would compare as text, 0.9.0.0 above 0.12.0.0
+  renderImages([withHighs('nine', 9), withHighs('twelve', 12), withHighs('two', 2)]);
+
+  expect(
+    screen.getByRole('columnheader', { name: /Vulnerabilities/ }).getAttribute('aria-sort')
+  ).toBe('descending');
+  expect(imageOrder()).toEqual(['twelve', 'nine', 'two']);
+});
+
+it('sorts the lines without an announced end after the dated ones in a table of many rows', async () => {
+  // more than ten rows, after the tenth of which the table would pick how to sort by itself
+  const dates = Array.from({ length: 11 }, (_, i) => `20${30 - i}-01-01`);
+  const lines = new Map<string, string | undefined>([
+    ['current', undefined],
+    ...dates.map((date): [string, string] => [`dated-${date}`, date]),
+  ]);
+  versions.lookup.mockImplementation(async (image: string) => ({
+    line: {
+      product: 'product',
+      name: '1',
+      latest: '1.0.1',
+      eol: false,
+      eolFrom: lines.get(image),
+      url: 'https://endoflife.date/product',
+    },
+  }));
+  renderImages([...lines.keys()].map(name => workload(name)));
+  await waitFor(() => expect(screen.getAllByText('No date announced')).toHaveLength(1));
+
+  const header = screen.getByRole('columnheader', { name: /End of life/ });
+  fireEvent.click(within(header).getByRole('button', { name: /End of life/ }));
+  await waitFor(() => expect(header.getAttribute('aria-sort')).toBe('ascending'));
+  // the soonest end first, the line without a date last
+  expect(imageOrder()).toEqual([...[...dates].reverse().map(date => `dated-${date}`), 'current']);
 });

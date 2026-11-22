@@ -1,7 +1,23 @@
 /* 
   Build a horizontack stack with seperate cells for critical, high, medium, low, negligible and unknown. 
 */
-import { Box, Stack, Tooltip } from '@mui/material';
+import { Box, Link, Stack, Tooltip } from '@mui/material';
+import { ReactNode } from 'react';
+
+/**
+ * The id of a finding, linked to the page of its data source. The address comes from the report,
+ * so only a web address is linked: a link with another scheme, such as javascript:, would run in
+ * Headlamp.
+ */
+export function DataSourceLink(props: Readonly<{ href?: string; children: ReactNode }>) {
+  const { href, children } = props;
+  if (!href || !/^https?:\/\//i.test(href)) return <>{children}</>;
+  return (
+    <Link target="_blank" href={href}>
+      {children}
+    </Link>
+  );
+}
 
 export function getCVESummary(
   configurationScanSummary: any,

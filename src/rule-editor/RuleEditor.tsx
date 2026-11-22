@@ -1,7 +1,6 @@
 import { Icon } from '@iconify/react';
 import { post, put, request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
-import { getAllowedNamespaces } from '@kinvolk/headlamp-plugin/lib/k8s/cluster';
 import Editor from '@monaco-editor/react';
 import { TabContext, TabList } from '@mui/lab';
 import {
@@ -11,167 +10,26 @@ import {
   Alert,
   Box,
   Button,
-  Chip,
-  Dialog,
-  DialogContent,
-  DialogTitle,
   Divider,
-  FormControl,
-  FormControlLabel,
   IconButton,
-  InputLabel,
-  MenuItem,
-  Popover,
-  Select,
   Stack,
-  Switch,
   Tab,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableRow,
   TextField,
   Tooltip,
   Typography,
 } from '@mui/material';
-import Autocomplete from '@mui/material/Autocomplete';
 import * as yaml from 'js-yaml';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { errorMessage as messageOf } from '../common/errors';
 import { AccessCheck, PermittedIconButton } from '../common/permissions';
 import { TabPanel } from '../common/TabPanel';
 import { useEditorTheme } from '../common/theme';
 import { getURLSegments } from '../common/url';
-import { discoverProfileResource } from '../softwarecomposition/profileApi';
-import {
-  defaultEventData,
-  EventType,
-  ProfileDependency,
-  Rule,
-  RuleEvalResults,
-  RuleExpression,
-} from '../types/Rules';
-import { loadWasm } from '../wasm/initWasmModule';
-import type { BaselineKind, ProfileSource } from './profileLoader';
-import {
-  containerProfileToMockYAML,
-  getContainerProfile,
-  listContainerProfileNames,
-  listSelectableNamespaces,
-} from './profileLoader';
-
-const EVENT_TYPES = Object.keys(defaultEventData) as EventType[];
-
-const DEFAULT_NAMESPACE = 'kubescape';
-
-const MITRE_TACTICS: { id: string; name: string }[] = [
-  { id: 'TA0001', name: 'Initial Access' },
-  { id: 'TA0002', name: 'Execution' },
-  { id: 'TA0003', name: 'Persistence' },
-  { id: 'TA0004', name: 'Privilege Escalation' },
-  { id: 'TA0005', name: 'Defense Evasion' },
-  { id: 'TA0006', name: 'Credential Access' },
-  { id: 'TA0007', name: 'Discovery' },
-  { id: 'TA0008', name: 'Lateral Movement' },
-  { id: 'TA0009', name: 'Collection' },
-  { id: 'TA0010', name: 'Exfiltration' },
-  { id: 'TA0011', name: 'Command and Control' },
-  { id: 'TA0040', name: 'Impact' },
-  { id: 'TA0042', name: 'Resource Development' },
-  { id: 'TA0043', name: 'Reconnaissance' },
-];
-
-const MITRE_TECHNIQUES: { id: string; name: string }[] = [
-  { id: 'T1005', name: 'Data from Local System' },
-  { id: 'T1021.001', name: 'Remote Services: Remote Desktop Protocol' },
-  { id: 'T1036', name: 'Masquerading' },
-  { id: 'T1041', name: 'Exfiltration Over C2 Channel' },
-  { id: 'T1055', name: 'Process Injection' },
-  { id: 'T1059', name: 'Command and Scripting Interpreter' },
-  { id: 'T1068', name: 'Exploitation for Privilege Escalation' },
-  { id: 'T1071', name: 'Application Layer Protocol' },
-  { id: 'T1071.004', name: 'Application Layer Protocol: DNS' },
-  { id: 'T1078', name: 'Valid Accounts' },
-  { id: 'T1098', name: 'Account Manipulation' },
-  { id: 'T1190', name: 'Exploit Public-Facing Application' },
-  { id: 'T1210', name: 'Exploitation of Remote Services' },
-  { id: 'T1218', name: 'System Binary Proxy Execution' },
-  { id: 'T1496', name: 'Resource Hijacking' },
-  { id: 'T1525', name: 'Implant Internal Image' },
-  { id: 'T1528', name: 'Steal Application Access Token' },
-  { id: 'T1543', name: 'Create or Modify System Process' },
-  { id: 'T1547.006', name: 'Boot or Logon Autostart: Kernel Modules and Extensions' },
-  { id: 'T1552.001', name: 'Unsecured Credentials: Credentials In Files' },
-  { id: 'T1574.006', name: 'Hijack Execution Flow: Dynamic Linker Hijacking' },
-  { id: 'T1609', name: 'Container Administration Command' },
-  { id: 'T1610', name: 'Deploy Container' },
-  { id: 'T1611', name: 'Escape to Host' },
-  { id: 'T1613', name: 'Container and Resource Discovery' },
-  { id: 'T1622', name: 'Debugger Evasion' },
-];
-
-const EMPTY_RULE: Rule = {
-  name: '',
-  id: '',
-  enabled: true,
-  description: '',
-  expressions: {
-    message: '',
-    uniqueId: '',
-    ruleExpression: [{ eventType: 'exec', expression: '' }],
-  },
-  profileDependency: 2,
-  severity: 5,
-  supportPolicy: false,
-  isTriggerAlert: true,
-  mitreTactic: '',
-  mitreTechnique: '',
-  tags: [],
-};
-
-const EMPTY_PROFILE_YAML = `# ApplicationProfile mock data (keyed by containerId)
-# containers:
-#   abc123:
-#     execs:
-#       - path: /bin/bash
-#     syscalls:
-#       - read
-`;
-
-const EMPTY_NETWORK_YAML = `# NetworkNeighborhood mock data (keyed by containerId)
-# containers:
-#   abc123:
-#     egress:
-#       - ipAddress: "8.8.8.8"
-#         dns:
-#           - "dns.google."
-`;
-
-function MonacoEditor(
-  props: Readonly<{
-    editorRef?: React.MutableRefObject<any>;
-    language: string;
-    defaultValue: string;
-    height: number;
-    onChange: (value: string) => void;
-  }>
-) {
-  const { editorRef, language, defaultValue, height, onChange } = props;
-  const editorTheme = useEditorTheme();
-  return (
-    <Editor
-      language={language}
-      defaultValue={defaultValue}
-      height={height}
-      theme={editorTheme}
-      onMount={(editor: any) => {
-        if (editorRef) editorRef.current = editor;
-      }}
-      onChange={(value: string | undefined) => onChange(value ?? '')}
-      options={{ minimap: { enabled: false }, scrollBeyondLastLine: false }}
-    />
-  );
-}
+import { Rule } from '../types/Rules';
+import { isChartDefaultRules, useRulesNamespace } from './kubescapeNamespace';
+import { PlaygroundDialog } from './PlaygroundDialog';
+import { DEFAULT_NAMESPACE, EMPTY_RULE } from './ruleDefaults';
+import { RuleForm } from './RuleForm';
 
 export function RuleNew() {
   return <RuleFormPage />;
@@ -179,47 +37,75 @@ export function RuleNew() {
 
 export function RuleEdit() {
   const [name, namespace] = getURLSegments(-1, -2);
-  const [initialMeta, setInitialMeta] = useState<{
-    name: string;
-    namespace: string;
-    resourceVersion: string;
-  } | null>(null);
+  const [initialMeta, setInitialMeta] = useState<RuleMetadata | null>(null);
   const [initialRules, setInitialRules] = useState<Rule[] | null>(null);
+  const [error, setError] = useState('');
 
   useEffect(() => {
+    let active = true;
+    setError('');
     request(`/apis/kubescape.io/v1/namespaces/${namespace}/rules/${name}`)
       .then((crd: any) => {
+        if (!active) return;
         setInitialMeta({
+          ...crd.metadata,
           name: crd.metadata.name,
           namespace: crd.metadata.namespace,
           resourceVersion: crd.metadata.resourceVersion,
         });
         setInitialRules(crd.spec?.rules?.length ? crd.spec.rules : [EMPTY_RULE]);
       })
-      .catch((err: any) => console.error('Failed to load rule:', err));
+      .catch((err: unknown) => {
+        console.error('Failed to load rule:', err);
+        if (active) setError(messageOf(err));
+      });
+    return () => {
+      active = false;
+    };
   }, [name, namespace]);
 
+  if (error) {
+    return (
+      <SectionBox title="Edit Rule" backLink>
+        <Alert severity="error">
+          Unable to read the Rules object {namespace}/{name}: {error}
+        </Alert>
+      </SectionBox>
+    );
+  }
   if (!initialMeta || !initialRules) return null;
   return <RuleFormPage initialMeta={initialMeta} initialRules={initialRules} isEdit />;
 }
 
+// the metadata of a Rules object; the labels and annotations of one that was read are kept
+type RuleMetadata = {
+  name: string;
+  namespace: string;
+  resourceVersion?: string;
+  [field: string]: any;
+};
+
 function RuleFormPage({
   initialMeta,
   initialRules,
-  isEdit = false,
+  isEdit: openedForEdit = false,
 }: Readonly<{
-  initialMeta?: { name: string; namespace: string; resourceVersion?: string };
+  initialMeta?: RuleMetadata;
   initialRules?: Rule[];
   isEdit?: boolean;
 }>) {
   const editorTheme = useEditorTheme();
-  const [ruleMeta, setRuleMeta] = useState(
+  const [ruleMeta, setRuleMeta] = useState<RuleMetadata>(
     initialMeta ?? {
       name: '',
       namespace: DEFAULT_NAMESPACE,
-      resourceVersion: undefined as string | undefined,
+      resourceVersion: undefined,
     }
   );
+  // the object in the cluster that a save replaces: the one the page was opened for, or the
+  // one the page created
+  const [savedMeta, setSavedMeta] = useState<RuleMetadata | undefined>(initialMeta);
+  const isEdit = openedForEdit || !!savedMeta;
   const [rules, setRules] = useState<Rule[]>(initialRules ?? [EMPTY_RULE]);
   const ruleKeyCounter = useRef(0);
   const [ruleKeys, setRuleKeys] = useState<string[]>(() =>
@@ -231,6 +117,15 @@ function RuleFormPage({
   const [saved, setSaved] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [playgroundOpen, setPlaygroundOpen] = useState(false);
+  // the namespace of Kubescape in the current cluster, where the chart installs default-rules
+  const kubescapeNamespace = useRulesNamespace();
+  // a new Rules object goes to that namespace, unless the user chose another
+  const namespaceChosen = useRef(false);
+  useEffect(() => {
+    if (!initialMeta && !savedMeta && !namespaceChosen.current) {
+      setRuleMeta(meta => ({ ...meta, namespace: kubescapeNamespace }));
+    }
+  }, [kubescapeNamespace]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const ruleYAML = useMemo(
     () =>
@@ -277,39 +172,47 @@ function RuleFormPage({
       apiVersion: 'kubescape.io/v1',
       kind: 'Rules',
       metadata: {
-        name: ruleMeta.name,
-        namespace: ruleMeta.namespace,
+        // labels and annotations, such as those of Helm or Argo CD, are kept
+        ...savedMeta,
+        name: savedMeta?.name ?? ruleMeta.name,
+        namespace: savedMeta?.namespace ?? ruleMeta.namespace,
         ...(ruleMeta.resourceVersion ? { resourceVersion: ruleMeta.resourceVersion } : {}),
       },
       spec: { rules },
     };
 
     try {
-      if (isEdit) {
-        const origName = initialMeta?.name ?? ruleMeta.name;
-        const origNamespace = initialMeta?.namespace ?? ruleMeta.namespace;
-        await put(`/apis/kubescape.io/v1/namespaces/${origNamespace}/rules/${origName}`, body);
-      } else {
-        await post(`/apis/kubescape.io/v1/namespaces/${ruleMeta.namespace}/rules`, body);
-      }
+      const written: any = savedMeta
+        ? await put(
+            `/apis/kubescape.io/v1/namespaces/${savedMeta.namespace}/rules/${savedMeta.name}`,
+            body
+          )
+        : await post(`/apis/kubescape.io/v1/namespaces/${ruleMeta.namespace}/rules`, body);
+      // the next save replaces what this one wrote, with its new version
+      const metadata: RuleMetadata = {
+        ...body.metadata,
+        ...written?.metadata,
+      };
+      setSavedMeta(metadata);
+      setRuleMeta(meta => ({ ...meta, resourceVersion: metadata.resourceVersion }));
       setErrorMessage('');
       setSaved(true);
-    } catch (err: any) {
-      setErrorMessage(err.message ?? String(err));
+    } catch (err) {
+      setErrorMessage(messageOf(err));
     }
   };
 
-  const isReadOnly =
-    isEdit && initialMeta?.name === 'default-rules' && initialMeta?.namespace === 'kubescape';
+  // the chart's default-rules, which Helm would overwrite
+  const isReadOnly = openedForEdit && isChartDefaultRules(initialMeta, kubescapeNamespace);
   // an edit replaces the object it was opened from; a new one is created where the form says
-  const saveNamespace = (isEdit && initialMeta?.namespace) || ruleMeta.namespace;
+  const saveNamespace = savedMeta?.namespace || ruleMeta.namespace;
   const saveCheck: AccessCheck | null = saveNamespace
     ? {
         group: 'kubescape.io',
         resource: 'rules',
-        verb: isEdit ? 'update' : 'create',
+        verb: savedMeta ? 'update' : 'create',
         namespace: saveNamespace,
-        ...(isEdit && { name: initialMeta?.name ?? ruleMeta.name }),
+        ...(savedMeta && { name: savedMeta.name }),
       }
     : null;
 
@@ -380,17 +283,21 @@ function RuleFormPage({
                 size="small"
                 fullWidth
                 required
+                // a save replaces the object in the cluster, whose name cannot change
+                disabled={isEdit}
                 error={submitted && !ruleMeta.name}
               />
               <TextField
                 label="Namespace"
                 value={ruleMeta.namespace}
                 onChange={e => {
+                  namespaceChosen.current = true;
                   setRuleMeta(m => ({ ...m, namespace: e.target.value }));
                   setSaved(false);
                 }}
                 size="small"
                 fullWidth
+                disabled={isEdit}
               />
             </Stack>
             <Divider sx={{ mb: 2 }} />
@@ -462,1010 +369,5 @@ function RuleFormPage({
         </TabPanel>
       </TabContext>
     </SectionBox>
-  );
-}
-
-function RuleForm({
-  rule,
-  onRuleChange,
-  submitted,
-  readOnly = false,
-}: Readonly<{
-  rule: Rule;
-  onRuleChange: <K extends keyof Rule>(key: K, value: Rule[K]) => void;
-  submitted: boolean;
-  readOnly?: boolean;
-}>) {
-  const setExpr = (patch: Partial<Rule['expressions']>) =>
-    onRuleChange('expressions', { ...rule.expressions, ...patch });
-
-  const exprKeyCounter = useRef(0);
-  const exprKeys = useRef<string[]>(
-    rule.expressions.ruleExpression.map(() => String(exprKeyCounter.current++))
-  );
-
-  const updateExpression = (idx: number, field: keyof RuleExpression, value: string) => {
-    const exprs = [...rule.expressions.ruleExpression];
-    exprs[idx] = { ...exprs[idx], [field]: value };
-    setExpr({ ruleExpression: exprs });
-  };
-
-  const addExpression = () => {
-    exprKeys.current.push(String(exprKeyCounter.current++));
-    setExpr({
-      ruleExpression: [
-        ...rule.expressions.ruleExpression,
-        { eventType: 'exec' as EventType, expression: '' },
-      ],
-    });
-  };
-
-  const removeExpression = (idx: number) => {
-    exprKeys.current.splice(idx, 1);
-    setExpr({
-      ruleExpression: rule.expressions.ruleExpression.filter((_, i) => i !== idx),
-    });
-  };
-
-  const [syntaxErrors, setSyntaxErrors] = useState<{
-    message?: string;
-    uniqueId?: string;
-    expressions: (string | undefined)[];
-  }>({ expressions: [] });
-
-  useEffect(() => {
-    void loadWasm();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    const timeout = setTimeout(() => {
-      if (!window.RuleEval) return;
-      try {
-        const ruleYAML = yaml.dump({
-          apiVersion: 'kubescape.io/v1',
-          kind: 'Rules',
-          metadata: { name: 'validate', namespace: 'kubescape' },
-          spec: { rules: [rule] },
-        });
-
-        const distinctTypes = [...new Set(rule.expressions.ruleExpression.map(e => e.eventType))];
-
-        const exprErrors: (string | undefined)[] = rule.expressions.ruleExpression.map(
-          () => undefined
-        );
-        let messageError: string | undefined;
-        let uniqueIdError: string | undefined;
-
-        for (const et of distinctTypes) {
-          const result: RuleEvalResults = JSON.parse(
-            window.RuleEval(ruleYAML, et, JSON.stringify(defaultEventData[et] ?? {}), '', '')
-          );
-
-          // Go's Evaluate() returns only expressions matching `et`, in their original order.
-          // Reconstruct which original indices those correspond to.
-          const matchingIndices = rule.expressions.ruleExpression
-            .map((e, i) => (e.eventType === et ? i : -1))
-            .filter(i => i !== -1);
-
-          result.ruleExpression.forEach((r, j) => {
-            const origIdx = matchingIndices[j];
-            if (origIdx !== undefined && rule.expressions.ruleExpression[origIdx].expression) {
-              exprErrors[origIdx] = r.error || undefined;
-            }
-          });
-
-          if (!messageError && rule.expressions.message && result.message?.error)
-            messageError = result.message.error;
-          if (!uniqueIdError && rule.expressions.uniqueId && result.uniqueId?.error)
-            uniqueIdError = result.uniqueId.error;
-        }
-
-        setSyntaxErrors({
-          message: messageError,
-          uniqueId: uniqueIdError,
-          expressions: exprErrors,
-        });
-      } catch {
-        // WASM not ready yet
-      }
-    }, 400);
-    return () => clearTimeout(timeout);
-  }, [rule.expressions]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const row = { mb: 2 };
-  const mono = { style: { fontFamily: 'monospace', fontSize: 13 } };
-
-  return (
-    <Box
-      component={readOnly ? 'fieldset' : 'div'}
-      disabled={readOnly}
-      sx={{ border: 0, p: 0, m: 0 }}
-    >
-      <Stack direction="row" spacing={2} sx={row}>
-        <TextField
-          label="Name"
-          value={rule.name}
-          onChange={e => onRuleChange('name', e.target.value)}
-          size="small"
-          fullWidth
-          required
-          error={submitted && !rule.name}
-        />
-        <TextField
-          label="ID"
-          value={rule.id}
-          onChange={e => onRuleChange('id', e.target.value)}
-          size="small"
-          sx={{ minWidth: 110 }}
-          required
-          error={submitted && !rule.id}
-        />
-      </Stack>
-      <TextField
-        label="Description"
-        value={rule.description}
-        onChange={e => onRuleChange('description', e.target.value)}
-        size="small"
-        fullWidth
-        multiline
-        rows={2}
-        sx={row}
-      />
-
-      {/* Toggles */}
-      <Stack direction="row" spacing={3} sx={row}>
-        <FormControlLabel
-          control={
-            <Switch
-              color="primary"
-              checked={rule.enabled}
-              onChange={e => onRuleChange('enabled', e.target.checked)}
-              size="small"
-            />
-          }
-          label="Enabled"
-        />
-        <FormControlLabel
-          control={
-            <Switch
-              color="primary"
-              checked={rule.isTriggerAlert}
-              onChange={e => onRuleChange('isTriggerAlert', e.target.checked)}
-              size="small"
-            />
-          }
-          label="Trigger alert"
-        />
-        <FormControlLabel
-          control={
-            <Switch
-              color="primary"
-              checked={rule.supportPolicy}
-              onChange={e => onRuleChange('supportPolicy', e.target.checked)}
-              size="small"
-            />
-          }
-          label="Support policy"
-        />
-      </Stack>
-
-      {/* Severity */}
-      <TextField
-        label="Severity (1–10)"
-        type="number"
-        value={rule.severity}
-        onChange={e => {
-          const next = Number(e.target.value);
-          if (!Number.isFinite(next)) return;
-          onRuleChange('severity', Math.min(10, Math.max(1, next)));
-        }}
-        size="small"
-        sx={{ ...row, width: 160 }}
-        inputProps={{ min: 1, max: 10 }}
-      />
-
-      {/* Profile dependency */}
-      <FormControl size="small" sx={{ ...row, minWidth: 220 }}>
-        <InputLabel>Profile dependency</InputLabel>
-        <Select
-          label="Profile dependency"
-          value={rule.profileDependency}
-          onChange={e =>
-            onRuleChange('profileDependency', Number(e.target.value) as ProfileDependency)
-          }
-        >
-          <MenuItem value={0}>Required</MenuItem>
-          <MenuItem value={1}>Optional</MenuItem>
-          <MenuItem value={2}>Not required</MenuItem>
-        </Select>
-      </FormControl>
-
-      <Divider sx={{ mb: 2 }} />
-
-      <Stack direction="row" spacing={2} sx={row}>
-        <Autocomplete
-          freeSolo
-          options={MITRE_TACTICS}
-          getOptionLabel={o => (typeof o === 'string' ? o : `${o.id} — ${o.name}`)}
-          inputValue={rule.mitreTactic}
-          filterOptions={(options, { inputValue }) => {
-            const isStoredId = options.some(o => o.id === inputValue);
-            if (!inputValue || isStoredId) return options;
-            const q = inputValue.toLowerCase();
-            return options.filter(
-              o => o.id.toLowerCase().includes(q) || o.name.toLowerCase().includes(q)
-            );
-          }}
-          onInputChange={(_, v, reason) => {
-            if (reason !== 'reset') onRuleChange('mitreTactic', v);
-          }}
-          onChange={(_, v) =>
-            onRuleChange('mitreTactic', typeof v === 'string' ? v : v ? v.id : '')
-          }
-          size="small"
-          fullWidth
-          renderInput={params => (
-            <TextField
-              {...params}
-              label="Tactic"
-              required
-              error={submitted && !rule.mitreTactic}
-              helperText={submitted && !rule.mitreTactic ? 'Required' : ''}
-              placeholder="e.g. TA0002"
-            />
-          )}
-        />
-        <Autocomplete
-          freeSolo
-          options={MITRE_TECHNIQUES}
-          getOptionLabel={o => (typeof o === 'string' ? o : `${o.id} — ${o.name}`)}
-          inputValue={rule.mitreTechnique}
-          filterOptions={(options, { inputValue }) => {
-            const isStoredId = options.some(o => o.id === inputValue);
-            if (!inputValue || isStoredId) return options;
-            const q = inputValue.toLowerCase();
-            return options.filter(
-              o => o.id.toLowerCase().includes(q) || o.name.toLowerCase().includes(q)
-            );
-          }}
-          onInputChange={(_, v, reason) => {
-            if (reason !== 'reset') onRuleChange('mitreTechnique', v);
-          }}
-          onChange={(_, v) =>
-            onRuleChange('mitreTechnique', typeof v === 'string' ? v : v ? v.id : '')
-          }
-          size="small"
-          fullWidth
-          renderInput={params => (
-            <TextField
-              {...params}
-              label="Technique"
-              required
-              error={submitted && !rule.mitreTechnique}
-              helperText={submitted && !rule.mitreTechnique ? 'Required' : ''}
-              placeholder="e.g. T1059"
-            />
-          )}
-        />
-      </Stack>
-
-      {/* Tags */}
-      <TextField
-        label="Tags (comma-separated)"
-        value={(rule.tags ?? []).join(', ')}
-        onChange={e =>
-          onRuleChange(
-            'tags',
-            e.target.value
-              .split(',')
-              .map(t => t.trim())
-              .filter(Boolean)
-          )
-        }
-        size="small"
-        fullWidth
-        sx={row}
-      />
-
-      <Divider sx={{ mb: 2 }} />
-
-      <TextField
-        label="Message"
-        value={rule.expressions.message}
-        onChange={e => setExpr({ message: e.target.value })}
-        size="small"
-        fullWidth
-        sx={row}
-        inputProps={mono}
-        error={!!syntaxErrors.message}
-        helperText={syntaxErrors.message}
-      />
-      <TextField
-        label="Unique ID"
-        value={rule.expressions.uniqueId}
-        onChange={e => setExpr({ uniqueId: e.target.value })}
-        size="small"
-        fullWidth
-        sx={row}
-        inputProps={mono}
-        error={!!syntaxErrors.uniqueId}
-        helperText={syntaxErrors.uniqueId}
-      />
-
-      <Stack direction="row" alignItems="center" spacing={0.5} sx={{ mb: 1 }}>
-        <Typography variant="body2">Rule expressions</Typography>
-        <LibraryReferenceButton />
-      </Stack>
-      {rule.expressions.ruleExpression.map((expr, idx) => (
-        <Box
-          key={exprKeys.current[idx]}
-          sx={{ mb: 2, pl: 1, borderLeft: '3px solid', borderColor: 'divider' }}
-        >
-          <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1 }}>
-            <TextField
-              select
-              label="Event type"
-              value={expr.eventType}
-              onChange={e => updateExpression(idx, 'eventType', e.target.value)}
-              size="small"
-              sx={{ minWidth: 150 }}
-            >
-              {EVENT_TYPES.map(et => (
-                <MenuItem key={et} value={et}>
-                  {et}
-                </MenuItem>
-              ))}
-            </TextField>
-            <Box sx={{ flex: 1 }} />
-            {!readOnly && (
-              <IconButton
-                size="small"
-                onClick={() => removeExpression(idx)}
-                disabled={rule.expressions.ruleExpression.length <= 1}
-              >
-                <Icon icon="mdi:delete-outline" />
-              </IconButton>
-            )}
-          </Stack>
-          <TextField
-            value={expr.expression}
-            onChange={e => updateExpression(idx, 'expression', e.target.value)}
-            size="small"
-            fullWidth
-            placeholder="CEL expression"
-            multiline
-            minRows={2}
-            inputProps={mono}
-            error={!!syntaxErrors.expressions[idx]}
-            helperText={syntaxErrors.expressions[idx]}
-            InputProps={{ readOnly }}
-          />
-        </Box>
-      ))}
-      {!readOnly && (
-        <IconButton size="small" onClick={addExpression} sx={{ mt: 0.5 }}>
-          <Icon icon="mdi:plus-circle-outline" />
-        </IconButton>
-      )}
-    </Box>
-  );
-}
-
-const GROUP_DESCRIPTIONS: Record<string, string> = {
-  ap: 'ApplicationProfile — baseline of what a container normally executes, opens, and calls. Use ap.* to detect activity that was never seen during the learning phase.',
-  nn: 'NetworkNeighborhood — baseline of which IPs and domains a container normally contacts. Use nn.* to detect unexpected network destinations.',
-  k8s: 'Kubernetes metadata helpers — access cluster-level information such as the API server address or container mount paths.',
-  parse: 'Parsing utilities for extracting values from event fields.',
-  net: 'Network utilities for classifying IP addresses.',
-  process: 'Process-level helpers (return empty values in the browser playground).',
-};
-
-const LIBRARY_FUNCTIONS: Array<{ group: string; signature: string; description: string }> = [
-  {
-    group: 'ap',
-    signature: 'ap.was_executed(containerId, path) bool',
-    description: 'Path was executed by container in baseline',
-  },
-  {
-    group: 'ap',
-    signature: 'ap.was_path_opened(containerId, path) bool',
-    description: 'Path was opened by container in baseline',
-  },
-  {
-    group: 'ap',
-    signature: 'ap.was_path_opened_with_suffix(containerId, suffix) bool',
-    description: 'Any opened path ends with suffix',
-  },
-  {
-    group: 'ap',
-    signature: 'ap.was_path_opened_with_prefix(containerId, prefix) bool',
-    description: 'Any opened path starts with prefix',
-  },
-  {
-    group: 'ap',
-    signature: 'ap.was_syscall_used(containerId, syscallName) bool',
-    description: 'Syscall was used by container in baseline',
-  },
-  {
-    group: 'ap',
-    signature: 'ap.was_capability_used(containerId, capName) bool',
-    description: 'Capability was used by container in baseline',
-  },
-  {
-    group: 'nn',
-    signature: 'nn.is_domain_in_egress(containerId, domain) bool',
-    description: 'Domain appeared in egress DNS in baseline',
-  },
-  {
-    group: 'nn',
-    signature: 'nn.was_address_in_egress(containerId, addr) bool',
-    description: 'IP address appeared in egress in baseline',
-  },
-  {
-    group: 'k8s',
-    signature: 'k8s.is_api_server_address(addr) bool',
-    description: 'Address matches the cluster API server',
-  },
-  {
-    group: 'k8s',
-    signature: 'k8s.get_container_mount_paths(ns, pod, container) list',
-    description: 'Returns the mount paths for a container',
-  },
-  {
-    group: 'parse',
-    signature: 'parse.get_exec_path(args, comm) string',
-    description: 'Returns args[0] if non-empty, otherwise comm',
-  },
-  {
-    group: 'net',
-    signature: 'net.is_private_ip(ip) bool',
-    description: 'True if the IP is in a private range or loopback',
-  },
-  {
-    group: 'process',
-    signature: 'process.get_ld_hook_var(pid) string',
-    description: 'Returns the LD_PRELOAD hook variable (empty in playground)',
-  },
-];
-
-function LibraryReferenceButton() {
-  const [anchor, setAnchor] = useState<HTMLButtonElement | null>(null);
-  const groups = [...new Set(LIBRARY_FUNCTIONS.map(f => f.group))];
-
-  return (
-    <>
-      <Tooltip title="CEL function reference">
-        <IconButton size="small" onClick={e => setAnchor(e.currentTarget)}>
-          <Icon icon="mdi:information-outline" />
-        </IconButton>
-      </Tooltip>
-      <Popover
-        open={!!anchor}
-        anchorEl={anchor}
-        onClose={() => setAnchor(null)}
-        anchorOrigin={{ vertical: 'bottom', horizontal: 'left' }}
-      >
-        <Box sx={{ p: 2, width: '60vw', maxWidth: 900, maxHeight: '70vh', overflow: 'auto' }}>
-          <Typography variant="subtitle2" sx={{ mb: 1 }}>
-            Available CEL functions
-          </Typography>
-          <Table size="small">
-            <TableBody>
-              {groups.flatMap(group => [
-                <TableRow key={`hdr-${group}`}>
-                  <TableCell colSpan={2} sx={{ pt: 1.5, pb: 0.25, borderBottom: 0 }}>
-                    <Typography variant="caption" sx={{ fontWeight: 700 }}>
-                      {group}.*
-                    </Typography>
-                    {GROUP_DESCRIPTIONS[group] && (
-                      <Typography
-                        variant="caption"
-                        color="text.secondary"
-                        sx={{ display: 'block' }}
-                      >
-                        {GROUP_DESCRIPTIONS[group]}
-                      </Typography>
-                    )}
-                  </TableCell>
-                </TableRow>,
-                ...LIBRARY_FUNCTIONS.filter(f => f.group === group).map(f => (
-                  <TableRow key={f.signature}>
-                    <TableCell
-                      sx={{
-                        fontFamily: 'monospace',
-                        fontSize: '0.72rem',
-                        verticalAlign: 'top',
-                        py: 0.5,
-                        borderBottom: 0,
-                      }}
-                    >
-                      {f.signature}
-                    </TableCell>
-                    <TableCell
-                      sx={{
-                        fontSize: '0.75rem',
-                        color: 'text.secondary',
-                        verticalAlign: 'top',
-                        py: 0.5,
-                        borderBottom: 0,
-                      }}
-                    >
-                      {f.description}
-                    </TableCell>
-                  </TableRow>
-                )),
-              ])}
-            </TableBody>
-          </Table>
-        </Box>
-      </Popover>
-    </>
-  );
-}
-
-type RuleTestResult = {
-  rule: Rule;
-  evalResult: RuleEvalResults | null;
-  evalError: string;
-};
-
-type LoadMeta = { namespace: string; workload: string; containerName: string };
-
-function ClusterMockLoader({
-  baselineKind,
-  onLoad,
-}: Readonly<{
-  baselineKind: BaselineKind;
-  onLoad: (yaml: string, meta: LoadMeta) => void;
-}>) {
-  const [open, setOpen] = useState(false);
-  const [namespaces, setNamespaces] = useState<string[]>([]);
-  const [namespace, setNamespace] = useState('');
-  const [workloads, setWorkloads] = useState<string[]>([]);
-  const [workload, setWorkload] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [workloadsLoaded, setWorkloadsLoaded] = useState(false);
-  const [refresh, setRefresh] = useState(0);
-  const [source, setSource] = useState<ProfileSource | null>(null);
-  const discoveryRequest = useRef(0);
-
-  const handleOpen = () => {
-    const requestID = ++discoveryRequest.current;
-    setOpen(true);
-    setError('');
-    setSource(null);
-    setRefresh(value => value + 1);
-    Promise.all([
-      listSelectableNamespaces(getAllowedNamespaces()),
-      discoverProfileResource(baselineKind === 'application' ? 'behavior' : 'network'),
-    ])
-      .then(([availableNamespaces, discoveredSource]) => {
-        if (requestID !== discoveryRequest.current) return;
-        setNamespaces(availableNamespaces);
-        setNamespace(current =>
-          availableNamespaces.includes(current)
-            ? current
-            : availableNamespaces.length === 1
-            ? availableNamespaces[0]
-            : ''
-        );
-        setSource(discoveredSource);
-      })
-      .catch((err: any) => {
-        if (requestID === discoveryRequest.current) setError(err?.message ?? String(err));
-      });
-  };
-
-  useEffect(() => {
-    setWorkload('');
-    setWorkloads([]);
-    setWorkloadsLoaded(false);
-    setError('');
-    if (!namespace || !source) return;
-    let active = true;
-    listContainerProfileNames(namespace, source)
-      .then(names => {
-        if (active) {
-          setWorkloads(names);
-          setWorkloadsLoaded(true);
-        }
-      })
-      .catch((err: any) => {
-        if (active) setError(err?.message ?? String(err));
-      });
-    return () => {
-      active = false;
-    };
-  }, [namespace, source, refresh]);
-
-  const emptyComment =
-    baselineKind === 'network'
-      ? [
-          '# No network baseline found for this container profile.',
-          '# Network baseline is recorded by Kubescape after observing the',
-          '# workload during its learning phase. The nn.* functions will',
-          '# return false until baseline data is available.',
-        ].join('\n')
-      : [
-          '# No application baseline found for this container profile.',
-          '# The profile is recorded by Kubescape during the learning phase.',
-          '# The ap.* functions will return false until baseline data is available.',
-        ].join('\n');
-
-  const handleLoad = async () => {
-    if (!namespace || !workload || !source) return;
-    setLoading(true);
-    setError('');
-    try {
-      const profile = await getContainerProfile(namespace, workload, source);
-      const converted = containerProfileToMockYAML(profile, baselineKind);
-      const parsed = yaml.load(converted) as any;
-      const containerName = Object.keys(parsed?.containers ?? {})[0] ?? '';
-      const hasData = !!containerName;
-      onLoad(hasData ? converted : emptyComment, { namespace, workload, containerName });
-      setOpen(false);
-    } catch (err: any) {
-      setError(err?.message ?? String(err));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  if (!open) {
-    return (
-      <Button
-        size="small"
-        startIcon={<Icon icon="mdi:cloud-download-outline" />}
-        onClick={handleOpen}
-        sx={{ mb: 1 }}
-      >
-        Load from cluster
-      </Button>
-    );
-  }
-
-  return (
-    <Stack spacing={1} sx={{ mb: 1 }}>
-      {error && (
-        <Alert
-          severity="error"
-          action={
-            <Button color="inherit" size="small" onClick={handleOpen}>
-              Retry
-            </Button>
-          }
-        >
-          {error}
-        </Alert>
-      )}
-      {source && namespaces.length === 0 && (
-        <Alert severity="info">No accessible namespaces found.</Alert>
-      )}
-      {workloadsLoaded && workloads.length === 0 && (
-        <Alert severity="info">No profiles found in this namespace.</Alert>
-      )}
-      <Stack direction="row" spacing={1} alignItems="center" sx={{ flexWrap: 'wrap', gap: 1 }}>
-        <TextField
-          select
-          label="Namespace"
-          value={namespace}
-          onChange={e => setNamespace(e.target.value)}
-          size="small"
-          sx={{ minWidth: 160 }}
-          disabled={!source}
-        >
-          {namespaces.map(ns => (
-            <MenuItem key={ns} value={ns}>
-              {ns}
-            </MenuItem>
-          ))}
-        </TextField>
-        <TextField
-          select
-          label="Profile"
-          value={workload}
-          onChange={e => setWorkload(e.target.value)}
-          size="small"
-          sx={{ minWidth: 200 }}
-          disabled={!source || !workloads.length}
-        >
-          {workloads.map(w => (
-            <MenuItem key={w} value={w}>
-              {w}
-            </MenuItem>
-          ))}
-        </TextField>
-        <Button
-          variant="contained"
-          size="small"
-          onClick={handleLoad}
-          disabled={!source || !workload || loading}
-        >
-          Load
-        </Button>
-        <Button
-          size="small"
-          onClick={() => {
-            discoveryRequest.current++;
-            setOpen(false);
-          }}
-        >
-          Cancel
-        </Button>
-      </Stack>
-    </Stack>
-  );
-}
-
-function ruleChip(item: RuleTestResult) {
-  if (item.rule.enabled === false) return <Chip label="disabled" color="default" size="small" />;
-  if (item.evalError || item.evalResult?.error)
-    return <Chip label="error" color="error" size="small" />;
-  if (item.evalResult?.eventTypeMismatch) return <Chip label="N/A" color="default" size="small" />;
-  if (item.evalResult?.ruleExpression?.some(r => r.result === true))
-    return <Chip label="fired" color="warning" size="small" />;
-  if (item.evalResult) return <Chip label="not fired" color="success" size="small" />;
-  return null;
-}
-
-function PlaygroundDialog({
-  open,
-  onClose,
-  rules,
-  ruleMeta,
-}: Readonly<{
-  open: boolean;
-  onClose: () => void;
-  rules: Rule[];
-  ruleMeta: { name: string; namespace: string };
-}>) {
-  useEffect(() => {
-    void loadWasm();
-  }, []);
-
-  const [eventType, setEventType] = useState<EventType>('exec');
-  const [eventData, setEventData] = useState(JSON.stringify(defaultEventData.exec, null, 2));
-  const [profileYAML, setProfileYAML] = useState(EMPTY_PROFILE_YAML);
-  const [networkYAML, setNetworkYAML] = useState(EMPTY_NETWORK_YAML);
-  const [results, setResults] = useState<RuleTestResult[]>([]);
-  const [hideNA, setHideNA] = useState(true);
-  const [mockTabValue, setMockTabValue] = useState(1);
-  const eventEditorRef = useRef<any>(null);
-  const profileEditorRef = useRef<any>(null);
-  const networkEditorRef = useRef<any>(null);
-
-  const patchEventData = (meta: LoadMeta) => {
-    if (!meta.containerName && !meta.namespace && !meta.workload) return;
-    try {
-      const parsed = JSON.parse(eventData);
-      if (meta.containerName) {
-        parsed.containerId = meta.containerName;
-        parsed.containerName = meta.containerName;
-      }
-      if (meta.namespace) parsed.namespace = meta.namespace;
-      if (meta.workload) parsed.podName = meta.workload;
-      const updated = JSON.stringify(parsed, null, 2);
-      setEventData(updated);
-      eventEditorRef.current?.setValue(updated);
-    } catch {
-      // malformed event data — skip
-    }
-  };
-
-  const onEventTypeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const et = e.target.value as EventType;
-    setEventType(et);
-    const newEventData = JSON.stringify(defaultEventData[et] ?? {}, null, 2);
-    setEventData(newEventData);
-    eventEditorRef.current?.setValue(newEventData);
-    setResults([]);
-  };
-
-  const evaluate = useCallback(() => {
-    if (!window.RuleEval) {
-      setResults([]);
-      return;
-    }
-    const next: RuleTestResult[] = rules.map(rule => {
-      if (rule.enabled === false) return { rule, evalResult: null, evalError: '' };
-      const singleYAML = yaml.dump({
-        apiVersion: 'kubescape.io/v1',
-        kind: 'Rules',
-        metadata: ruleMeta,
-        spec: { rules: [rule] },
-      });
-      try {
-        const evalResult: RuleEvalResults = JSON.parse(
-          window.RuleEval(singleYAML, eventType, eventData, profileYAML, networkYAML)
-        );
-        return { rule, evalResult, evalError: '' };
-      } catch (err: any) {
-        return { rule, evalResult: null, evalError: err.message ?? String(err) };
-      }
-    });
-    setResults(next);
-  }, [rules, ruleMeta, eventType, eventData, profileYAML, networkYAML]);
-
-  useEffect(() => {
-    if (open) evaluate();
-  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (open) evaluate();
-  }, [eventType]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  return (
-    <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
-      <DialogTitle>
-        <Stack direction="row" alignItems="center" justifyContent="space-between">
-          <span>Test Rules</span>
-          <IconButton size="small" onClick={onClose}>
-            <Icon icon="mdi:close" />
-          </IconButton>
-        </Stack>
-      </DialogTitle>
-      <DialogContent>
-        <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
-          Event Data
-        </Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-          The runtime event that triggered the rule — for example an exec call, a file open, or a
-          network connection. Select the event type to load a template, then edit the fields to
-          match the scenario you want to test.
-        </Typography>
-        <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 1 }}>
-          <TextField
-            select
-            value={eventType}
-            onChange={onEventTypeChange}
-            label="Event type"
-            size="small"
-            sx={{ minWidth: 140 }}
-          >
-            {EVENT_TYPES.map(et => (
-              <MenuItem key={et} value={et}>
-                {et}
-              </MenuItem>
-            ))}
-          </TextField>
-        </Stack>
-
-        <MonacoEditor
-          editorRef={eventEditorRef}
-          language="json"
-          defaultValue={JSON.stringify(defaultEventData.exec, null, 2)}
-          height={200}
-          onChange={v => {
-            setEventData(v);
-            setResults([]);
-          }}
-        />
-
-        <Typography variant="subtitle2" sx={{ mt: 2, mb: 0.5 }}>
-          Baseline mock data
-        </Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-          Rules that use <code>ap.*</code> or <code>nn.*</code> functions compare the event against
-          a learned baseline. Populate these mocks to simulate what the baseline contains — leave
-          them empty to simulate a container with no baseline activity.
-        </Typography>
-        <TabContext value={mockTabValue}>
-          <TabList onChange={(_: any, v: number) => setMockTabValue(v)} sx={{ minHeight: 36 }}>
-            <Tab label="ApplicationProfile mock" value={1} sx={{ minHeight: 36, py: 0 }} />
-            <Tab label="NetworkNeighborhood mock" value={2} sx={{ minHeight: 36, py: 0 }} />
-          </TabList>
-          <TabPanel value={1}>
-            <ClusterMockLoader
-              baselineKind="application"
-              onLoad={(v, meta) => {
-                setProfileYAML(v);
-                profileEditorRef.current?.setValue(v);
-                patchEventData(meta);
-                setResults([]);
-              }}
-            />
-            <MonacoEditor
-              editorRef={profileEditorRef}
-              language="yaml"
-              defaultValue={EMPTY_PROFILE_YAML}
-              height={150}
-              onChange={v => {
-                setProfileYAML(v);
-                setResults([]);
-              }}
-            />
-          </TabPanel>
-          <TabPanel value={2}>
-            <ClusterMockLoader
-              baselineKind="network"
-              onLoad={(v, meta) => {
-                setNetworkYAML(v);
-                networkEditorRef.current?.setValue(v);
-                patchEventData(meta);
-                setResults([]);
-              }}
-            />
-            <MonacoEditor
-              editorRef={networkEditorRef}
-              language="yaml"
-              defaultValue={EMPTY_NETWORK_YAML}
-              height={150}
-              onChange={v => {
-                setNetworkYAML(v);
-                setResults([]);
-              }}
-            />
-          </TabPanel>
-        </TabContext>
-
-        <Box sx={{ mt: 2, mb: results.length ? 2 : 0 }}>
-          <Button variant="contained" onClick={evaluate}>
-            Evaluate
-          </Button>
-        </Box>
-
-        {results.length > 0 &&
-          (() => {
-            const errors = results.flatMap(item => {
-              const msg =
-                item.evalError ||
-                item.evalResult?.error ||
-                item.evalResult?.ruleExpression?.find(r => r.error)?.error;
-              return msg ? [`${item.rule.name}: ${msg}`] : [];
-            });
-
-            if (errors.length > 0) {
-              return (
-                <Box sx={{ mt: 2 }}>
-                  {errors.map((e, i) => (
-                    <Alert key={i} severity="error" sx={{ mb: 1 }}>
-                      {e}
-                    </Alert>
-                  ))}
-                </Box>
-              );
-            }
-
-            return (
-              <>
-                <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 1 }}>
-                  <Button
-                    size="small"
-                    variant={hideNA ? 'contained' : 'outlined'}
-                    onClick={() => setHideNA(h => !h)}
-                  >
-                    {hideNA ? 'Show N/A' : 'Hide N/A'}
-                  </Button>
-                </Stack>
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Name</TableCell>
-                      <TableCell>Result</TableCell>
-                      <TableCell>Message</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {results
-                      .filter(item => !hideNA || !item.evalResult?.eventTypeMismatch)
-                      .map((item, idx) => (
-                        <TableRow key={idx}>
-                          <TableCell>{item.rule.name}</TableCell>
-                          <TableCell>{ruleChip(item)}</TableCell>
-                          <TableCell sx={{ fontFamily: 'monospace', fontSize: '0.75rem' }}>
-                            {item.evalResult?.ruleExpression?.some(r => r.result === true)
-                              ? item.evalResult?.message?.result
-                              : ''}
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                  </TableBody>
-                </Table>
-              </>
-            );
-          })()}
-      </DialogContent>
-    </Dialog>
   );
 }

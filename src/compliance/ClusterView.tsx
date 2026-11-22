@@ -5,7 +5,7 @@ import { SectionBox, TableColumn } from '@kinvolk/headlamp-plugin/lib/CommonComp
 import { useMemo } from 'react';
 import { kubescapeConfigStore } from '../common/config-store';
 import Table from '../common/Table';
-import { defaultFrameworkNames, FrameWork, useRegoData } from '../rego';
+import { activeFrameworkNames, FrameWork, useRegoData } from '../rego';
 import { WorkloadConfigurationScanSummary } from '../softwarecomposition/WorkloadConfigurationScanSummary';
 import { frameworkComplianceScore } from './workload-scanning';
 
@@ -32,8 +32,10 @@ export default function ClusterView(
     return <></>;
   }
 
-  const selectedFrameworkNames =
-    (kubescapeConfigStore.get().activeFrameworks as string[]) ?? defaultFrameworkNames;
+  const selectedFrameworkNames = activeFrameworkNames(
+    kubescapeConfigStore.get()?.activeFrameworks,
+    customFrameworks
+  );
 
   const frameworkCells: TableColumn<ClusterResult>[] = [];
 

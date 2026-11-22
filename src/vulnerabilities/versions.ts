@@ -57,10 +57,17 @@ export function compareVersions(a: ParsedVersion, b: ParsedVersion) {
   );
 }
 
+/** Whether the version is a date such as 20240101, which tags a build. */
+export function isDate(version: ParsedVersion) {
+  return version.numbers.length === 1 && version.numbers[0] >= 1e7;
+}
+
 function sameFormat(tag: ParsedVersion, candidate: ParsedVersion) {
   if (candidate.prefix !== tag.prefix || candidate.numbers.length !== tag.numbers.length) {
     return false;
   }
+  // a build of a date is not a release of the line 3, as alpine tags both
+  if (isDate(tag) !== isDate(candidate)) return false;
   // a pre-release is followed by the release
   return candidate.shape === tag.shape || (isPrerelease(tag) && candidate.shape === '');
 }
@@ -90,6 +97,10 @@ export function newestTag(tag: string, tags: string[]): string | undefined {
  */
 function isRelease(version: ParsedVersion, current: ParsedVersion) {
   if (version.prefix !== '' && version.prefix !== 'v') return false;
+  // a date such as 20240101 tags a build, not a release of a project with dotted versions
+  if (version.numbers.length === 1 && current.numbers.length > 1 && version.numbers[0] >= 1e7) {
+    return false;
+  }
   if (!/[a-z]/i.test(version.suffix)) return true;
   return isPrerelease(current) && isPrerelease(version);
 }

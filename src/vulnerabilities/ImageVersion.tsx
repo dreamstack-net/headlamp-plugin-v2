@@ -8,11 +8,16 @@ import { Box, Link, Stack, Tooltip, Typography } from '@mui/material';
 import { useEffect, useMemo, useState } from 'react';
 import { KubescapeConfig, kubescapeConfigStore } from '../common/config-store';
 import {
+  endOfLifePermit,
   imageVersionKey,
+  imageVersionsPermit,
   LatestVersion,
   lookupImageVersion,
   possiblyPrivatePermit,
+  preferNewLookups,
   ReleaseLine,
+  stopEndOfLifeLookups,
+  stopImageVersionLookups,
   stopPossiblyPrivateLookups,
   versionCheckerResults,
 } from './imageVersionSources';
@@ -39,16 +44,21 @@ export function useImageVersionSettings() {
 }
 
 /**
- * The settings with a switch of the image versions changed. Switching off the newest versions or
- * the images that may be private stops the lookups that would still send names that may be
- * private, also those that wait their turn.
+ * The settings with a switch of the image versions changed. Switching one off stops the lookups
+ * that it allowed, also those that wait their turn: the newest versions all of them, the images
+ * that may be private those that would still send such names, and the end of life those that
+ * ask endoflife.date.
  */
 export function changeImageVersionSetting<T extends object>(
   data: T | undefined,
-  setting: 'imageVersions' | 'possiblyPrivateImages',
+  setting: 'imageVersions' | 'possiblyPrivateImages' | 'endOfLife',
   on: boolean
 ) {
-  if (!on) stopPossiblyPrivateLookups();
+  if (!on) {
+    if (setting === 'imageVersions') stopImageVersionLookups();
+    if (setting !== 'endOfLife') stopPossiblyPrivateLookups();
+    if (setting !== 'possiblyPrivateImages') stopEndOfLifeLookups();
+  }
   return { ...data, [setting]: on };
 }
 
@@ -65,19 +75,30 @@ export function imageVersionMapKey({ image, cluster }: ImageInCluster) {
 
 const noVersions = new Map<string, ImageVersion>();
 
+/** The permits of the lookups of a view, as the settings allowed them when it started them. */
+interface LookupPermits {
+  versions: AbortSignal;
+  // undefined when the settings do not show the end of life
+  endOfLife: AbortSignal | undefined;
+  // undefined when the settings do not allow names of images that may be private
+  possiblyPrivate: AbortSignal | undefined;
+}
+
 async function findVersion(
   { image, cluster, source }: ImageInCluster,
-  endOfLife: boolean,
-  possiblyPrivate: AbortSignal | undefined
+  permits: LookupPermits
 ): Promise<ImageVersion> {
   const tag = imageTag(image);
   const key = imageVersionKey(image);
   const checked = key ? (await versionCheckerResults(cluster)).get(key) : undefined;
+  // a lookup takes the permits that hold as it starts, so one that would start after its
+  // setting was switched off is not started
+  if (permits.versions.aborted) return { tag, newer: false };
   const found = await lookupImageVersion(image, {
     latest: !checked,
-    endOfLife,
+    endOfLife: !!permits.endOfLife && !permits.endOfLife.aborted,
     source,
-    possiblyPrivate,
+    possiblyPrivate: permits.possiblyPrivate,
   });
   if (checked) {
     return {
@@ -116,14 +137,25 @@ export function useImageVersions(images: ImageInCluster[]): Map<string, ImageVer
 
   useEffect(() => {
     if (!enabled || !wanted) return;
-    // taken now, so that switching the setting off also stops the lookups that start later
-    const permit = possiblyPrivate ? possiblyPrivatePermit() : undefined;
+    // taken now, so that switching a setting off also stops the lookups that start later
+    const permits: LookupPermits = {
+      versions: imageVersionsPermit(),
+      endOfLife: endOfLife ? endOfLifePermit() : undefined,
+      possiblyPrivate: possiblyPrivate ? possiblyPrivatePermit() : undefined,
+    };
+    // the view that opened last is served first
+    preferNewLookups();
     let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const found = new Map<string, ImageVersion>();
     const flush = () => {
       timer = undefined;
-      if (active) setVersions(new Map(found));
+      // while nothing was found, the views keep the map they have, so a list of images whose
+      // versions are unknown does not draw its rows again
+      if (active)
+        setVersions(previous =>
+          found.size === 0 && previous.size === 0 ? previous : new Map(found)
+        );
     };
     Promise.all(
       wanted.split('\n').map(async line => {
@@ -132,8 +164,7 @@ export function useImageVersions(images: ImageInCluster[]): Map<string, ImageVer
         const image = rest.join('|');
         const version = await findVersion(
           { cluster, image, source: source || undefined },
-          endOfLife,
-          permit
+          permits
         ).catch(() => null);
         if (!version?.latest && !version?.line) return;
         found.set(key, version);

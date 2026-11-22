@@ -107,11 +107,21 @@ export function workloadOfPod(pod: string): string {
  * it at both ends.
  */
 export function podsOfWorkloadPattern(pod: string): string | undefined {
+  // every tail that reads the same workload from the name: one pod template hash in a hundred
+  // has digits only, like the time of a Job of a CronJob, and the hash of the next rollout
+  // most likely has letters too
+  let workload: string | undefined;
+  const tails: string[] = [];
   for (const { tail, pattern } of ownerPatterns) {
     const match = pattern.exec(pod);
-    if (match) return `${match[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}${tail}`;
+    if (match && (workload ?? match[1]) === match[1]) {
+      workload = match[1];
+      tails.push(tail);
+    }
   }
-  return undefined;
+  if (workload === undefined) return undefined;
+  const name = workload.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return `${name}${tails.length > 1 ? `(?:${tails.join('|')})` : tails[0]}`;
 }
 
 /** The workload of the alert, named by the exporter or read from the pod name. */

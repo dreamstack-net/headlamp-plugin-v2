@@ -9,7 +9,7 @@ import {
 import { localeDate } from '@kinvolk/headlamp-plugin/lib/Utils';
 import { TabContext, TabList } from '@mui/lab';
 import { Alert, Chip, IconButton, Stack, Tab, Tooltip, Typography } from '@mui/material';
-import { KeyboardEvent, useEffect, useMemo, useState } from 'react';
+import { KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useHistory } from 'react-router-dom';
 import { ClusterErrors } from '../common/ClusterErrors';
 import { clusterColumns, rejectedClusters } from '../common/clusters';
@@ -24,11 +24,18 @@ import {
   applicationProfileClass,
   ClusterError,
   containerProfileClass,
-  listQuery,
+  listQueryWithErrors,
   rulesClass,
 } from '../model';
+import { useRulesNamespace } from '../rule-editor/kubescapeNamespace';
 import { ContainerProfile } from '../softwarecomposition/ContainerProfile';
 import { discoverProfileResource, ProfileResource } from '../softwarecomposition/profileApi';
+import type {
+  BoundRule,
+  LabelSelector,
+  RulesObject,
+  RuntimeRuleAlertBinding,
+} from '../types/RuleBinding';
 import { AlertDetailsDialog } from './AlertDetails';
 import {
   alertMessage,
@@ -52,7 +59,7 @@ import {
 import { isPartial } from './relearn';
 import { RelearnButton } from './RelearnDialog';
 import { SeccompProfilesTab } from './SeccompProfiles';
-import { SilenceButton, SilenceList, SilenceNotice } from './Silences';
+import { SilenceDialog, SilenceIconButton, SilenceList, SilenceNotice } from './Silences';
 
 const { createRouteURL } = Router;
 
@@ -100,7 +107,7 @@ export function RuntimeDetection() {
     <SectionBox title="Runtime Detection">
       <SetupCheck features={['runtime']} />
       <TabContext value={tabValue}>
-        <TabList onChange={(_: any, v: string) => setTabValue(v)} sx={{ mb: 1 }}>
+        <TabList onChange={(_, v: string) => setTabValue(v)} sx={{ mb: 1 }}>
           <Tab label="Alerts" value="alerts" />
           <Tab label="Application Profiles" value="profiles" />
           <Tab label="Seccomp Profiles" value="seccomp" />
@@ -127,6 +134,9 @@ export function RuntimeDetection() {
 
 // ── Alerts ────────────────────────────────────────────────────────────────────
 
+// an alert with the text of its Rule column: the rule's name and what it detects
+type AlertRow = AlertmanagerAlert & { ruleText: string };
+
 function AlertsTab() {
   const clusters = useHLSelectedClusters();
   const clustersKey = clusters.join(',');
@@ -137,24 +147,45 @@ function AlertsTab() {
   const [errors, setErrors] = useState<ClusterError[]>([]);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const [selected, setSelected] = useState<AlertmanagerAlert | null>(null);
+  // the alert whose rule is being silenced; its dialog is kept here rather than in the row, which
+  // leaves the page when a refresh brings newer alerts or drops this one
+  const [silencing, setSilencing] = useState<AlertmanagerAlert | null>(null);
   // the rules of the clusters, for what each alert's rule detects
-  const [ruleObjects] = rulesClass.useList({ clusters }) as any;
+  const [ruleObjects] = rulesClass.useList({ clusters }) as [RulesObject[] | null, unknown];
   const rules = useMemo(
     () =>
       indexRules(
-        (ruleObjects ?? []).map((object: any) => ({
+        (ruleObjects ?? []).map(object => ({
           cluster: object.cluster,
           rules: object.jsonData?.spec?.rules,
         }))
       ),
     [ruleObjects]
   );
+  // Headlamp only redraws a cell when its value changes, and keeps the values of a row until the
+  // data changes, so the rules, which may be read after the alerts, are part of new rows
+  const rows = useMemo<AlertRow[]>(
+    () =>
+      alerts.map(alert => ({
+        ...alert,
+        ruleText: [
+          alert.labels.rule_name ?? alert.labels.alertname,
+          ruleDescription(alertRule(rules, alert)),
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      })),
+    [alerts, rules]
+  );
   // re-render when the Alertmanager address is configured
   kubescapeConfigStore.useConfig()();
   const alertmanagerUrl = getAlertmanagerUrl();
 
+  // the latest read; an answer to an earlier one, such as for other clusters, is dropped
+  const latestRead = useRef(0);
   const fetchAlerts = () => {
     if (!alertmanagerUrl) return;
+    const read = ++latestRead.current;
     setLoading(true);
     Promise.all([
       Promise.allSettled(clusters.map(cluster => fetchKubescapeAlerts(cluster))),
@@ -162,6 +193,7 @@ function AlertsTab() {
       Promise.allSettled(clusters.map(cluster => fetchKubescapeSilences(cluster))),
     ])
       .then(([results, silenceResults]) => {
+        if (read !== latestRead.current) return;
         setAlerts(
           results
             .flatMap(result => (result.status === 'fulfilled' ? result.value : []))
@@ -173,13 +205,19 @@ function AlertsTab() {
         setErrors(rejectedClusters(clusters, results));
         setLastRefresh(new Date());
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (read === latestRead.current) setLoading(false);
+      });
   };
+  // a silence is answered later, to the handlers of the render that asked for it, so they read
+  // again through this ref, for the clusters selected now
+  const fetchAlertsNow = useRef(fetchAlerts);
+  fetchAlertsNow.current = fetchAlerts;
 
   // a silenced alert leaves the list, and an ended silence brings its alerts back
   const onSilenceChange = (change: SilenceNotice) => {
     setNotice(change);
-    if (change.severity === 'success') fetchAlerts();
+    if (change.severity === 'success') fetchAlertsNow.current();
   };
 
   useEffect(() => {
@@ -188,7 +226,11 @@ function AlertsTab() {
     const interval = setInterval(() => {
       if (!document.hidden) fetchAlerts();
     }, 60_000);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      // the answers of the reads made so far are dropped
+      latestRead.current++;
+    };
   }, [alertmanagerUrl, clustersKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!alertmanagerUrl) {
@@ -218,18 +260,18 @@ function AlertsTab() {
       )}
 
       <HeadlampTable
-        data={alerts}
+        data={rows}
         // a click on an alert shows its details
         onRowClick={setSelected}
         // the cells of a row keep what the row first showed, so each alert is a row of its own
-        getRowId={(a: AlertmanagerAlert) => `${a.cluster}/${a.fingerprint}/${a.startsAt}`}
+        getRowId={(a: AlertRow) => `${a.cluster}/${a.fingerprint}/${a.startsAt}`}
         columns={[
-          ...clusterColumns<AlertmanagerAlert>(clusters, alert => alert.cluster),
+          ...clusterColumns<AlertRow>(clusters, alert => alert.cluster),
           {
             id: 'time',
             header: 'Time',
             accessorKey: 'startsAt',
-            Cell: ({ cell }: any) => {
+            Cell: ({ cell }) => {
               const d = new Date(cell.getValue());
               const startOfToday = new Date();
               startOfToday.setHours(0, 0, 0, 0);
@@ -239,13 +281,9 @@ function AlertsTab() {
           },
           {
             header: 'Rule',
-            // with what the rule detects, which the search also finds; Headlamp only redraws a
-            // cell when its value changes, so rules read after the alerts are part of it
-            accessorFn: (a: AlertmanagerAlert) =>
-              [a.labels.rule_name ?? a.labels.alertname, ruleDescription(alertRule(rules, a))]
-                .filter(Boolean)
-                .join('\n'),
-            Cell: ({ cell }: any) => {
+            // with what the rule detects, which the search also finds
+            accessorKey: 'ruleText',
+            Cell: ({ cell }) => {
               const [name, description] = String(cell.getValue()).split('\n');
               return description ? (
                 <Tooltip title={description}>
@@ -256,7 +294,7 @@ function AlertsTab() {
               );
             },
             // the details can also be opened with the keyboard
-            muiTableBodyCellProps: ({ row }: any) => ({
+            muiTableBodyCellProps: ({ row }) => ({
               tabIndex: 0,
               onKeyDown: (event: KeyboardEvent<HTMLElement>) => {
                 if (event.key === 'Enter' || event.key === ' ') {
@@ -271,10 +309,10 @@ function AlertsTab() {
             id: 'severity',
             header: 'Severity',
             accessorFn: (a: AlertmanagerAlert) => alertSeverity(a) ?? '',
-            sortingFn: (a: any, b: any) =>
+            sortingFn: (a, b) =>
               (severityRank[alertSeverity(a.original) ?? 'None'] ?? 0) -
               (severityRank[alertSeverity(b.original) ?? 'None'] ?? 0),
-            Cell: ({ cell }: any) => {
+            Cell: ({ cell }) => {
               const severity = cell.getValue();
               if (!severity) return null;
               return <Chip label={severity} color={severityColor(severity)} size="small" />;
@@ -299,18 +337,30 @@ function AlertsTab() {
           {
             header: 'Message',
             accessorFn: (a: AlertmanagerAlert) => alertMessage(a),
-            Cell: ({ cell }: any) => <ShowHideLabel>{cell.getValue()}</ShowHideLabel>,
+            Cell: ({ cell }) => <ShowHideLabel>{cell.getValue()}</ShowHideLabel>,
             gridTemplate: 'minmax(280px, 2fr)',
           },
           {
             header: '',
             accessorFn: (a: AlertmanagerAlert) => `${a.cluster}/${a.fingerprint}`,
-            Cell: ({ row }: any) => <SilenceButton alert={row.original} onDone={onSilenceChange} />,
+            Cell: ({ row }) => (
+              <SilenceIconButton alert={row.original} onClick={() => setSilencing(row.original)} />
+            ),
             gridTemplate: 'min-content',
           },
         ]}
         initialState={{ sorting: [{ id: 'time', desc: true }] }}
       />
+      {silencing && (
+        <SilenceDialog
+          alert={silencing}
+          onClose={() => setSilencing(null)}
+          onDone={change => {
+            setSilencing(null);
+            onSilenceChange(change);
+          }}
+        />
+      )}
       {selected && (
         <AlertDetailsDialog
           alert={selected}
@@ -339,6 +389,9 @@ function ApplicationProfilesTab() {
   // the profile resource of each cluster, for relearning
   const [sources, setSources] = useState<Record<string, ProfileResource>>({});
   const [errors, setErrors] = useState<ClusterError[]>([]);
+  // the clusters whose profiles could not be read at all; a namespace that could not be read
+  // leaves the profiles of the others
+  const [failedClusters, setFailedClusters] = useState(0);
   const [loading, setLoading] = useState(true);
   // a relearn changes the profiles, so they are read again
   const [reloads, setReloads] = useState(0);
@@ -351,10 +404,11 @@ function ApplicationProfilesTab() {
         discoverProfileResource('behavior', cluster).then(async source => ({
           cluster,
           source,
-          profiles: (await listQuery(
+          // namespaces that could not be read are shown with the cluster errors
+          read: await listQueryWithErrors(
             source.modern ? containerProfileClass : applicationProfileClass,
             cluster
-          )) as ContainerProfile[],
+          ),
         }))
       )
     ).then(results => {
@@ -362,9 +416,15 @@ function ApplicationProfilesTab() {
       const found = results.flatMap(result =>
         result.status === 'fulfilled' ? [result.value] : []
       );
-      setItems(found.flatMap(result => result.profiles));
+      setItems(found.flatMap(result => result.read.items as ContainerProfile[]));
       setSources(Object.fromEntries(found.map(result => [result.cluster, result.source])));
-      setErrors(rejectedClusters(clusters, results));
+      setFailedClusters(results.filter(result => result.status === 'rejected').length);
+      setErrors([
+        ...rejectedClusters(clusters, results),
+        ...found.flatMap(({ cluster, read }) =>
+          read.errors.length > 0 ? [{ cluster, message: read.errors.join('; ') }] : []
+        ),
+      ]);
       setLoading(false);
     });
     return () => {
@@ -374,14 +434,14 @@ function ApplicationProfilesTab() {
 
   // With one cluster its error says enough; with several, the cluster is named
   const error = clusters.length === 1 ? errors[0]?.message : undefined;
-  const failed = errors.length === clusters.length;
+  const failed = clusters.length > 0 && failedClusters === clusters.length;
 
   return (
     <>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
         The behaviour and network traffic Kubescape learned per version of each workload, used by
-        the <code>ap.*</code> and <code>nn.*</code> CEL functions in rules. A profile shows its
-        traffic as a network graph.
+        the <code>cp.*</code> CEL functions in rules (formerly <code>ap.*</code> and{' '}
+        <code>nn.*</code>). A profile shows its traffic as a network graph.
       </Typography>
       {error ? (
         <Alert severity="error" sx={{ mb: 1 }}>
@@ -403,7 +463,7 @@ function ApplicationProfilesTab() {
               header: 'Name',
               accessorFn: (p: ContainerProfile) =>
                 p.metadata.labels?.['kubescape.io/workload-name'] ?? p.metadata.name,
-              Cell: ({ cell, row }: any) => (
+              Cell: ({ cell, row }) => (
                 <HeadlampLink
                   routeName={RoutingName.RuntimeDetection}
                   activeCluster={row.original.metadata.cluster}
@@ -447,7 +507,7 @@ function ApplicationProfilesTab() {
             {
               header: '',
               accessorFn: profileId,
-              Cell: ({ row }: any) => {
+              Cell: ({ row }) => {
                 const source = sources[row.original.metadata.cluster ?? ''];
                 return source ? (
                   <RelearnButton
@@ -479,20 +539,32 @@ interface RulesRow {
   ruleCount: number;
 }
 
+// Rules objects of the same name in other clusters are rows of their own
+function rulesRowId(row: RulesRow) {
+  return JSON.stringify([row.cluster, row.namespace, row.crdName]);
+}
+
 function RulesTab() {
   const clusters = useHLSelectedClusters();
-  const [rulesCRDs] = rulesClass.useList({ clusters }) as any;
+  const [rulesCRDs] = rulesClass.useList({ clusters }) as [RulesObject[] | null, unknown];
   const history = useHistory();
   // the Rules object to delete once the user confirms
   const [deleting, setDeleting] = useState<RulesRow | null>(null);
+  // the rule editor creates new Rules objects in the namespace of Kubescape of the current
+  // cluster, unless the user chooses another
+  const kubescapeNamespace = useRulesNamespace();
 
   const items: RulesRow[] =
-    rulesCRDs?.map((crd: any) => ({
+    rulesCRDs?.map(crd => ({
       crdName: crd.jsonData.metadata.name,
       namespace: crd.jsonData.metadata.namespace,
       cluster: crd.cluster,
       ruleCount: crd.jsonData.spec?.rules?.length ?? 0,
     })) ?? [];
+  // the row to delete as the list has it now: the cell that asked keeps the row it first drew,
+  // and the list is watched
+  const toDelete =
+    deleting && (items.find(item => rulesRowId(item) === rulesRowId(deleting)) ?? deleting);
 
   // The list is watched, so a successful delete removes the row without a reload.
   const deleteRules = ({ namespace, crdName, cluster }: RulesRow) =>
@@ -508,13 +580,12 @@ function RulesTab() {
           <code>kubescape.io/v1 Rules</code> CRDs deployed in the cluster. Click a name to open the
           rule editor.
         </Typography>
-        {/* the rule editor creates new Rules objects in the kubescape namespace by default */}
         <PermittedIconButton
           check={{
             group: 'kubescape.io',
             resource: 'rules',
             verb: 'create',
-            namespace: 'kubescape',
+            namespace: kubescapeNamespace,
           }}
           title="Add new rule"
           onClick={() => history.push(createRouteURL(RoutingName.RuleNew))}
@@ -522,29 +593,30 @@ function RulesTab() {
           <Icon icon="mdi:add-circle" />
         </PermittedIconButton>
       </Stack>
-      {deleting && (
+      {toDelete && (
         <ConfirmDeleteDialog
           target={{
             kind: 'Rules object',
-            name: deleting.crdName,
-            namespace: deleting.namespace,
-            cluster: deleting.cluster,
+            name: toDelete.crdName,
+            namespace: toDelete.namespace,
+            cluster: toDelete.cluster,
           }}
-          consequence={`Runtime detection no longer uses the ${deleting.ruleCount} ${
-            deleting.ruleCount === 1 ? 'rule' : 'rules'
+          consequence={`Runtime detection no longer uses the ${toDelete.ruleCount} ${
+            toDelete.ruleCount === 1 ? 'rule' : 'rules'
           } it holds.`}
-          onDelete={() => deleteRules(deleting)}
+          onDelete={() => deleteRules(toDelete)}
           onClose={() => setDeleting(null)}
         />
       )}
       <HeadlampTable
         data={items}
+        getRowId={(item: any) => rulesRowId(item)}
         columns={[
           {
             id: 'name',
             header: 'Name',
             accessorKey: 'crdName',
-            Cell: ({ cell, row }: any) => (
+            Cell: ({ cell, row }) => (
               <HeadlampLink
                 routeName={RoutingName.RuleEdit}
                 activeCluster={row.original.cluster}
@@ -569,7 +641,7 @@ function RulesTab() {
           {
             header: '',
             accessorFn: (item: any) => item.crdName,
-            Cell: ({ row }: any) => (
+            Cell: ({ row }) => (
               <PermittedIconButton
                 check={{
                   group: 'kubescape.io',
@@ -597,7 +669,15 @@ function RulesTab() {
 
 // ── Rule Bindings ─────────────────────────────────────────────────────────────
 
-function formatSelector(selector: any): string {
+/** A rule of a binding, which names it, or binds it by its id or its tags. */
+function boundRuleLabel(rule: BoundRule): string {
+  if (rule.ruleName) return rule.ruleName;
+  if (rule.ruleID) return rule.ruleID;
+  if (rule.ruleTags?.length) return `tags: ${rule.ruleTags.join(', ')}`;
+  return '?';
+}
+
+function formatSelector(selector: LabelSelector | undefined): string {
   if (!selector) return '(all)';
   const parts: string[] = [];
   if (selector.matchLabels) {
@@ -606,7 +686,7 @@ function formatSelector(selector: any): string {
   if (selector.matchExpressions) {
     parts.push(
       ...selector.matchExpressions.map(
-        (e: any) => `${e.key} ${e.operator} [${(e.values ?? []).join(', ')}]`
+        e => `${e.key} ${e.operator} [${(e.values ?? []).join(', ')}]`
       )
     );
   }
@@ -615,29 +695,41 @@ function formatSelector(selector: any): string {
 
 const RULE_BINDING_API = '/apis/kubescape.io/v1/runtimerulealertbindings';
 
+type BindingRow = RuntimeRuleAlertBinding & { cluster: string };
+
 function RuleBindingsTab() {
   const history = useHistory();
   const clusters = useHLSelectedClusters();
   const clustersKey = clusters.join(',');
-  const [items, setItems] = useState<any[]>([]);
+  const [items, setItems] = useState<BindingRow[]>([]);
   const [errors, setErrors] = useState<ClusterError[]>([]);
   // the binding to delete once the user confirms
   const [deleting, setDeleting] = useState<{ name: string; cluster: string } | null>(null);
+  // the latest read; an answer to an earlier one, such as for other clusters, is dropped
+  const latestRead = useRef(0);
 
-  const load = () =>
-    Promise.allSettled(
+  const load = () => {
+    const read = ++latestRead.current;
+    return Promise.allSettled(
       clusters.map(cluster =>
-        request(RULE_BINDING_API, { cluster }).then((res: any) =>
-          (res.items ?? []).map((item: any) => ({ ...item, cluster }))
+        request(RULE_BINDING_API, { cluster }).then(
+          (res: { items?: RuntimeRuleAlertBinding[] }): BindingRow[] =>
+            (res.items ?? []).map(item => ({ ...item, cluster }))
         )
       )
     ).then(results => {
+      if (read !== latestRead.current) return;
       setItems(results.flatMap(result => (result.status === 'fulfilled' ? result.value : [])));
       setErrors(rejectedClusters(clusters, results));
     });
+  };
 
   useEffect(() => {
     load();
+    // a page that is left takes no answers
+    return () => {
+      latestRead.current++;
+    };
   }, [clustersKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const deleteBinding = async ({ name, cluster }: { name: string; cluster: string }) => {
@@ -671,12 +763,14 @@ function RuleBindingsTab() {
       <ClusterErrors errors={errors} what="the rule bindings" />
       <HeadlampTable
         data={items}
+        // bindings of the same name in other clusters, such as the default one, are rows of their own
+        getRowId={(b: BindingRow) => JSON.stringify([b.cluster, b.metadata.name])}
         columns={[
           {
             id: 'name',
             header: 'Name',
-            accessorFn: (b: any) => b.metadata.name,
-            Cell: ({ cell, row }: any) => (
+            accessorFn: (b: BindingRow) => b.metadata.name,
+            Cell: ({ cell, row }) => (
               <HeadlampLink
                 routeName={RoutingName.RuleBindingEdit}
                 activeCluster={row.original.cluster}
@@ -687,26 +781,27 @@ function RuleBindingsTab() {
             ),
             gridTemplate: 'auto',
           },
-          ...clusterColumns<any>(clusters, item => item.cluster),
+          ...clusterColumns<BindingRow>(clusters, item => item.cluster),
           {
             header: 'Namespace Selector',
-            accessorFn: (b: any) => formatSelector(b.spec?.namespaceSelector),
+            accessorFn: (b: BindingRow) => formatSelector(b.spec?.namespaceSelector),
             gridTemplate: 'auto',
           },
           {
             header: 'Pod Selector',
-            accessorFn: (b: any) => formatSelector(b.spec?.podSelector),
+            accessorFn: (b: BindingRow) => formatSelector(b.spec?.podSelector),
             gridTemplate: 'auto',
           },
           {
             header: 'Rules',
-            accessorFn: (b: any) => b.spec?.rules ?? [],
-            Cell: ({ cell }: any) => (
+            // the rules as text, which sorts and searches; the chips are drawn in the cell
+            accessorFn: (b: BindingRow) => (b.spec?.rules ?? []).map(boundRuleLabel).join(', '),
+            Cell: ({ row }) => (
               <Stack direction="row" flexWrap="wrap" gap={0.5}>
-                {(cell.getValue() as any[]).map((r: any) => (
+                {(row.original.spec?.rules ?? []).map((r, index) => (
                   <Chip
-                    key={r.ruleName}
-                    label={r.ruleName}
+                    key={index}
+                    label={boundRuleLabel(r)}
                     size="small"
                     color={severityColor(r.severity)}
                   />
@@ -717,8 +812,8 @@ function RuleBindingsTab() {
           },
           {
             header: '',
-            accessorFn: (b: any) => b.metadata.name,
-            Cell: ({ cell, row }: any) => (
+            accessorFn: (b: BindingRow) => b.metadata.name,
+            Cell: ({ cell, row }) => (
               <PermittedIconButton
                 check={{
                   group: 'kubescape.io',

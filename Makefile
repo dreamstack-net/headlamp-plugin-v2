@@ -1,15 +1,13 @@
 SHELL := /bin/bash
 
-vap_test_files:=\
-	deployment.yaml \
-	deployment-for-list-items.yaml \
-	pod-capabilities.yaml \
-	service-account.yaml \
-	deployment-with-common-label-1.yaml  \
-	pod-for-list-items.yaml  \
-	service.yaml \
-	deployment-with-common-label-2.yaml  \
-	pod.yaml
+# The versions of the Kubescape data and the test resources, shared with the installer script.
+# Evaluated when a download target runs, so that building needs no jq.
+data_sources = scripts/data-sources.json
+cel_version = $(shell jq -r .celAdmissionLibrary $(data_sources))
+rego_version = $(shell jq -r .regolibrary $(data_sources))
+vap_test_files = $(shell jq -r '.vapTestFiles[]' $(data_sources))
+
+PYTHON ?= python3
 
 .PHONY: wasm-download kubescape-cel-admission-library-download kubescape-rego-download download build local
 
@@ -20,22 +18,22 @@ wasm-download:
 
 kubescape-cel-admission-library-download:
 	mkdir -p public
-	curl -fL https://github.com/kubescape/cel-admission-library/releases/latest/download/basic-control-configuration.yaml -o public/basic-control-configuration.yaml
-	curl -fL https://github.com/kubescape/cel-admission-library/releases/latest/download/kubescape-validating-admission-policies.yaml -o public/validating-admission-policies.yaml
+	curl -fL https://github.com/kubescape/cel-admission-library/releases/download/$(cel_version)/basic-control-configuration.yaml -o public/basic-control-configuration.yaml
+	curl -fL https://github.com/kubescape/cel-admission-library/releases/download/$(cel_version)/kubescape-validating-admission-policies.yaml -o public/validating-admission-policies.yaml
 	rm -f public/vap-test-files*
 	set -o pipefail; for word in ${vap_test_files}; do \
 		printf '\n---\n' >> public/vap-test-files.yaml; \
-		curl -fL https://raw.githubusercontent.com/kubescape/cel-admission-library/refs/heads/main/test-resources/$$word >> public/vap-test-files.yaml || exit 1; \
+		curl -fL https://raw.githubusercontent.com/kubescape/cel-admission-library/$(cel_version)/test-resources/$$word >> public/vap-test-files.yaml || exit 1; \
 		echo $$word >> public/vap-test-files-index.yaml; \
 	done
 
 kubescape-rego-download:
 	mkdir -p public
-	curl -fL https://github.com/kubescape/regolibrary/releases/download/v2/frameworks \
+	set -o pipefail; curl -fL https://github.com/kubescape/regolibrary/releases/download/$(rego_version)/frameworks \
 	    | jq '.[].controls = []' > public/frameworks.json
-	curl -fL https://github.com/kubescape/regolibrary/releases/download/v2/controls \
+	curl -fL https://github.com/kubescape/regolibrary/releases/download/$(rego_version)/controls \
 	    -o public/controls.json
-	curl -fL https://github.com/kubescape/regolibrary/releases/download/v2/rules \
+	curl -fL https://github.com/kubescape/regolibrary/releases/download/$(rego_version)/rules \
 	    -o public/rego-rules.json
 
 download: wasm-download kubescape-cel-admission-library-download kubescape-rego-download
@@ -43,5 +41,7 @@ download: wasm-download kubescape-cel-admission-library-download kubescape-rego-
 build:
 	GOOS=js GOARCH=wasm go -C go build -ldflags="-s -w" -o ../dist/main.wasm cmd/main.go
 
-local: build
-	cp dist/main.wasm public/*.yaml public/*.json ~/.config/Headlamp/plugins/kubescape-plugin/
+# Builds a copy of this checkout (main.js, package.json, main.wasm and the Kubescape data) and
+# installs it into Headlamp desktop on Linux, macOS or Windows; on Windows use PYTHON=py.
+local:
+	$(PYTHON) scripts/install_headlamp_plugin.py --source .

@@ -2,10 +2,11 @@
   Kubescape definitions for resources with basic methods for querying. 
 */
 import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
-import { getAllowedNamespaces } from '@kinvolk/headlamp-plugin/lib/k8s/cluster';
 import { makeCustomResourceClass } from '@kinvolk/headlamp-plugin/lib/k8s/crd';
 import { KubeObjectClass } from '@kinvolk/headlamp-plugin/lib/k8s/KubeObject';
 import { getCluster } from '@kinvolk/headlamp-plugin/lib/Utils';
+import { getAllowedNamespaces } from './common/clusterContext';
+import { listInNamespaces, NamespacedList } from './query';
 
 const spdxGroup = 'spdx.softwarecomposition.kubescape.io';
 const spdxVersion = 'v1beta1';
@@ -19,7 +20,6 @@ export const vulnerabilityManifestClass = makeCustomResourceClass({
   singularName: 'vulnerabilitymanifest',
   pluralName: 'vulnerabilitymanifests',
   kind: 'VulnerabilityManifest',
-  customResourceDefinition: undefined as any,
 });
 
 export const vulnerabilityManifestSummaryClass = makeCustomResourceClass({
@@ -28,7 +28,6 @@ export const vulnerabilityManifestSummaryClass = makeCustomResourceClass({
   singularName: 'vulnerabilitymanifestsummary',
   pluralName: 'vulnerabilitymanifestsummaries',
   kind: 'VulnerabilityManifestSummary',
-  customResourceDefinition: undefined as any,
 });
 
 export const vulnerabilitySummaryClass = makeCustomResourceClass({
@@ -37,7 +36,6 @@ export const vulnerabilitySummaryClass = makeCustomResourceClass({
   singularName: 'vulnerabilitysummary',
   pluralName: 'vulnerabilitysummaries',
   kind: 'VulnerabilitySummary',
-  customResourceDefinition: undefined as any,
 });
 
 export const openVulnerabilityExchangeContainerClass = makeCustomResourceClass({
@@ -46,7 +44,6 @@ export const openVulnerabilityExchangeContainerClass = makeCustomResourceClass({
   singularName: 'openvulnerabilityexchangecontainer',
   pluralName: 'openvulnerabilityexchangecontainers',
   kind: 'OpenVulnerabilityExchangeContainer',
-  customResourceDefinition: undefined as any,
 });
 
 export const workloadConfigurationScanSummaryClass = makeCustomResourceClass({
@@ -55,7 +52,6 @@ export const workloadConfigurationScanSummaryClass = makeCustomResourceClass({
   singularName: 'workloadconfigurationscansummary',
   pluralName: 'workloadconfigurationscansummaries',
   kind: 'WorkloadConfigurationScanSummary',
-  customResourceDefinition: undefined as any,
 });
 
 export const workloadConfigurationScanClass = makeCustomResourceClass({
@@ -64,7 +60,6 @@ export const workloadConfigurationScanClass = makeCustomResourceClass({
   singularName: 'workloadconfigurationscan',
   pluralName: 'workloadconfigurationscans',
   kind: 'WorkloadConfigurationScan',
-  customResourceDefinition: undefined as any,
 });
 
 export const configurationScanSummariesClass = makeCustomResourceClass({
@@ -73,7 +68,6 @@ export const configurationScanSummariesClass = makeCustomResourceClass({
   singularName: 'configurationscansummary',
   pluralName: 'configurationscansummaries',
   kind: 'ConfigurationScanSummary',
-  customResourceDefinition: undefined as any,
 });
 
 export const generatedNetworkPolicyClass = makeCustomResourceClass({
@@ -82,7 +76,6 @@ export const generatedNetworkPolicyClass = makeCustomResourceClass({
   singularName: 'generatednetworkpolicy',
   pluralName: 'generatednetworkpolicies',
   kind: 'GeneratedNetworkPolicy',
-  customResourceDefinition: undefined as any,
 });
 
 export const containerProfileClass = makeCustomResourceClass({
@@ -91,7 +84,6 @@ export const containerProfileClass = makeCustomResourceClass({
   singularName: 'containerprofile',
   pluralName: 'containerprofiles',
   kind: 'ContainerProfile',
-  customResourceDefinition: undefined as any,
 });
 
 // Older supported Storage releases serve the separate resources. Keep these
@@ -102,7 +94,6 @@ export const networkNeighborhoodsClass = makeCustomResourceClass({
   singularName: 'networkneighborhood',
   pluralName: 'networkneighborhoods',
   kind: 'NetworkNeighborhood',
-  customResourceDefinition: undefined as any,
 });
 
 export const sbomSyftClass = makeCustomResourceClass({
@@ -111,7 +102,6 @@ export const sbomSyftClass = makeCustomResourceClass({
   singularName: 'sbomsyft',
   pluralName: 'sbomsyfts',
   kind: 'SBOMSyft',
-  customResourceDefinition: undefined as any,
 });
 
 export const sbomSyftFilteredClass = makeCustomResourceClass({
@@ -120,7 +110,6 @@ export const sbomSyftFilteredClass = makeCustomResourceClass({
   singularName: 'sbomsyftfiltered',
   pluralName: 'sbomsyftfiltereds',
   kind: 'SBOMSyftFiltered',
-  customResourceDefinition: undefined as any,
 });
 
 export const applicationProfileClass = makeCustomResourceClass({
@@ -129,7 +118,6 @@ export const applicationProfileClass = makeCustomResourceClass({
   singularName: 'applicationprofile',
   pluralName: 'applicationprofiles',
   kind: 'ApplicationProfile',
-  customResourceDefinition: undefined as any,
 });
 
 export const knownServersClass = makeCustomResourceClass({
@@ -138,7 +126,6 @@ export const knownServersClass = makeCustomResourceClass({
   singularName: 'knownserver',
   pluralName: 'knownservers',
   kind: 'KnownServer',
-  customResourceDefinition: undefined as any,
 });
 
 // Kubescape stores seccomp profiles in a CRD or in its storage, depending on the
@@ -149,7 +136,6 @@ export const seccompProfileClass = makeCustomResourceClass({
   singularName: 'seccompprofile',
   pluralName: 'seccompprofiles',
   kind: 'SeccompProfile',
-  customResourceDefinition: undefined as any,
 });
 
 export const seccompProfileStorageClass = makeCustomResourceClass({
@@ -158,7 +144,6 @@ export const seccompProfileStorageClass = makeCustomResourceClass({
   singularName: 'seccompprofile',
   pluralName: 'seccompprofiles',
   kind: 'SeccompProfile',
-  customResourceDefinition: undefined as any,
 });
 
 export const rulesClass = makeCustomResourceClass({
@@ -167,7 +152,6 @@ export const rulesClass = makeCustomResourceClass({
   singularName: 'rules',
   pluralName: 'rules',
   kind: 'Rules',
-  customResourceDefinition: undefined as any,
 });
 
 export const runtimeRuleAlertBindingClass = makeCustomResourceClass({
@@ -176,7 +160,6 @@ export const runtimeRuleAlertBindingClass = makeCustomResourceClass({
   singularName: 'runtimerulealertbinding',
   pluralName: 'runtimerulealertbindings',
   kind: 'RuntimeRuleAlertBinding',
-  customResourceDefinition: undefined as any,
 });
 
 const kubescapeGroup = 'kubescape.io';
@@ -189,7 +172,6 @@ export const securityExceptionClass = makeCustomResourceClass({
   singularName: 'securityexception',
   pluralName: 'securityexceptions',
   kind: 'SecurityException',
-  customResourceDefinition: undefined as any,
 });
 
 export const clusterSecurityExceptionClass = makeCustomResourceClass({
@@ -198,40 +180,38 @@ export const clusterSecurityExceptionClass = makeCustomResourceClass({
   singularName: 'clustersecurityexception',
   pluralName: 'clustersecurityexceptions',
   kind: 'ClusterSecurityException',
-  customResourceDefinition: undefined as any,
 });
 
 /**
- * Lists all objects of the given class in one cluster, restricted to the allowed
- * namespaces of that cluster when those are configured.
+ * Lists all objects of the given class in one cluster, restricted to the allowed namespaces of
+ * that cluster when those are configured. A namespace that cannot be read does not take the
+ * others with it: the errors say why namespaces could not be read, for pages to show, such as
+ * with useItemsInClusters. When none can be read, it rejects.
  *
  * @param objectClass - The class of objects to list.
  * @param cluster - The cluster to query, the current cluster by default.
  */
+export function listQueryWithErrors(
+  objectClass: KubeObjectClass,
+  cluster: string | null = getCluster()
+): Promise<NamespacedList> {
+  return listInNamespaces(objectClass, cluster, getAllowedNamespaces(cluster) ?? []);
+}
+
+/**
+ * The items of {@link listQueryWithErrors}; namespaces that could not be read are only logged,
+ * so a page that can show them uses listQueryWithErrors.
+ */
 export async function listQuery(
   objectClass: KubeObjectClass,
   cluster: string | null = getCluster()
-): Promise<any> {
-  const namespaces: string[] = getAllowedNamespaces(cluster);
-  const group = objectClass.apiEndpoint.apiInfo[0].group;
-  const version = objectClass.apiEndpoint.apiInfo[0].version;
-  const pluralName = objectClass.pluralName;
-  const requestOptions = cluster ? { cluster } : {};
-
-  let items: any[];
-  if (namespaces?.length > 0) {
-    const listOfLists: any[] = await Promise.all(
-      namespaces.map(namespace =>
-        request(`/apis/${group}/${version}/namespaces/${namespace}/${pluralName}`, requestOptions)
-      )
+): Promise<any[]> {
+  const { items, errors } = await listQueryWithErrors(objectClass, cluster);
+  if (errors.length > 0) {
+    console.warn(
+      `Not all ${objectClass.pluralName} of ${cluster ?? 'the cluster'} were read:`,
+      errors
     );
-    items = listOfLists.flatMap(list => list.items);
-  } else {
-    const overviewList = await request(`/apis/${group}/${version}/${pluralName}`, requestOptions);
-    items = overviewList.items;
-  }
-  for (const item of items) {
-    item.metadata.cluster = cluster ?? '';
   }
   return items;
 }

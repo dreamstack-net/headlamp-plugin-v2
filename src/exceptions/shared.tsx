@@ -55,6 +55,8 @@ export function MetadataFields(
     onReasonChange: (v: string) => void;
     expiresDate: string;
     onExpiresDateChange: (v: string) => void;
+    // the cluster the exception goes to, the current one by default
+    cluster?: string;
   }>
 ) {
   const {
@@ -67,6 +69,7 @@ export function MetadataFields(
     onReasonChange,
     expiresDate,
     onExpiresDateChange,
+    cluster,
   } = props;
   return (
     <>
@@ -97,7 +100,7 @@ export function MetadataFields(
         onChange={e => onReasonChange(e.target.value)}
       />
       <ExpiryField expiresDate={expiresDate} onExpiresDateChange={onExpiresDateChange} />
-      <RecordedAs />
+      <RecordedAs cluster={cluster} />
     </>
   );
 }
@@ -110,8 +113,37 @@ export function dateInDays(days: number, now: Date = new Date()): string {
 }
 
 /**
+ * The time an exception that expires on a date ends: the end of that day where the user is, so
+ * that an exception that expires today still applies today, and the lists, which show the date
+ * in the local time zone, show the date that was chosen.
+ */
+export function expiryTimestamp(date: string): string {
+  const [year, month, day] = date.split('-').map(Number);
+  return new Date(year, month - 1, day, 23, 59, 59).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/** The local date on which a timestamp falls, as a date input shows it. */
+export function expiryDate(expiresAt: string | undefined): string {
+  if (!expiresAt) return '';
+  const at = new Date(expiresAt);
+  return Number.isNaN(at.getTime()) ? expiresAt.split('T')[0] : dateInDays(0, at);
+}
+
+/**
+ * The expiry to store for the date of the form: the previous expiry, to the second, when its
+ * date was not changed, and the end of the chosen day otherwise. Undefined for no expiry.
+ */
+export function expiresAtFor(date: string, previous?: string): string | undefined {
+  if (!date) return undefined;
+  if (previous && expiryDate(previous) === date) return previous;
+  return expiryTimestamp(date);
+}
+
+/**
  * When the exception expires, or that it never does, which an empty date means. Choosing an
- * expiry proposes a date a month ahead.
+ * expiry proposes a date a month ahead. A date input also reports an empty value while its date
+ * is incomplete, as when a part of it is cleared to type another: that is not taken for never,
+ * which only the checkbox says.
  */
 function ExpiryField(
   props: Readonly<{ expiresDate: string; onExpiresDateChange: (v: string) => void }>
@@ -128,7 +160,9 @@ function ExpiryField(
         InputLabelProps={{ shrink: true }}
         inputProps={{ min: dateInDays(0) }}
         value={expiresDate}
-        onChange={e => onExpiresDateChange(e.target.value)}
+        onChange={e => {
+          if (e.target.value) onExpiresDateChange(e.target.value);
+        }}
         helperText={neverExpires ? 'The exception applies until it is deleted.' : undefined}
       />
       <FormControlLabel
@@ -145,9 +179,10 @@ function ExpiryField(
   );
 }
 
-// Tells the user under which name the change is recorded in the history of the exception
-function RecordedAs() {
-  const user = useCurrentUser();
+// Tells the user under which name the change is recorded in the history of the exception: the
+// name the cluster of the exception knows the user by
+function RecordedAs({ cluster }: Readonly<{ cluster?: string }>) {
+  const user = useCurrentUser(cluster);
   return (
     <Typography variant="body2" color="text.secondary">
       {user
@@ -350,6 +385,11 @@ export function sanitizeName(raw: string): string {
     .replaceAll(/^-|-$/g, '');
 }
 
+/**
+ * The pattern for an image at any tag. An image that is deployed by its digest alone has no
+ * tag for `:*` to match, so its pattern is the bare repository, which matches the image at any
+ * tag or digest.
+ */
 export function toImageGlob(imageRef: string): string {
   // Strip digest reference before computing the tag glob
   const atIdx = imageRef.indexOf('@');
@@ -358,5 +398,5 @@ export function toImageGlob(imageRef: string): string {
   if (lastColon > 0 && !ref.substring(lastColon + 1).includes('/')) {
     return ref.substring(0, lastColon) + ':*';
   }
-  return ref + ':*';
+  return atIdx > 0 ? ref : ref + ':*';
 }

@@ -26,6 +26,7 @@ import {
   Typography,
 } from '@mui/material';
 import { ReactNode, useEffect, useState } from 'react';
+import { errorMessage } from '../common/errors';
 import { RoutingName } from '../index';
 import type { Rule } from '../types/Rules';
 import {
@@ -97,7 +98,7 @@ function useAlertProfile(alert: AlertmanagerAlert): ProfileLookup {
         if (active) setLookup(match ? { state: 'found', match } : { state: 'none' });
       })
       .catch(err => {
-        if (active) setLookup({ state: 'error', message: err?.message ?? String(err) });
+        if (active) setLookup({ state: 'error', message: errorMessage(err) });
       });
     return () => {
       active = false;
@@ -125,7 +126,7 @@ function useLearnedDomains(
         if (active) setDomains(found ?? 'unavailable');
       })
       .catch(err => {
-        if (active) setDomains({ error: err?.message ?? String(err) });
+        if (active) setDomains({ error: errorMessage(err) });
       });
     return () => {
       active = false;

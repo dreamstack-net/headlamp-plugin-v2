@@ -4,7 +4,19 @@ import { vi } from 'vitest';
 import { addKubescapeColumns } from './tableColumns';
 import { clearWorkloadSummaries } from './workloadSummaries';
 
-const mocks = vi.hoisted(() => ({ listQuery: vi.fn(), config: {} as any }));
+const mocks = vi.hoisted(() => ({
+  listQuery: vi.fn(),
+  config: {} as any,
+  // the requests for the exceptions, and the setup of the cluster
+  request: vi.fn(),
+  setup: {} as any,
+}));
+vi.mock('@kinvolk/headlamp-plugin/lib/ApiProxy', () => ({ request: mocks.request }));
+vi.mock('../common/clusterContext', () => ({ getAllowedNamespaces: () => [] }));
+vi.mock('../common/kubescapeSetup', () => ({
+  readClusterSetup: async () => mocks.setup,
+  scannersApplyExceptions: (setup: any) => setup.capabilities?.riskAcceptance === 'enable',
+}));
 vi.mock('../query', () => ({
   paginatedListQuery: async (cluster: string, resourceClass: any, ...rest: any[]) => ({
     items: await mocks.listQuery(resourceClass, cluster, ...rest),
@@ -23,14 +35,20 @@ vi.mock('../index', () => ({
 }));
 vi.mock('@kinvolk/headlamp-plugin/lib/Utils', () => ({ getCluster: () => 'current' }));
 vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', () => ({
-  Link: ({ children, routeName, params, activeCluster, 'aria-label': label }: any) => (
-    <a
-      href={`/${activeCluster}/${routeName}/${params.namespace}/${params.name}`}
-      aria-label={label}
-    >
-      {children}
-    </a>
-  ),
+  // like Headlamp's Link: with an activeCluster, the cluster parameter of the route is all
+  // selected clusters, that one first; the route of a configuration scan has it twice
+  Link: ({ children, routeName, params, activeCluster, 'aria-label': label }: any) => {
+    const cluster = activeCluster ? `${activeCluster}+cluster-z` : params.cluster;
+    const scanCluster = routeName === 'Configuration Scan' ? `/${cluster}` : '';
+    return (
+      <a
+        href={`/c/${cluster}/${routeName}${scanCluster}/${params.namespace}/${params.name}`}
+        aria-label={label}
+      >
+        {children}
+      </a>
+    );
+  },
 }));
 
 const workloadLabels = {
@@ -41,6 +59,9 @@ const workloadLabels = {
 
 beforeEach(() => {
   mocks.config = {};
+  // the scanners apply the exceptions, unless a test says otherwise
+  mocks.setup = { capabilities: { riskAcceptance: 'enable' } };
+  mocks.request.mockReset().mockResolvedValue({ items: [] });
   clearWorkloadSummaries();
   mocks.listQuery.mockReset().mockImplementation(async (resourceClass: any) =>
     resourceClass.pluralName === 'vulnerabilitymanifestsummaries'
@@ -64,7 +85,19 @@ beforeEach(() => {
       : [
           {
             metadata: { name: 'deployment-web', namespace: 'shop', labels: workloadLabels },
-            spec: { severities: { critical: 1, high: 4, medium: 0, low: 0 } },
+            spec: {
+              severities: { critical: 1, high: 4, medium: 0, low: 0 },
+              controls: Object.fromEntries(
+                ['C-0001', 'C-0002', 'C-0003', 'C-0004', 'C-0005'].map((controlID, index) => [
+                  controlID,
+                  {
+                    controlID,
+                    severity: { severity: index === 0 ? 'Critical' : 'High' },
+                    status: { status: 'failed' },
+                  },
+                ])
+              ),
+            },
           },
         ]
   );
@@ -109,24 +142,57 @@ it('shows the critical and high counts of the workload that runs a pod', async (
     </>
   );
 
+  // the page of the CVEs reads the first cluster of the address
   expect((await screen.findByLabelText('2 Critical findings')).getAttribute('href')).toBe(
-    '/cluster-a/Vulnerability/shop/deployment-web-web'
+    '/c/cluster-a+cluster-z/Vulnerability/shop/deployment-web-web'
   );
   expect(screen.getByLabelText('7 High findings')).toBeTruthy();
+  // the page of the configuration scan reads its cluster from the path of the route
   expect(screen.getByLabelText('4 High findings').getAttribute('href')).toBe(
-    '/cluster-a/Configuration Scan/shop/deployment-web'
+    '/c/cluster-a/Configuration Scan/cluster-a/shop/deployment-web'
   );
   expect(mocks.listQuery.mock.calls.map(call => call[1])).toEqual(['cluster-a', 'cluster-a']);
-  expect(cves.getValue(pod)).toBe('2 7');
 });
 
-it('sorts the most critical first and rows without results last', async () => {
-  const [cves] = addKubescapeColumns({ id: 'headlamp-deployments', columns: [] });
+it('is neither sorted nor searched, as the counts arrive after the table sorted its rows', async () => {
+  // Headlamp's table sorts its rows, and takes the values it searches, once per change of its
+  // data: rows whose counts were read later would keep the place of rows without results
+  const columns = addKubescapeColumns({ id: 'headlamp-deployments', columns: [] });
   const web = { kind: 'Deployment', metadata: { name: 'web', namespace: 'shop' } };
-  const other = { kind: 'Deployment', metadata: { name: 'other', namespace: 'shop' } };
 
-  render(<>{cves.render(web) as ReactNode}</>);
+  render(<>{columns[0].render(web) as ReactNode}</>);
   await screen.findByLabelText('2 Critical findings');
 
-  expect([other, web].sort(cves.sort)).toEqual([web, other]);
+  for (const column of columns) {
+    expect(column.sort).toBe(false);
+    expect(column.getValue(web)).toBe('');
+  }
+});
+
+it('leaves out the controls that exceptions exclude where the plugin applies them', async () => {
+  mocks.setup = { capabilities: {} };
+  mocks.request.mockImplementation(async (url: string) =>
+    url === '/apis/kubescape.io/v1beta1/securityexceptions'
+      ? {
+          items: [
+            {
+              kind: 'SecurityException',
+              metadata: { name: 'accepted', namespace: 'shop' },
+              spec: { posture: [{ controlID: 'C-0002', action: 'ignore' }] },
+            },
+          ],
+        }
+      : { items: [] }
+  );
+  const [, controls] = addKubescapeColumns({ id: 'headlamp-deployments', columns: [] });
+  const web = {
+    kind: 'Deployment',
+    cluster: 'cluster-b',
+    metadata: { name: 'web', namespace: 'shop' },
+  };
+
+  render(<>{controls.render(web) as ReactNode}</>);
+
+  expect(await screen.findByLabelText('3 High findings')).toBeTruthy();
+  expect(screen.getByLabelText('1 Critical findings')).toBeTruthy();
 });

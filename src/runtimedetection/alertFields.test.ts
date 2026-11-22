@@ -8,6 +8,7 @@ import {
   alertWorkload,
   indexRules,
   mitreUrl,
+  podsOfWorkloadPattern,
   processId,
   ruleDescription,
   workloadOfPod,
@@ -67,6 +68,36 @@ describe('workloadOfPod', () => {
 
   it('keeps names that Kubernetes did not generate', () => {
     expect(workloadOfPod('debug-shell')).toBe('debug-shell');
+  });
+});
+
+describe('podsOfWorkloadPattern', () => {
+  // as Alertmanager matches it, anchored at both ends
+  const matches = (pod: string, other: string) =>
+    new RegExp(`^(?:${podsOfWorkloadPattern(pod)})$`).test(other);
+
+  it('matches the pods of later rollouts and runs of the workload, and no other workload', () => {
+    expect(podsOfWorkloadPattern('cert-watch-b576bb668-5f2s6')).toBe(
+      'cert-watch-[bcdfghjklmnpqrstvwxz2456789]{6,10}-[bcdfghjklmnpqrstvwxz2456789]{5}'
+    );
+    expect(matches('cert-watch-b576bb668-5f2s6', 'cert-watch-7d9f8c6b54-x2x9z')).toBe(true);
+    expect(matches('cert-watch-b576bb668-5f2s6', 'cert-watch-api-7d9f8c6b54-x2x9z')).toBe(false);
+    expect(matches('shop-nightly-sync-29888835-kxll6', 'shop-nightly-sync-29890275-p7qzd')).toBe(
+      true
+    );
+    expect(matches('node-agent-tr5nd', 'node-agent-x8k2p')).toBe(true);
+    expect(matches('chat-0', 'chat-12')).toBe(true);
+    expect(matches('a.b-0', 'axb-1')).toBe(false);
+    expect(podsOfWorkloadPattern('debug-shell')).toBeUndefined();
+  });
+
+  it('matches the next rollout of a pod template hash that has digits only', () => {
+    // one hash in a hundred reads as the time of a Job of a CronJob
+    expect(workloadOfPod('web-5648974658-x2k4p')).toBe('web');
+    expect(matches('web-5648974658-x2k4p', 'web-5648974658-zzzzz')).toBe(true);
+    expect(matches('web-5648974658-x2k4p', 'web-7d4b9c6f5-bbcdf')).toBe(true);
+    expect(matches('web-5648974658-x2k4p', 'web-api-7d4b9c6f5-bbcdf')).toBe(false);
+    expect(matches('web-5648974658-x2k4p', 'other-7d4b9c6f5-bbcdf')).toBe(false);
   });
 });
 

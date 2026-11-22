@@ -35,6 +35,16 @@ jobs:
         jq-version: ['1.8.1']
 
     steps:
+      - name: Check the release name
+        env:
+          RELEASE_NAME: ${{ github.event.inputs.releaseName }}
+        run: |
+          if ! [[ "$RELEASE_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$RELEASE_NAME is not a version such as v1.0.0"
+            exit 1
+          fi
+
+      # the credentials stay, as EndBug/add-and-commit pushes the release commit with git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Use Node.js ${{ matrix.node-version }}
@@ -46,6 +56,7 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ matrix.go-version }}
+          cache-dependency-path: go/go.sum
 
       - name: Setup jq
         uses: dcarbone/install-jq-action@4fcb5062d7ce9bc4382d1a352d19ba3ba2c317c1 # v4.0.1
@@ -56,6 +67,17 @@ jobs:
 
       - name: Download dependencies
         run: make download
+
+      # the checks of the CI workflow, so that a release is never built from code that fails them
+      - run: npx @kinvolk/headlamp-plugin lint .
+      - run: npx @kinvolk/headlamp-plugin format --check .
+      - run: npx @kinvolk/headlamp-plugin tsc .
+      - run: npx @kinvolk/headlamp-plugin test .
+      - name: Vet and test the Go evaluators
+        run: |
+          go -C go vet ./...
+          GOOS=js GOARCH=wasm go -C go vet ./...
+          go -C go test ./...
 
       - run: npx @kinvolk/headlamp-plugin build .
 
@@ -107,6 +129,7 @@ jobs:
           commitChange: false
 
       - name: Commit artifacthub-pkg.yml
+        id: commit
         uses: EndBug/add-and-commit@cc9c08ba6c8df3b93a8f2db63e89b98368ae2ae8 # v11.1.1
         with:
           message: Release ${{ github.event.inputs.releaseName }}
@@ -129,6 +152,8 @@ jobs:
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ github.event.inputs.releaseName }}
+          # the release commit of the built sources, not whatever the branch holds by now
+          target_commitish: ${{ steps.commit.outputs.commit_long_sha || github.sha }}
           prerelease: true
           files: |
             ${{ env.RELEASE_TAR }}

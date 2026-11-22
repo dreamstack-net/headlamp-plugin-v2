@@ -128,6 +128,8 @@ it('shows which observed traffic the current policies allow, and the rules witho
   );
   expect(screen.getByText('1 flow')).toBeTruthy();
   expect(screen.getByText('None')).toBeTruthy();
+  // the policy selects the pod template, and no pods were read to say it leaves some out
+  expect(screen.queryByText(/Not all pods of db/)).toBeNull();
 });
 
 it('says when no policy selects the workload', () => {
@@ -144,6 +146,40 @@ it('says when no policy selects the workload', () => {
   expect(screen.getAllByText('Not restricted')).toHaveLength(2);
 });
 
+it('says when a policy does not select every pod of the workload that runs', () => {
+  // a policy for one pod of a StatefulSet, by a label that its pod template does not have
+  const firstPodOnly: ExistingPolicy = {
+    metadata: { name: 'db-0-only', namespace: 'shop' },
+    spec: {
+      podSelector: { matchLabels: { 'statefulset.kubernetes.io/pod-name': 'db-0' } },
+      policyTypes: ['Ingress'],
+    },
+  };
+  const livePodLabels = [0, 1].map(index => ({
+    app: 'db',
+    'statefulset.kubernetes.io/pod-name': `db-${index}`,
+  }));
+  render(
+    <ExistingPolicies
+      generatedNetworkPolicy={generated}
+      result={{
+        comparison: comparePolicies(
+          [firstPodOnly],
+          { namespace: 'shop', podLabels: { app: 'db' }, livePodLabels },
+          flows
+        ),
+      }}
+      cluster="prd"
+    />
+  );
+  // it counts as a policy that selects the workload, with what that leaves out
+  expect(screen.queryByText(/No NetworkPolicy selects db/)).toBeNull();
+  expect(
+    screen.getByText(/Not all pods of db that run now are selected by db-0-only\./)
+  ).toBeTruthy();
+  expect(screen.getAllByText('Not allowed')).toHaveLength(1);
+});
+
 it('gives each node of the diagram the status of the traffic of its peers', () => {
   const { nodes } = createNodes(generated);
   const statuses = nodeFlowStatuses(nodes, comparison.flows);
@@ -152,4 +188,65 @@ it('gives each node of the diagram the status of the traffic of its peers', () =
   expect(statusOf(api)).toEqual({ status: 'allowed', allowedBy: ['default-ingress'] });
   expect(statusOf(job)).toEqual({ status: 'blocked', allowedBy: [] });
   expect(statuses.has('main')).toBe(false);
+});
+
+it('says when the pods of the workload were not read, and names traffic without a peer', () => {
+  const allSources: ObservedFlow = {
+    direction: 'ingress',
+    peer: {},
+    ports: [{ protocol: 'TCP', port: '8080' }],
+    endpoints: [{ anyPeer: true }],
+  };
+  const { rerender } = render(
+    <ExistingPolicies
+      generatedNetworkPolicy={generated}
+      result={{
+        comparison: comparePolicies(policies, { namespace: 'shop', podLabels: { app: 'db' } }, [
+          allSources,
+        ]),
+        podsNotRead: 'unreadable',
+      }}
+      cluster="prd"
+    />
+  );
+  expect(
+    screen.getByText(/The pods of db could not be read, so the policies were matched against/)
+  ).toBeTruthy();
+  expect(screen.getByText('All sources')).toBeTruthy();
+  // default-ingress allows 8080 from some peers only
+  expect(screen.getByText('Unknown')).toBeTruthy();
+
+  rerender(
+    <ExistingPolicies
+      generatedNetworkPolicy={generated}
+      result={{ comparison, podsNotRead: 'no-selector' }}
+      cluster="prd"
+    />
+  );
+  expect(screen.getByText(/The pods of db are not read, as it has no selector, so/)).toBeTruthy();
+});
+
+it('shows a rule of the generated policy without peers as a node of all sources', () => {
+  const withoutPeers = {
+    ...generated,
+    spec: {
+      spec: { ...generated.spec.spec, ingress: [{ ports: [{ protocol: 'TCP', port: 80 }] }] },
+    },
+  } as unknown as GeneratedNetworkPolicy;
+  const { nodes } = createNodes(withoutPeers);
+  const flow: ObservedFlow = {
+    direction: 'ingress',
+    peer: {},
+    ports: [{ protocol: 'TCP', port: '80' }],
+    endpoints: [{ anyPeer: true }],
+  };
+  const open: ExistingPolicy = {
+    metadata: { name: 'open-web', namespace: 'shop' },
+    spec: { podSelector: {}, policyTypes: ['Ingress'], ingress: [{ ports: [{ port: '80' }] }] },
+  };
+  const statuses = nodeFlowStatuses(
+    nodes,
+    comparePolicies([open], { namespace: 'shop', podLabels: {} }, [flow]).flows
+  );
+  expect(statuses.get(nodes[1].id)).toEqual({ status: 'allowed', allowedBy: ['open-web'] });
 });

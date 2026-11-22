@@ -34,6 +34,8 @@ namespace RoutingPath {
     '/kubescape/vulnerabilities/namespaces/:namespace/:name';
   export const KubescapeCVEResults = '/kubescape/vulnerabilities/cves/:cve';
   export const ImageVulnerabilityDetails = '/kubescape/vulnerabilities/images/:namespace/:name';
+  // four segments, so that it is not taken for the namespace of VulnerabilitiesNamespaceSummary
+  export const KubescapeClusterComparison = '/kubescape/vulnerabilities/clusters/compare';
   export const KubescapeFrameworks = '/kubescape/frameworks';
   export const FrameworkControls = '/kubescape/frameworks/:name/controls';
   export const FrameworkNew = '/kubescape/framework';
@@ -60,6 +62,7 @@ export namespace RoutingName {
   export const ApplicationProfiles = 'Application Profile';
   export const ComplianceView = 'Compliance';
   export const ImageVulnerabilityDetails = 'Image Vulnerabilities';
+  export const KubescapeClusterComparison = 'Images Across Clusters';
   export const KubescapeConfigurationScanNamespaceSummary = 'Namespace Configuration Scan';
   export const KubescapeControlResults = 'Control Configuration Scan';
   export const KubescapeCVEResults = 'CVE Vulnerabilities';
@@ -115,6 +118,14 @@ registerSidebarEntry({
   name: vulnerabilities,
   label: 'Vulnerabilities',
   url: RoutingPath.KubescapeVulnerabilities,
+});
+
+// the images of the selected clusters compared, under Vulnerabilities
+registerSidebarEntry({
+  parent: vulnerabilities,
+  name: 'vulnerability-clusters',
+  label: 'Clusters',
+  url: RoutingPath.KubescapeClusterComparison,
 });
 
 registerSidebarEntry({
@@ -304,6 +315,16 @@ registerRoute({
   name: RoutingName.ImageVulnerabilityDetails,
 });
 
+import KubescapeClusterComparison from './vulnerabilities/ClusterComparison';
+
+registerRoute({
+  path: RoutingPath.KubescapeClusterComparison,
+  sidebar: 'vulnerability-clusters',
+  component: () => <KubescapeClusterComparison />,
+  exact: true,
+  name: RoutingName.KubescapeClusterComparison,
+});
+
 import SBOMDetail from './vulnerabilities/SBOMDetail';
 
 registerRoute({
@@ -466,9 +487,12 @@ if (typeof registerResourceTableColumnsProcessor === 'function') {
 }
 
 // Notifications for critical runtime alerts and expiring exceptions
-import { startNotifications } from './common/notifications';
+import { SelectedClustersTracker, startNotifications } from './common/notifications';
 
 startNotifications();
+// keeps the selected clusters for the notifications; it renders nothing, and the app bar is on
+// every page
+registerAppBarAction({ id: 'kubescape-selected-clusters', action: <SelectedClustersTracker /> });
 
 // Register plugin settings
 import { PLUGIN_NAME } from './common/config-store';

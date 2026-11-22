@@ -5,6 +5,7 @@ import {
   DateLabel,
   Link as HeadlampLink,
   SectionBox,
+  TableColumn,
 } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
 import { Stack } from '@mui/material';
 import { useMemo } from 'react';
@@ -21,9 +22,17 @@ import {
   useImageVersionSettings,
 } from './ImageVersion';
 import { imageTag } from './registry';
-import { getImageScanKey, getImageScans, ImageScan, WorkloadScan } from './scanData';
+import {
+  getImageScanKey,
+  getImageScans,
+  ImageScan,
+  ofSeveralClusters,
+  workloadLabel,
+  WorkloadScan,
+} from './scanData';
 
-type ImageRow = ImageScan & { version?: ImageVersion };
+// an image with the workload containers that run it and, once found, its versions
+type ImageRow = ImageScan & { version?: ImageVersion; workloads: string[] };
 
 export default function ImageListView(props: Readonly<{ workloadScans: WorkloadScan[] | null }>) {
   const { workloadScans } = props;
@@ -42,29 +51,45 @@ export default function ImageListView(props: Readonly<{ workloadScans: WorkloadS
     [imageScans]
   );
   const versions = useImageVersions(images);
+  // the workloads of each image and when kubevuln last scanned them, in one pass over the
+  // workloads: recent kubevuln versions only record when they scanned the workloads of an image
+  const { workloadsByImage, scannedAt } = useMemo(() => {
+    const workloadsByImage = new Map<string, Set<string>>();
+    const scannedAt = new Map<string, string>();
+    const scans = workloadScans ?? [];
+    const withCluster = ofSeveralClusters(scans);
+    for (const workloadScan of scans) {
+      if (!workloadScan.imageScan) continue;
+      const key = getImageScanKey(workloadScan.imageScan);
+      let workloads = workloadsByImage.get(key);
+      if (!workloads) {
+        workloads = new Set();
+        workloadsByImage.set(key, workloads);
+      }
+      workloads.add(workloadLabel(workloadScan, withCluster));
+      const latest = scannedAt.get(key);
+      if (workloadScan.scannedAt && (!latest || workloadScan.scannedAt > latest)) {
+        scannedAt.set(key, workloadScan.scannedAt);
+      }
+    }
+    return { workloadsByImage, scannedAt };
+  }, [workloadScans]);
   // the table reads the values of a row again only when the rows change, so the versions that
   // are found are part of the rows
   const rows = useMemo<ImageRow[]>(
     () =>
       imageScans.map(scan => ({
         ...scan,
+        workloads: [...(workloadsByImage.get(getImageScanKey(scan)) ?? [])],
         version: versions.get(imageVersionMapKey({ image: scan.imageName, cluster: scan.cluster })),
       })),
-    [imageScans, versions]
+    [imageScans, versions, workloadsByImage]
   );
 
   if (!workloadScans) {
     return <></>;
   }
 
-  // recent kubevuln versions only record when they scanned the workloads that run an image
-  const scannedAt = new Map<string, string>();
-  for (const workloadScan of workloadScans) {
-    if (!workloadScan.imageScan || !workloadScan.scannedAt) continue;
-    const key = getImageScanKey(workloadScan.imageScan);
-    const latest = scannedAt.get(key);
-    if (!latest || workloadScan.scannedAt > latest) scannedAt.set(key, workloadScan.scannedAt);
-  }
   const evaluatedAt = (imageScan: ImageScan) =>
     imageScan.reportCreatedAt ?? scannedAt.get(getImageScanKey(imageScan));
 
@@ -91,7 +116,7 @@ export default function ImageListView(props: Readonly<{ workloadScans: WorkloadS
                 return [
                   imageScan.imageName,
                   imageScan.cluster,
-                  imageWorkloads(workloadScans, imageScan).join('; '),
+                  imageScan.workloads.join('; '),
                   ...(settings.enabled
                     ? [
                         imageTag(imageScan.imageName),
@@ -120,7 +145,7 @@ export default function ImageListView(props: Readonly<{ workloadScans: WorkloadS
             {
               header: 'Image',
               accessorKey: 'manifestName',
-              Cell: ({ cell, row }: any) => {
+              Cell: ({ cell, row }) => {
                 return (
                   <HeadlampLink
                     routeName={RoutingName.ImageVulnerabilityDetails}
@@ -137,7 +162,7 @@ export default function ImageListView(props: Readonly<{ workloadScans: WorkloadS
               gridTemplate: 'auto',
             },
             ...(settings.enabled
-              ? [
+              ? ([
                   {
                     id: 'Tag',
                     header: 'Tag',
@@ -149,16 +174,16 @@ export default function ImageListView(props: Readonly<{ workloadScans: WorkloadS
                     header: 'Latest',
                     // the value changes when the version is found, which redraws the cell
                     accessorFn: (row: ImageRow) => row.version?.latest?.latest ?? '',
-                    sortingFn: (a: any, b: any) =>
+                    sortingFn: (a, b) =>
                       latestRank(a.original.version) - latestRank(b.original.version),
                     sortDescFirst: true,
-                    Cell: ({ row }: any) => <LatestVersionLabel version={row.original.version} />,
+                    Cell: ({ row }) => <LatestVersionLabel version={row.original.version} />,
                     gridTemplate: 'auto',
                   },
-                ]
+                ] satisfies TableColumn<ImageRow>[])
               : []),
             ...(settings.endOfLife
-              ? [
+              ? ([
                   {
                     id: 'End of life',
                     header: 'End of life',
@@ -167,19 +192,20 @@ export default function ImageListView(props: Readonly<{ workloadScans: WorkloadS
                       const line = row.version?.line;
                       return line ? line.eolFrom ?? (line.eol ? '0' : 'none') : undefined;
                     },
+                    // compared as text, which puts none after the dates; left to the table, a
+                    // list of more than ten rows compares the numbers in the values, none first
+                    sortingFn: 'basic' as const,
                     sortUndefined: 'last' as const,
-                    Cell: ({ row }: any) => <EndOfLifeLabel line={row.original.version?.line} />,
+                    Cell: ({ row }) => <EndOfLifeLabel line={row.original.version?.line} />,
                     gridTemplate: 'auto',
                   },
-                ]
+                ] satisfies TableColumn<ImageRow>[])
               : []),
             {
+              id: 'Workload',
               header: 'Workload',
-              accessorFn: (imageScan: ImageScan) => (
-                <div style={{ whiteSpace: 'pre-line' }}>
-                  {imageWorkloads(workloadScans, imageScan).join('\n')}
-                </div>
-              ),
+              accessorFn: (row: ImageRow) => row.workloads.join('\n'),
+              Cell: ({ cell }) => <div style={{ whiteSpace: 'pre-line' }}>{cell.getValue()}</div>,
               gridTemplate: 'auto',
             },
             {
@@ -189,40 +215,44 @@ export default function ImageListView(props: Readonly<{ workloadScans: WorkloadS
               sortingFn: 'basic',
               sortUndefined: 'last',
               sortDescFirst: false,
-              Cell: ({ cell }: any) =>
+              Cell: ({ cell }) =>
                 cell.getValue() ? <DateLabel date={cell.getValue()} /> : 'Unknown',
               gridTemplate: 'auto',
             },
             {
+              id: 'Scan record created',
               header: 'Scan record created',
-              accessorFn: (imageScan: ImageScan) => (
-                <DateLabel date={imageScan.creationTimestamp} />
-              ),
+              accessorKey: 'creationTimestamp',
+              Cell: ({ cell }) => <DateLabel date={cell.getValue()} />,
               gridTemplate: 'auto',
             },
             {
               id: 'Vulnerabilities',
               header: 'Vulnerabilities',
               accessorFn: (imageScan: ImageScan) => countImageScans(imageScan).join('.'),
-              Cell: ({ row }: any) => resultStack(row.original),
+              // by the numbers of the counts: the table picks how to sort from the rows after
+              // the tenth, so that ten rows or fewer would sort as text, 9 above 12
+              sortingFn: 'alphanumeric',
+              Cell: ({ row }) => resultStack(row.original),
               gridTemplate: 'auto',
             },
             {
+              id: 'SBOM',
               header: 'SBOM',
-              accessorFn: (imageScan: ImageScan) => {
-                return (
-                  <HeadlampLink
-                    routeName={RoutingName.KubescapeSBOMDetails}
-                    activeCluster={imageScan.cluster}
-                    params={{
-                      name: imageScan.manifestName,
-                      namespace: imageScan.namespace,
-                    }}
-                  >
-                    SBOM
-                  </HeadlampLink>
-                );
-              },
+              accessorFn: (imageScan: ImageScan) => imageScan.manifestName,
+              enableSorting: false,
+              Cell: ({ row }) => (
+                <HeadlampLink
+                  routeName={RoutingName.KubescapeSBOMDetails}
+                  activeCluster={row.original.cluster}
+                  params={{
+                    name: row.original.manifestName,
+                    namespace: row.original.namespace,
+                  }}
+                >
+                  SBOM
+                </HeadlampLink>
+              ),
               gridTemplate: 'min-content',
             },
           ]}
@@ -255,16 +285,6 @@ function resultStack(imageScan: ImageScan) {
       }}
     />
   );
-}
-
-// The workload containers that run the image, as "workload/container"
-function imageWorkloads(workloadScans: WorkloadScan[], imageScan: ImageScan): string[] {
-  const workloads = workloadScans
-    .filter(
-      scan => scan.imageScan && getImageScanKey(scan.imageScan) === getImageScanKey(imageScan)
-    )
-    .map(scan => `${scan.name}/${scan.container}`);
-  return [...new Set(workloads)];
 }
 
 function countImageScans(imageScan: ImageScan) {

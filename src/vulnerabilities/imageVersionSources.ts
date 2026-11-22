@@ -21,12 +21,43 @@
   the Crossplane community. Switching that setting off stops those requests that were not sent yet
   (possiblyPrivatePermit). The project an image's labels name is only asked about when the image
   is public. endoflife.date only gets the names of products on its own lists, and only when the
-  settings show the end of life. Answers are kept for a day, in localStorage where they are small.
+  settings show the end of life. Every other request of a lookup takes the permit of the newest
+  versions or of the end of life as the lookup starts (imageVersionsPermit, endOfLifePermit), so
+  switching one of them off also stops what its lookups have yet to ask. Answers are kept for a
+  day, in localStorage where they are small.
 */
-import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
+import { canonical, endOfLifeProduct, endOfLifeReleases } from './endOfLife';
 import { githubProjectOfSource } from './imageSource';
 import { ImageReference, imageTag, parseImageReference, registryPage } from './registry';
+import { cached, clearCachedLookups } from './versionCache';
+import { clearVersionCheckers } from './versionChecker';
+import {
+  endOfLifePermit,
+  fetchBody,
+  fetchJson,
+  imageVersionsPermit,
+  strings,
+} from './versionRequests';
 import { newestOfVersion, newestRelease, newestTag, parseVersion, releaseLineOf } from './versions';
+
+// The parts of the lookups, which the views import from here
+export { endOfLifeProduct, purlKey } from './endOfLife';
+export type { EndOfLifeMatch } from './endOfLife';
+export {
+  imageVersionKey,
+  parseVersionCheckerMetrics,
+  versionCheckerResults,
+} from './versionChecker';
+export type { VersionCheckerResult } from './versionChecker';
+export {
+  endOfLifePermit,
+  imageVersionsPermit,
+  possiblyPrivatePermit,
+  preferNewLookups,
+  stopEndOfLifeLookups,
+  stopImageVersionLookups,
+  stopPossiblyPrivateLookups,
+} from './versionRequests';
 
 export interface VersionSource {
   name: string;
@@ -55,216 +86,21 @@ export interface PublicVersion {
   line?: ReleaseLine;
 }
 
-const day = 24 * 3600 * 1000;
-// a service that failed is asked again after an hour
-const retryAfter = 3600 * 1000;
-const storageName = 'kubescape-plugin.image-versions.';
-// raised when lookups change, so that answers of the old lookups are not used
-const storageVersion = 8;
-const storagePrefix = `${storageName}${storageVersion}.`;
-
-const memory = new Map<string, { expires: number; value: Promise<unknown> }>();
-let pruned = false;
-
-export interface VersionCheckerResult {
-  latest: string;
-  isLatest: boolean;
-}
-
-const versionCheckers = new Map<
-  string,
-  { expires: number; value: Promise<Map<string, VersionCheckerResult>> }
->();
-
 /** Forgets the answers kept in memory; the tests start from nothing. */
 export function clearVersionCache() {
-  memory.clear();
-  versionCheckers.clear();
-  pruned = false;
-}
-
-function storage(): Storage | undefined {
-  try {
-    return window.localStorage;
-  } catch {
-    return undefined;
-  }
-}
-
-function pruneStorage(now: number) {
-  const store = storage();
-  if (!store) return;
-  try {
-    for (let i = store.length - 1; i >= 0; i--) {
-      const key = store.key(i);
-      if (!key?.startsWith(storageName)) continue;
-      const at = key.startsWith(storagePrefix) && JSON.parse(store.getItem(key) ?? '{}')?.at;
-      if (typeof at !== 'number' || now - at >= day || at > now) store.removeItem(key);
-    }
-  } catch {
-    // nothing to clean up in a full or blocked storage
-  }
-}
-
-function readStored(key: string, now: number): { at: number; value: unknown } | undefined {
-  try {
-    const stored = JSON.parse(storage()?.getItem(storagePrefix + key) ?? 'null');
-    if (typeof stored?.at !== 'number' || now - stored.at >= day || stored.at > now) {
-      return undefined;
-    }
-    return { at: stored.at, value: stored.value ?? null };
-  } catch {
-    return undefined;
-  }
-}
-
-function writeStored(key: string, value: unknown, now: number) {
-  try {
-    storage()?.setItem(storagePrefix + key, JSON.stringify({ at: now, value }));
-  } catch {
-    // the answer is still kept in memory
-  }
-}
-
-/**
- * The answer of a lookup, kept a day: in memory, and in localStorage when it is small. A lookup
- * that throws keeps throwing for an hour, without asking the service again, so that lookups
- * built on it are not stored either.
- */
-export function cached<T>(
-  key: string,
-  load: () => Promise<T | null>,
-  options: { persist?: boolean; now?: number } = {}
-): Promise<T | null> {
-  const now = options.now ?? Date.now();
-  const entry = memory.get(key);
-  if (entry && now < entry.expires) return entry.value as Promise<T | null>;
-  if (options.persist) {
-    if (!pruned) {
-      pruned = true;
-      pruneStorage(now);
-    }
-    const stored = readStored(key, now);
-    if (stored) {
-      const value = Promise.resolve(stored.value as T | null);
-      memory.set(key, { expires: stored.at + day, value });
-      return value;
-    }
-  }
-  const value = load().then(
-    result => {
-      if (options.persist) writeStored(key, result ?? null, now);
-      return result ?? null;
-    },
-    error => {
-      if (error instanceof LookupStopped) {
-        // nothing failed, so the next lookup asks again
-        if (memory.get(key)?.value === value) memory.delete(key);
-      } else {
-        // the failure is not stored, nor an answer built on it
-        memory.set(key, { expires: now + retryAfter, value });
-      }
-      throw error;
-    }
-  );
-  value.catch(() => {});
-  memory.set(key, { expires: now + day, value });
-  return value;
-}
-
-/*
-  The names of images that may be private are only sent with a permit, which switching the setting
-  off revokes: the requests that wait their turn and those that lookups have yet to make are then
-  not sent.
-*/
-let privateNames = new AbortController();
-
-/** The permit to send the names of images that may be private, while the settings allow it. */
-export function possiblyPrivatePermit(): AbortSignal {
-  return privateNames.signal;
-}
-
-/** Revokes the permit, when the settings no longer allow names that may be private. */
-export function stopPossiblyPrivateLookups() {
-  privateNames.abort();
-  privateNames = new AbortController();
-}
-
-/** A request that was not sent, as its permit was revoked. */
-class LookupStopped extends Error {}
-
-// at most four requests at a time, so that a list of images does not flood the services
-const maxRequests = 4;
-let running = 0;
-const waiting: Array<() => void> = [];
-
-/** Waits for a free request; a revoked permit takes the request out of the queue. */
-function waitTurn(permit?: AbortSignal) {
-  return new Promise<void>((resolve, reject) => {
-    const stop = () => {
-      const index = waiting.indexOf(turn);
-      if (index >= 0) waiting.splice(index, 1);
-      reject(new LookupStopped());
-    };
-    const turn = () => {
-      permit?.removeEventListener('abort', stop);
-      resolve();
-    };
-    if (permit?.aborted) return stop();
-    waiting.push(turn);
-    permit?.addEventListener('abort', stop, { once: true });
-  });
-}
-
-/**
- * The JSON of a public service; null for a repository it does not know or may not show, which it
- * says with one of the missing statuses. A request with a permit is only sent while it holds.
- */
-async function fetchBody(
-  url: string,
-  as: 'json' | 'text',
-  missing: number[] = [401, 403, 404],
-  permit?: AbortSignal
-): Promise<any> {
-  while (running >= maxRequests) {
-    await waitTurn(permit);
-  }
-  if (permit?.aborted) {
-    // the turn goes to the next request
-    waiting.shift()?.();
-    throw new LookupStopped();
-  }
-  running++;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-  try {
-    const response = await fetch(url, { signal: controller.signal, credentials: 'omit' });
-    if (missing.includes(response.status)) return null;
-    if (!response.ok) throw new Error(`${url} answered ${response.status}`);
-    return as === 'json' ? await response.json() : await response.text();
-  } finally {
-    clearTimeout(timer);
-    running--;
-    waiting.shift()?.();
-  }
-}
-
-function fetchJson(url: string, permit?: AbortSignal): Promise<any> {
-  return fetchBody(url, 'json', undefined, permit);
-}
-
-function strings(values: unknown[]): string[] {
-  return values.filter((value): value is string => typeof value === 'string');
+  clearCachedLookups();
+  clearVersionCheckers();
 }
 
 /** The active tags of a quay.io repository, the most recent first. */
-function quayTags(repository: string) {
+function quayTags(repository: string, permit?: AbortSignal) {
   return cached<string[]>(`quay|${repository}`, async () => {
     const tags: string[] = [];
     // the newest versions are among the tags pushed last
     for (let page = 1; page <= 5; page++) {
       const body = await fetchJson(
-        `https://quay.io/api/v1/repository/${repository}/tag/?onlyActiveTags=true&limit=100&page=${page}`
+        `https://quay.io/api/v1/repository/${repository}/tag/?onlyActiveTags=true&limit=100&page=${page}`,
+        permit
       );
       if (!body) return page === 1 ? null : tags;
       tags.push(...strings((body.tags ?? []).map((tag: any) => tag?.name)));
@@ -275,163 +111,13 @@ function quayTags(repository: string) {
 }
 
 /** The versions of a GitHub project, from the tags jsDelivr reads; GitHub's own API allows only
- * 60 requests an hour from an address. A project that may be private is asked with a permit. */
+ * 60 requests an hour from an address. A project that may be private is asked with the permit
+ * for such names, another one with the permit of the newest versions. */
 function githubVersions(project: string, permit?: AbortSignal) {
   return cached<string[]>(`github|${project}`, async () => {
     const body = await fetchJson(`https://data.jsdelivr.com/v1/packages/gh/${project}`, permit);
     return body ? strings((body.versions ?? []).map((version: any) => version?.version)) : null;
   });
-}
-
-interface Release {
-  name: string;
-  latest?: string;
-  isEol: boolean;
-  eolFrom?: string;
-}
-
-function endOfLifeReleases(product: string) {
-  return cached<Release[]>(
-    `eol|${product}`,
-    async () => {
-      const body = await fetchJson(
-        `https://endoflife.date/api/v1/products/${encodeURIComponent(product)}/`
-      );
-      if (!body) return null;
-      return (body.result?.releases ?? [])
-        .filter((release: any) => typeof release?.name === 'string')
-        .map((release: any) => ({
-          name: release.name,
-          latest: typeof release.latest?.name === 'string' ? release.latest.name : undefined,
-          isEol: release.isEol === true,
-          eolFrom: typeof release.eolFrom === 'string' ? release.eolFrom : undefined,
-        }));
-    },
-    { persist: true }
-  );
-}
-
-const dockerHubHosts = [
-  'docker.io',
-  'index.docker.io',
-  'registry-1.docker.io',
-  'registry.hub.docker.com',
-];
-
-/**
- * The key of a package URL that names an image or a GitHub project, as endoflife.date lists them:
- * registry|path for an image, with * for a pkg:docker URL that names no registry, such as
- * *|library/redis for pkg:docker/library/redis and quay.io|argoproj/argocd for
- * pkg:oci/argocd?repository_url=quay.io/argoproj, and github|owner/name for pkg:github/owner/name.
- */
-export function purlKey(purl: string): string | undefined {
-  const docker = purl.match(/^pkg:docker\/([^@?#]+)(?:@[^?#]*)?(?:\?([^#]*))?/);
-  if (docker) {
-    let path = decodeURIComponent(docker[1]).toLowerCase();
-    if (!path.includes('/')) path = `library/${path}`;
-    const registry = new URLSearchParams(docker[2] ?? '').get('repository_url')?.toLowerCase();
-    const host = registry && (dockerHubHosts.includes(registry) ? 'docker.io' : registry);
-    return `${host || '*'}|${path}`;
-  }
-  const oci = purl.match(/^pkg:oci\/([^@?#/]+)(?:@[^?#]*)?\?([^#]*)/);
-  if (oci) {
-    const url = new URLSearchParams(oci[2]).get('repository_url')?.toLowerCase();
-    const [host, ...path] = url?.replace(/^https?:\/\//, '').split('/') ?? [];
-    if (!host) return undefined;
-    const registry = dockerHubHosts.includes(host) ? 'docker.io' : host;
-    return `${registry}|${[...path, decodeURIComponent(oci[1]).toLowerCase()].join('/')}`;
-  }
-  const github = purl.match(/^pkg:github\/([^/@?#]+)\/([^/@?#]+)/);
-  return github ? `github|${github[1]}/${github[2]}`.toLowerCase() : undefined;
-}
-
-/** The products of endoflife.date by the package URLs of their images and projects. */
-function endOfLifeIdentifiers() {
-  return cached<Record<string, string>>(
-    'eol-identifiers',
-    async () => {
-      const body = await fetchJson('https://endoflife.date/api/v1/identifiers/purl/');
-      if (!body) return null;
-      const products: Record<string, string> = {};
-      for (const entry of body.result ?? []) {
-        const key = typeof entry?.identifier === 'string' && purlKey(entry.identifier);
-        if (key && typeof entry.product?.name === 'string') products[key] = entry.product.name;
-      }
-      return products;
-    },
-    { persist: true }
-  );
-}
-
-/** The products of endoflife.date by their names and aliases, in lower case. */
-function endOfLifeNames() {
-  return cached<Record<string, string>>(
-    'eol-names',
-    async () => {
-      const body = await fetchJson('https://endoflife.date/api/v1/products/');
-      if (!body) return null;
-      const products: Record<string, string> = {};
-      const list: any[] = (body.result ?? []).filter((p: any) => typeof p?.name === 'string');
-      // a name of a product goes before the same alias of another one
-      for (const product of list) products[product.name.toLowerCase()] = product.name;
-      for (const product of list) {
-        for (const alias of strings(product.aliases ?? [])) {
-          products[alias.toLowerCase()] ??= product.name;
-        }
-      }
-      return products;
-    },
-    { persist: true }
-  );
-}
-
-// Amazon's public gallery mirrors the official images of Docker Hub
-function canonical(reference: ImageReference): ImageReference {
-  const mirrored = reference.repository.match(/^docker\/(library\/[^/]+)$/);
-  return reference.registry === 'public.ecr.aws' && mirrored
-    ? { registry: 'docker.io', repository: mirrored[1] }
-    : reference;
-}
-
-/** A product of endoflife.date, and whether it was found by name only. */
-export interface EndOfLifeMatch {
-  product: string;
-  byName: boolean;
-}
-
-/**
- * The endoflife.date product of an image: the product that lists the image or the GitHub project
- * it is built from, or else the product with the name of the image (tool for tool3), of its
- * project, or of the start of its name when its publisher carries that name too (tracer for
- * tracerproject/tracer-collector). A product found by name only counts when the tag of the image
- * is one of its versions.
- */
-export async function endOfLifeProduct(
-  reference: ImageReference,
-  project?: string
-): Promise<EndOfLifeMatch | undefined> {
-  const { registry, repository } = canonical(reference);
-  const path = repository.toLowerCase();
-  const identifiers = await endOfLifeIdentifiers();
-  const identified =
-    identifiers?.[`${registry}|${path}`] ??
-    identifiers?.[`*|${path}`] ??
-    (project ? identifiers?.[`github|${project.toLowerCase()}`] : undefined);
-  if (identified) return { product: identified, byName: false };
-
-  const names = await endOfLifeNames();
-  if (!names) return undefined;
-  const segments = path.split('/');
-  const name = segments[segments.length - 1];
-  const publisher = segments.length > 1 ? segments[segments.length - 2] : '';
-  const candidates = [name, name.replace(/\d+$/, ''), project?.split('/')[1]?.toLowerCase()];
-  const named = candidates.find(candidate => candidate && names[candidate]);
-  if (named) return { product: names[named], byName: true };
-  const start = name.split('-')[0];
-  if (start !== name && names[start] && publisher.includes(start)) {
-    return { product: names[start], byName: true };
-  }
-  return undefined;
 }
 
 /**
@@ -491,12 +177,13 @@ function impliedProject(reference: ImageReference, mayName: boolean) {
  * The names of Docker's official images: the library files that Docker builds them from, listed
  * by jsDelivr in one request a day, which names no image.
  */
-function officialImageNames() {
+function officialImageNames(permit?: AbortSignal) {
   return cached<string[]>(
     'official-names',
     async () => {
       const body = await fetchJson(
-        'https://data.jsdelivr.com/v1/packages/gh/docker-library/official-images@master?structure=flat'
+        'https://data.jsdelivr.com/v1/packages/gh/docker-library/official-images@master?structure=flat',
+        permit
       );
       if (!body) return null;
       return strings((body.files ?? []).map((file: any) => file?.name)).flatMap(
@@ -511,11 +198,13 @@ function officialImageNames() {
  * The tags of an official image of Docker Hub, from the library files that Docker builds them
  * from, read through jsDelivr: every tag that is maintained.
  */
-function officialImageTags(name: string) {
+function officialImageTags(name: string, permit?: AbortSignal) {
   return cached<string[]>(`official|${name}`, async () => {
     const text = await fetchBody(
       `https://cdn.jsdelivr.net/gh/docker-library/official-images@master/library/${name}`,
-      'text'
+      'text',
+      undefined,
+      permit
     );
     if (typeof text !== 'string') return null;
     return text
@@ -526,9 +215,15 @@ function officialImageTags(name: string) {
   });
 }
 
+// what shields.io answers, with status 200, when it could not ask Docker Hub: "rate limited by
+// upstream service" or "inaccessible", which say nothing about the image
+const shieldsFailure = /rate limited|inaccessible/i;
+
 /**
  * The newest version of an image of Docker Hub as shields.io, which makes the version badges of
  * projects, reads it. It sorts the most recent tags by their version and adds a v to the version.
+ * When shields.io could not ask Docker Hub, the lookup fails, so that it is asked again after an
+ * hour instead of being kept as the answer for a day.
  */
 function dockerHubVersion(repository: string, permit: AbortSignal) {
   return cached<string>(`shields|${repository}`, async () => {
@@ -536,8 +231,21 @@ function dockerHubVersion(repository: string, permit: AbortSignal) {
       `https://img.shields.io/docker/v/${repository}.json?sort=semver`,
       permit
     );
-    return typeof body?.value === 'string' ? body.value : null;
+    const value = typeof body?.value === 'string' ? body.value : null;
+    if (value && shieldsFailure.test(value)) throw new Error(`shields.io answered ${value}`);
+    return value;
   });
+}
+
+/**
+ * Whether the answer of shields.io shows that it knows the Docker Hub image, which it only can
+ * when the image is public: a version, or "invalid response data", which it answers for some
+ * public repositories. Its other messages, such as "repository or tag not found" or "no tags
+ * found", show nothing about the image.
+ */
+export function shieldsKnowsImage(value: string | null | undefined): boolean {
+  if (!value) return false;
+  return /^v?\d/i.test(value.trim()) || /^invalid response data$/i.test(value.trim());
 }
 
 /** An image in Google's Artifact Registry. */
@@ -601,17 +309,17 @@ export function artifactRegistryPackage(
  * Whether anyone may read a repository of Artifact Registry. Private repositories are asked
  * about once a day, rather than for each of their images.
  */
-function isPublicRepository(url: string) {
-  return cached<boolean>(`ar-repository|${url}`, async () => !!(await fetchJson(url)), {
+function isPublicRepository(url: string, permit?: AbortSignal) {
+  return cached<boolean>(`ar-repository|${url}`, async () => !!(await fetchJson(url, permit)), {
     persist: true,
   });
 }
 
 /** The tags of an image of Artifact Registry, in the order of their names. */
-function artifactRegistryTags(image: ArtifactRegistryPackage) {
+function artifactRegistryTags(image: ArtifactRegistryPackage, permit?: AbortSignal) {
   const repositoryUrl = `https://artifactregistry.googleapis.com/v1/projects/${image.project}/locations/${image.location}/repositories/${image.repository}`;
   return cached<string[]>(`ar|${repositoryUrl}|${image.package}`, async () => {
-    if (!(await isPublicRepository(repositoryUrl))) return null;
+    if (!(await isPublicRepository(repositoryUrl, permit))) return null;
     const tags: string[] = [];
     let pageToken = '';
     // versions come before names such as latest; images with many builds have thousands of tags
@@ -619,7 +327,8 @@ function artifactRegistryTags(image: ArtifactRegistryPackage) {
       const body = await fetchJson(
         `${repositoryUrl}/packages/${encodeURIComponent(image.package)}/tags?pageSize=1000${
           pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''
-        }`
+        }`,
+        permit
       );
       if (!body) return page === 1 ? null : tags;
       for (const entry of body.tags ?? []) {
@@ -643,13 +352,15 @@ function newestListedTag(tag: string, tags: string[] | null) {
  * The newest version from the registry of the image or the GitHub project it is built from: the
  * project its registry implies, or the one its labels name (sourceProject) when the image is
  * public, which its registry or shields.io knowing it shows. shields.io and the implied project
- * of an image not known to be public are only asked about when possiblyPrivate allows it.
+ * of an image not known to be public are only asked about when possiblyPrivate allows it; the
+ * other requests take the permit of the newest versions.
  */
 function registryOrProjectLatest(
   reference: ImageReference,
   tag: string,
   sourceProject: string | undefined,
-  possiblyPrivate: AbortSignal | undefined
+  possiblyPrivate: AbortSignal | undefined,
+  permit?: AbortSignal
 ) {
   return cached<LatestVersion>(
     `latest|${reference.registry}/${reference.repository}:${tag}|${sourceProject ?? ''}|${
@@ -658,7 +369,7 @@ function registryOrProjectLatest(
     async () => {
       let isPublic = isPublicByName(reference);
       if (reference.registry === 'quay.io') {
-        const tags = await quayTags(reference.repository);
+        const tags = await quayTags(reference.repository, permit);
         isPublic = tags !== null;
         const newest = newestListedTag(tag, tags);
         if (newest) {
@@ -671,7 +382,7 @@ function registryOrProjectLatest(
       const googleImage = artifactRegistryPackage(reference);
       if (googleImage) {
         // none for a private repository
-        const tags = await artifactRegistryTags(googleImage);
+        const tags = await artifactRegistryTags(googleImage, permit);
         isPublic = tags !== null;
         const newest = newestListedTag(tag, tags);
         if (newest) {
@@ -691,9 +402,13 @@ function registryOrProjectLatest(
       if (official) {
         // an image without a publisher may also be one built locally, so only the names of
         // Docker's official images are asked about
-        const names = await officialImageNames();
-        const tags = names?.includes(official[1]) ? await officialImageTags(official[1]) : null;
-        isPublic = tags !== null;
+        const names = await officialImageNames(permit);
+        const tags = names?.includes(official[1])
+          ? await officialImageTags(official[1], permit)
+          : null;
+        // an image of that name with a tag that Docker does not build may be built locally too,
+        // so only one of the official tags shows that the image, with its labels, is public
+        isPublic = !!tags?.includes(tag);
         const newest = newestListedTag(tag, tags);
         if (newest)
           return { latest: newest, source: { name: 'Docker Hub', url: dockerHubPage?.url } };
@@ -702,9 +417,9 @@ function registryOrProjectLatest(
       // Docker Hub cannot be asked whether a repository is public, and shields.io learns the name
       if (dockerHub.registry === 'docker.io' && !official && possiblyPrivate) {
         const version = await dockerHubVersion(dockerHub.repository, possiblyPrivate);
-        // shields.io only sees public repositories; it says so for others. It also answers
-        // "invalid response data" for some public ones, and writes 2026.2.1 as v2026.2.1
-        if (version && !/not found/i.test(version)) isPublic = true;
+        // shields.io only sees public repositories; it says so for others, and writes 2026.2.1
+        // as v2026.2.1
+        if (shieldsKnowsImage(version)) isPublic = true;
         dockerHubNewest =
           (version &&
             newestOfVersion(tag, /^v/i.test(tag) ? version : version.replace(/^v/, ''))) ||
@@ -715,8 +430,8 @@ function registryOrProjectLatest(
         impliedProject(reference, isPublic || !!possiblyPrivate) ??
         (isPublic ? sourceProject : undefined);
       if (project) {
-        // the project of an image not known to be public is only named with the permit
-        const versions = await githubVersions(project, isPublic ? undefined : possiblyPrivate);
+        // the project of an image not known to be public is only named with the permit for it
+        const versions = await githubVersions(project, isPublic ? permit : possiblyPrivate);
         const newest = versions && newestRelease(tag, versions);
         if (newest) {
           return {
@@ -737,10 +452,11 @@ function registryOrProjectLatest(
 async function endOfLifeOf(
   reference: ImageReference,
   tag: string,
-  project?: string
+  project: string | undefined,
+  permit: AbortSignal
 ): Promise<{ line?: ReleaseLine; newest?: LatestVersion }> {
-  const match = await endOfLifeProduct(reference, project);
-  const releases = match ? await endOfLifeReleases(match.product) : null;
+  const match = await endOfLifeProduct(reference, project, permit);
+  const releases = match ? await endOfLifeReleases(match.product, permit) : null;
   if (!match || !releases?.length) return {};
   const { product } = match;
   const url = `https://endoflife.date/${product}`;
@@ -767,7 +483,9 @@ async function endOfLifeOf(
 /**
  * The newest version of a public image and the release line of its tag. Images whose tag is not
  * a version, such as latest, are not looked up. Without the end of life, endoflife.date is not
- * asked, also not for the newest version.
+ * asked, also not for the newest version. The lookup takes the permits of the newest versions and
+ * of the end of life as it starts, so switching one of them off (changeImageVersionSetting) stops
+ * the requests it has yet to make; what was stopped is not kept as an answer or a failure.
  */
 export async function lookupImageVersion(
   image: string,
@@ -787,82 +505,29 @@ export async function lookupImageVersion(
   const tag = imageTag(image);
   if (!reference || !tag || !parseVersion(tag)) return {};
   const sourceProject = githubProjectOfSource(options.source);
+  // taken now, so that a setting that is switched off also stops the requests made later
+  const versionsPermit = imageVersionsPermit();
+  const endOfLifeDatesPermit = endOfLifePermit();
   // a service that fails leaves out what it would tell
   const noEndOfLife: { line?: ReleaseLine; newest?: LatestVersion } = {};
   const [latest, endOfLife] = await Promise.all([
     options.latest === false
       ? null
-      : registryOrProjectLatest(reference, tag, sourceProject, options.possiblyPrivate).catch(
-          () => null
-        ),
+      : registryOrProjectLatest(
+          reference,
+          tag,
+          sourceProject,
+          options.possiblyPrivate,
+          versionsPermit
+        ).catch(() => null),
     options.endOfLife === false
       ? noEndOfLife
-      : endOfLifeOf(reference, tag, githubProject(reference) ?? sourceProject).catch(
-          () => noEndOfLife
-        ),
+      : endOfLifeOf(
+          reference,
+          tag,
+          githubProject(reference) ?? sourceProject,
+          endOfLifeDatesPermit
+        ).catch(() => noEndOfLife),
   ]);
   return { latest: latest ?? endOfLife.newest, line: endOfLife.line };
-}
-
-/** The key of an image for version-checker's results: registry/repository:tag. */
-export function imageVersionKey(image: string): string | undefined {
-  const reference = parseImageReference(image);
-  const tag = imageTag(image);
-  return reference && tag ? `${reference.registry}/${reference.repository}:${tag}` : undefined;
-}
-
-function unescapeLabel(value: string) {
-  return value.replace(/\\(["\\n])/g, (_, char) => (char === 'n' ? '\n' : char));
-}
-
-/** version-checker's results, by imageVersionKey, from its Prometheus metrics. */
-export function parseVersionCheckerMetrics(text: string): Map<string, VersionCheckerResult> {
-  const results = new Map<string, VersionCheckerResult>();
-  for (const line of text.split('\n')) {
-    const match = line.match(/^version_checker_is_latest_version\{(.*)\}\s+(\S+)/);
-    if (!match) continue;
-    const labels: Record<string, string> = {};
-    for (const [, name, value] of match[1].matchAll(/(\w+)="((?:[^"\\]|\\.)*)"/g)) {
-      labels[name] = unescapeLabel(value);
-    }
-    const key =
-      labels.image && labels.current_version
-        ? imageVersionKey(`${labels.image}:${labels.current_version}`)
-        : undefined;
-    if (key && labels.latest_version) {
-      results.set(key, { latest: labels.latest_version, isLatest: Number(match[2]) === 1 });
-    }
-  }
-  return results;
-}
-
-/**
- * The results of version-checker in a cluster, read from its metrics through the API server's
- * service proxy; empty when it does not run there. Kept for five minutes.
- */
-export function versionCheckerResults(
-  cluster: string,
-  now: number = Date.now()
-): Promise<Map<string, VersionCheckerResult>> {
-  const entry = versionCheckers.get(cluster);
-  if (entry && now < entry.expires) return entry.value;
-  const value = (async () => {
-    const services = await request(
-      `/api/v1/services?labelSelector=${encodeURIComponent(
-        'app.kubernetes.io/name=version-checker'
-      )}`,
-      { cluster, autoLogoutOnAuthError: false }
-    );
-    const service = services?.items?.[0];
-    const ports: Array<{ name?: string; port: number }> = service?.spec?.ports ?? [];
-    const port = ports.find(p => p.name === 'web') ?? ports[0];
-    if (!service || !port) return new Map<string, VersionCheckerResult>();
-    const response = await request(
-      `/api/v1/namespaces/${service.metadata.namespace}/services/${service.metadata.name}:${port.port}/proxy/metrics`,
-      { cluster, isJSON: false, autoLogoutOnAuthError: false }
-    );
-    return parseVersionCheckerMetrics(await response.text());
-  })().catch(() => new Map<string, VersionCheckerResult>());
-  versionCheckers.set(cluster, { expires: now + 5 * 60 * 1000, value });
-  return value;
 }

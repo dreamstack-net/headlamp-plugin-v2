@@ -1,12 +1,15 @@
 package vap
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"reflect"
 	"strings"
 
 	"github.com/google/cel-go/cel"
+	celast "github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/ext"
@@ -40,10 +43,30 @@ type EvaluationResults struct {
 	Error            string        `json:"error,omitempty"`
 	Variables        []*EvalResult `json:"variables,omitempty"`
 	MatchConstraints bool          `json:"matchConstraints"`
-	MatchConditions  []*EvalResult `json:"matchConditions,omitempty"`
-	Validations      []*EvalResult `json:"validations,omitempty"`
-	AuditAnnotations []*EvalResult `json:"auditAnnotations,omitempty"`
+	// why the request does not match the constraints
+	MatchReason     string        `json:"matchReason,omitempty"`
+	MatchConditions []*EvalResult `json:"matchConditions,omitempty"`
+	// false when a match condition is false, so the API server skips the policy; only set when
+	// the request matches the constraints
+	MatchConditionsMatched bool `json:"matchConditionsMatched"`
+	// a match condition that failed while none is false. The API server then applies the
+	// failurePolicy: Ignore admits the request, Fail, the default, makes it a violation, which
+	// the validationActions of the binding deny, warn about or audit
+	MatchConditionError string `json:"matchConditionError,omitempty"`
+	// whether the failurePolicy of the policy is Ignore, which admits a request whose
+	// evaluation fails
+	FailurePolicyIgnore bool          `json:"failurePolicyIgnore,omitempty"`
+	Validations         []*EvalResult `json:"validations,omitempty"`
+	AuditAnnotations    []*EvalResult `json:"auditAnnotations,omitempty"`
+	// an audit annotation for which the API server rejects the request, whatever the
+	// validationActions of the binding: its value is not a string or null, or, unless the
+	// failurePolicy is Ignore, it failed
+	AuditAnnotationError string `json:"auditAnnotationError,omitempty"`
 }
+
+// the longest message of a messageExpression the API server uses
+// (k8s.io/apiserver/pkg/apis/cel.MaxEvaluatedMessageExpressionSizeBytes)
+const maxMessageExpressionBytes = 5 * 1024
 
 type ObjectData map[string]any
 
@@ -78,15 +101,16 @@ func NewAdmissionPolicyEvaluator(policy, object, oldObject, request, params, nam
 		return nil, fmt.Errorf("failed to parse policy YAML: %w", err)
 	}
 
-	if err := yaml.Unmarshal(object, &evaluator.object); err != nil {
+	var err error
+	if evaluator.object, err = unmarshalObject(object); err != nil {
 		return nil, fmt.Errorf("failed to parse object YAML: %w", err)
 	}
 
-	if err := yaml.Unmarshal(oldObject, &evaluator.oldObject); err != nil {
+	if evaluator.oldObject, err = unmarshalObject(oldObject); err != nil {
 		return nil, fmt.Errorf("failed to parse oldObject YAML: %w", err)
 	}
 
-	if err := yaml.Unmarshal(request, &evaluator.request); err != nil {
+	if evaluator.request, err = unmarshalObject(request); err != nil {
 		return nil, fmt.Errorf("failed to parse request YAML: %w", err)
 	}
 	// Attributes missing from the request are those of the request for the object
@@ -100,11 +124,11 @@ func NewAdmissionPolicyEvaluator(policy, object, oldObject, request, params, nam
 		}
 	}
 
-	if err := yaml.Unmarshal(params, &evaluator.paramsObject); err != nil {
+	if evaluator.paramsObject, err = unmarshalObject(params); err != nil {
 		return nil, fmt.Errorf("failed to parse params YAML: %w", err)
 	}
 
-	if err := yaml.Unmarshal(namespace, &evaluator.namespaceObject); err != nil {
+	if evaluator.namespaceObject, err = unmarshalObject(namespace); err != nil {
 		return nil, fmt.Errorf("failed to parse namespace YAML: %w", err)
 	}
 
@@ -127,6 +151,46 @@ func NewAdmissionPolicyEvaluator(policy, object, oldObject, request, params, nam
 	return &evaluator, nil
 }
 
+// unmarshalObject reads an object with whole numbers as integers and the other numbers as
+// doubles, as the API server reads the JSON of a request, rather than all of them as the
+// doubles of JSON: integer arithmetic on a double, such as replicas % 2, has no overload
+func unmarshalObject(data []byte) (ObjectData, error) {
+	jsonData, err := yaml.YAMLToJSON(data)
+	if err != nil {
+		return nil, err
+	}
+	var object ObjectData
+	decoder := json.NewDecoder(bytes.NewReader(jsonData))
+	decoder.UseNumber()
+	if err := decoder.Decode(&object); err != nil {
+		return nil, err
+	}
+	convertNumbers(map[string]any(object))
+	return object, nil
+}
+
+func convertNumbers(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, item := range v {
+			v[key] = convertNumbers(item)
+		}
+	case []any:
+		for i, item := range v {
+			v[i] = convertNumbers(item)
+		}
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return n
+		}
+		if f, err := v.Float64(); err == nil {
+			return f
+		}
+		return v.String()
+	}
+	return value
+}
+
 // defaultRequest returns the attributes of the request the API server would send when the
 // object is admitted: an UPDATE when there is an old object, a CREATE otherwise.
 func (evaluator *AdmissionPolicyEvaluator) defaultRequest() ObjectData {
@@ -139,6 +203,10 @@ func (evaluator *AdmissionPolicyEvaluator) defaultRequest() ObjectData {
 	metadata, _ := evaluator.object["metadata"].(map[string]any)
 	name, _ := metadata["name"].(string)
 	namespace, _ := metadata["namespace"].(string)
+	// the request for a Namespace names the Namespace itself as its namespace
+	if kind == "Namespace" && group == "" {
+		namespace = name
+	}
 
 	operation := "CREATE"
 	if evaluator.oldObject != nil {
@@ -162,14 +230,15 @@ func (evaluator *AdmissionPolicyEvaluator) defaultRequest() ObjectData {
 
 func (evaluator *AdmissionPolicyEvaluator) Evaluate() {
 
-	// Input Variables
+	// Input Variables. Like the API server, params and namespaceObject are null when there are
+	// none, rather than empty maps
 	variables := map[string]any{}
 	inputData := map[string]any{
 		"object":          evaluator.object,
 		"oldObject":       nullIfEmpty(evaluator.oldObject),
 		"request":         evaluator.request,
-		"params":          evaluator.paramsObject,
-		"namespaceObject": evaluator.namespaceObject,
+		"params":          nullIfEmpty(evaluator.paramsObject),
+		"namespaceObject": nullIfEmpty(evaluator.namespaceObject),
 		"variables":       variables,
 	}
 
@@ -190,19 +259,55 @@ func (evaluator *AdmissionPolicyEvaluator) Evaluate() {
 		})
 	}
 
-	// MatchConditions
-	matched := true
+	evaluator.Results.FailurePolicyIgnore = evaluator.policy.Spec.FailurePolicy != nil &&
+		*evaluator.policy.Spec.FailurePolicy == Ignore
+
+	// The API server evaluates the match conditions before the variables, and does not accept a
+	// policy whose match conditions use them. It gives them no namespace either: namespaceObject
+	// is null in a match condition, also for an object in a namespace
+	matchConditionData := map[string]any{}
+	for key, value := range inputData {
+		if key != "variables" {
+			matchConditionData[key] = value
+		}
+	}
+	matchConditionData["namespaceObject"] = nil
 	for _, matchCondition := range evaluator.policy.Spec.MatchConditions {
-		value, err := evaluator.evalExpression(inputData, matchCondition.Expression)
+		if evaluator.usesVariables(matchCondition.Expression) {
+			evaluator.Results.Error = fmt.Sprintf("the match condition %s uses variables, which the "+
+				"API server does not accept: it evaluates match conditions before the variables",
+				matchCondition.Name)
+			return
+		}
+	}
+
+	// MatchConditions: a condition that is false skips the policy; one that fails, while no
+	// other is false, applies the failurePolicy
+	matched := true
+	var conditionError string
+	for _, matchCondition := range evaluator.policy.Spec.MatchConditions {
+		value, err := evaluator.evalExpression(matchConditionData, matchCondition.Expression)
 		evaluator.Results.MatchConditions = append(evaluator.Results.MatchConditions, &EvalResult{
 			Name:   matchCondition.Name,
 			Result: getResult(value),
 			Error:  errorString(err),
 		})
-		matched = matched && err == nil && value != nil && value.Value() == true
+		switch {
+		case err != nil:
+			if conditionError == "" {
+				conditionError = fmt.Sprintf("%s: %v", matchCondition.Name, err)
+			}
+		case value == nil || value.Value() != true:
+			matched = false
+		}
 	}
 
+	evaluator.Results.MatchConditionsMatched = matched
 	if !matched {
+		return
+	}
+	if conditionError != "" {
+		evaluator.Results.MatchConditionError = conditionError
 		return
 	}
 
@@ -217,29 +322,80 @@ func (evaluator *AdmissionPolicyEvaluator) Evaluate() {
 		}
 
 		if err == nil && value != nil && value.Value() != true {
-			evalResult.Message = validation.Message
-
-			if evalResult.Message == "" && validation.MessageExpression != "" {
-				message, err := evaluator.evalExpression(inputData, validation.MessageExpression)
-				if err != nil || !types.IsUnknownOrError(message) {
-					evalResult.Message = message
-				}
-			}
+			evalResult.Message = evaluator.failureMessage(inputData, validation)
 		}
 
 		evaluator.Results.Validations = append(evaluator.Results.Validations, evalResult)
 	}
 
-	// AuditAnnotations
+	// AuditAnnotations: the API server publishes a string, leaves out null and an empty string,
+	// and rejects the request for any other value, whatever the failurePolicy and the
+	// validationActions; an annotation that fails rejects it unless the failurePolicy is Ignore
 	for _, auditAnnotation := range evaluator.policy.Spec.AuditAnnotations {
 		value, err := evaluator.evalExpression(inputData, auditAnnotation.ValueExpression)
-		evaluator.Results.AuditAnnotations = append(evaluator.Results.AuditAnnotations, &EvalResult{
+		result := &EvalResult{
 			Name:       auditAnnotation.Key,
 			Expression: auditAnnotation.ValueExpression,
-			Result:     value,
+			Result:     getResult(value),
 			Error:      errorString(err),
-		})
+		}
+		if err == nil && value != nil {
+			switch value.(type) {
+			case types.String, types.Null:
+			default:
+				result.Error = fmt.Sprintf("valueExpression '%v' resulted in unsupported return type: %v. "+
+					"Return type must be either string or null.", auditAnnotation.ValueExpression, value.Type())
+				if evaluator.Results.AuditAnnotationError == "" {
+					evaluator.Results.AuditAnnotationError = fmt.Sprintf("%s: %s", auditAnnotation.Key, result.Error)
+				}
+			}
+		}
+		if err != nil && !evaluator.Results.FailurePolicyIgnore && evaluator.Results.AuditAnnotationError == "" {
+			evaluator.Results.AuditAnnotationError = fmt.Sprintf("%s: %v", auditAnnotation.Key, err)
+		}
+		evaluator.Results.AuditAnnotations = append(evaluator.Results.AuditAnnotations, result)
 	}
+}
+
+// failureMessage is the message of a validation that is not true, as the API server makes it:
+// the result of the messageExpression, without surrounding white space, unless it fails, is not
+// a string, is empty, longer than 5 KiB or more than one line; else the message, without
+// surrounding white space; else the expression.
+func (evaluator *AdmissionPolicyEvaluator) failureMessage(inputData map[string]any, validation Validation) string {
+	message := ""
+	if validation.MessageExpression != "" {
+		value, err := evaluator.evalExpression(inputData, validation.MessageExpression)
+		if err == nil && value != nil {
+			if text, ok := value.Value().(string); ok {
+				text = strings.TrimSpace(text)
+				if len(text) <= maxMessageExpressionBytes && !strings.Contains(text, "\n") {
+					message = text
+				}
+			}
+		}
+	}
+	if message == "" {
+		message = strings.TrimSpace(validation.Message)
+	}
+	if message == "" {
+		message = fmt.Sprintf("failed expression: %v", strings.TrimSpace(validation.Expression))
+	}
+	return message
+}
+
+// usesVariables tells whether the expression refers to the variables of the policy
+func (evaluator *AdmissionPolicyEvaluator) usesVariables(expression string) bool {
+	parsed, issues := evaluator.celEnvironment.Parse(expression)
+	if issues != nil && issues.Err() != nil {
+		return false
+	}
+	found := false
+	celast.PreOrderVisit(parsed.NativeRep().Expr(), celast.NewExprVisitor(func(e celast.Expr) {
+		if e.Kind() == celast.IdentKind && e.AsIdent() == "variables" {
+			found = true
+		}
+	}))
+	return found
 }
 
 // nullIfEmpty binds absent input as null, like the API server does for oldObject on CREATE
@@ -287,9 +443,16 @@ func getResult(val ref.Val) any {
 	if err, ok := val.Value().(error); ok {
 		return err.Error()
 	}
-	if value, err := val.ConvertToNative(reflect.TypeOf(&structpb.Value{})); err != nil {
+	value, err := val.ConvertToNative(reflect.TypeFor[*structpb.Value]())
+	if err != nil {
 		return err.Error()
-	} else {
-		return value
 	}
+	// JSON has no NaN and no infinity, which a division of doubles by zero gives; such a value
+	// is shown as text, as it would fail the JSON of all results
+	if jsonValue, ok := value.(*structpb.Value); ok {
+		if _, err := jsonValue.MarshalJSON(); err != nil {
+			return fmt.Sprintf("%v", val.Value())
+		}
+	}
+	return value
 }

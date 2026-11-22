@@ -71,17 +71,28 @@ function executionMock(container: ContainerProfileContainer) {
     opens: (container.opens ?? []).map(open => ({ path: open.path, flags: open.flags ?? [] })),
     syscalls: container.syscalls ?? [],
     capabilities: container.capabilities ?? [],
+    // the HTTP endpoints of the cp.was_endpoint_accessed* and cp.was_host_accessed functions
+    ...(container.endpoints?.length
+      ? {
+          endpoints: container.endpoints.map(endpoint => ({
+            endpoint: endpoint.endpoint,
+            methods: endpoint.methods ?? [],
+          })),
+        }
+      : {}),
   };
+}
+
+/** The values of a neighbor's single field and its list, as the node-agent takes both. */
+function neighborValues(one: string | undefined, list: string[] | undefined): string[] {
+  return [...new Set([...(one ? [one] : []), ...(list ?? [])])];
 }
 
 function networkEntries(neighbors: NonNullable<ContainerProfileContainer['egress']>) {
   return neighbors.flatMap(neighbor => {
-    const dns = neighbor.dnsNames?.length ? neighbor.dnsNames : neighbor.dns ? [neighbor.dns] : [];
-    const ipAddresses = neighbor.ipAddresses?.length
-      ? neighbor.ipAddresses
-      : neighbor.ipAddress
-      ? [neighbor.ipAddress]
-      : [''];
+    const dns = neighborValues(neighbor.dns, neighbor.dnsNames);
+    const addresses = neighborValues(neighbor.ipAddress, neighbor.ipAddresses);
+    const ipAddresses = addresses.length ? addresses : [''];
     // The rule playground's Go mock accepts one ipAddress per entry, while
     // ContainerProfile can hold several in a single network neighbor.
     return ipAddresses.map(ipAddress => ({ ipAddress, dns }));

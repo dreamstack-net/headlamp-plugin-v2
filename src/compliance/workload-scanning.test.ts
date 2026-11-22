@@ -124,6 +124,35 @@ it('counts again after exceptions changed the scans', () => {
   expect(countScans(scans, control, 'failed')).toBeGreaterThanOrEqual(before);
 });
 
+it('counts the exceptions limited to a framework only in that framework', () => {
+  const result = (controlID: string, exceptedInFrameworks?: string[]) =>
+    ({
+      metadata: {},
+      exceptedByPolicy: false,
+      spec: {
+        controls: {
+          [controlID]: {
+            controlID,
+            status: { status: 'failed' },
+            exceptedByPolicy: false,
+            exceptedInFrameworks,
+          },
+        },
+      },
+    } as any);
+  const scans = [result('C-0001', ['nsa']), result('C-0001')];
+  invalidateControlStats(true);
+  const control = { controlID: 'C-0001' } as any;
+
+  expect(countScans(scans, control, 'failed', 'NSA')).toBe(1);
+  expect(countExcludedWorkloadsForControl(scans, control, 'NSA')).toBe(1);
+  expect(countScans(scans, control, 'failed', 'MITRE')).toBe(2);
+  expect(countScans(scans, control, 'failed')).toBe(2);
+  expect(countFailedScans(scans, 'nsa')).toBe(1);
+  expect(frameworkComplianceScore(scans, { name: 'NSA', controls: [control] } as any)).toBe(50);
+  expect(frameworkComplianceScore(scans, { name: 'MITRE', controls: [control] } as any)).toBe(0);
+});
+
 it('scores a framework by the average score of its controls', () => {
   const pass = (controlID: string, status: string) =>
     ({
@@ -137,4 +166,21 @@ it('scores a framework by the average score of its controls', () => {
       controls: [{ controlID: 'C-0001' }, { controlID: 'C-0002' }],
     } as any)
   ).toBe(75);
+});
+
+it('scores a framework without controls 100 instead of NaN', () => {
+  const scans = randomScans(5);
+  expect(frameworkComplianceScore(scans, { name: 'Empty', controls: [] } as any)).toBe(100);
+  expect(frameworkComplianceScore([], { name: 'Empty', controls: [] } as any)).toBe(100);
+});
+
+it('counts the failed results of the controls of a framework', () => {
+  const scans = randomScans(100);
+  const ids = new Set(['C-0002', 'C-0005', 'C-9999']);
+  expect(countFailedScans(scans, undefined, ids)).toBe(
+    [...ids].reduce((sum, id) => sum + reference.countScans(scans, id, 'failed'), 0)
+  );
+  expect(countFailedScans(scans, undefined, new Set())).toBe(0);
+  // without controls, all of them
+  expect(countFailedScans(scans, undefined, undefined)).toBe(countFailedScans(scans));
 });

@@ -1,11 +1,14 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import type { Dispatch, ReactNode, SetStateAction } from 'react';
+import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { vi } from 'vitest';
+import KubescapeCVEResults from './CVEResults';
 import ImageDetails from './ImageDetails';
 import ImageList from './ImageList';
+import { formatPercentile } from './KnownExploited';
+import VulnerabilitiesNamespaceSummary from './NamespaceSummary';
 import ResourceList from './ResourceList';
-import SBOMDetail from './SBOMDetail';
+import SBOMDetail, { distroLabel } from './SBOMDetail';
 import {
   getImageScanKey,
   invalidateScanClusters,
@@ -14,23 +17,39 @@ import {
   VulnerabilityContext,
   WorkloadScan,
 } from './scanData';
-import { manifest, match, sbom, summary, T0, T1, T2 } from './testFixtures';
+import { manifest, match, sbom, summary, T0, T1, T2, unscoredMatch } from './testFixtures';
 import WorkloadDetails, { fetchVulnerabilityManifest } from './WorkloadScanDetails';
 
 const mocks = vi.hoisted(() => ({
   request: vi.fn(),
-  imageGet: vi.fn(),
-  sbomGet: vi.fn(),
-  sbomFilteredGet: vi.fn(),
+  // the GET of an object of the storage, which the image and SBOM pages read once
+  fetchObject: vi.fn(),
   severity: null as string | null,
   cluster: 'cluster-a',
   name: 'workload-123',
   saveToFile: vi.fn(),
   lookupImageVersion: vi.fn(),
+  post: vi.fn(),
+  // the selected clusters
+  clusters: ['cluster-a', 'cluster-b'],
+  // the read of the scans by the page of a CVE, and the cache of the scans it starts from
+  readVulnerabilityScans: vi.fn(),
+  context: { workloadScans: [] as unknown[], queryTasks: [] as unknown[] },
+  // the columns of the table that was drawn last, for what its rows do not show
+  columns: [] as any[],
+  // the namespaces a restricted user may read; none for a user who may read all
+  allowedNamespaces: [] as string[],
 }));
 // the image versions and their end of life are off until they are switched on
 vi.mock('../common/config-store', () => ({
-  kubescapeConfigStore: { useConfig: () => () => ({ imageVersions: true, endOfLife: true }) },
+  kubescapeConfigStore: {
+    get: () => ({}),
+    useConfig: () => () => ({ imageVersions: true, endOfLife: true }),
+  },
+}));
+vi.mock('./Vulnerabilities', () => ({
+  readVulnerabilityScans: mocks.readVulnerabilityScans,
+  vulnerabilityContext: mocks.context,
 }));
 vi.mock('./imageVersionSources', async importOriginal => ({
   ...(await importOriginal<typeof import('./imageVersionSources')>()),
@@ -38,26 +57,34 @@ vi.mock('./imageVersionSources', async importOriginal => ({
   versionCheckerResults: async () => new Map(),
 }));
 vi.mock('../common/filedialog', () => ({ saveToFile: mocks.saveToFile }));
-vi.mock('../common/clusterContext', () => ({ getAllowedNamespaces: () => [] }));
+vi.mock('../common/clusterContext', () => ({
+  getAllowedNamespaces: () => mocks.allowedNamespaces,
+}));
 vi.mock('../index', () => ({
   RoutingName: {
     ImageVulnerabilityDetails: 'image',
     KubescapeSBOMDetails: 'sbom',
     KubescapeVulnerabilityDetails: 'workload',
   },
-  useHLSelectedClusters: () => ['cluster-a', 'cluster-b'],
+  useHLSelectedClusters: () => mocks.clusters,
 }));
 vi.mock('../model', () => ({
-  vulnerabilityManifestClass: { useApiGet: mocks.imageGet },
+  fetchObject: mocks.fetchObject,
+  vulnerabilityManifestClass: { pluralName: 'vulnerabilitymanifests' },
   vulnerabilityManifestSummaryClass: {},
-  sbomSyftClass: { useApiGet: mocks.sbomGet },
-  sbomSyftFilteredClass: { useApiGet: mocks.sbomFilteredGet },
+  sbomSyftClass: { pluralName: 'sbomsyfts' },
+  sbomSyftFilteredClass: { pluralName: 'sbomsyftfiltereds' },
+  vulnerabilitySummaryClass: { pluralName: 'vulnerabilitysummaries' },
 }));
 vi.mock('../common/url', () => ({
   getURLSegments: () => [mocks.name, 'workloads'],
+  getLastURLSegment: () => mocks.name,
   useURLSearchParam: (name: string) => [name === 'severity' ? mocks.severity : null, () => {}],
 }));
-vi.mock('@kinvolk/headlamp-plugin/lib/ApiProxy', () => ({ request: mocks.request }));
+vi.mock('@kinvolk/headlamp-plugin/lib/ApiProxy', () => ({
+  request: mocks.request,
+  post: mocks.post,
+}));
 vi.mock('@kinvolk/headlamp-plugin/lib/Utils', () => ({ getCluster: () => mocks.cluster }));
 vi.mock('../exceptions/GuidedVulnerabilityExceptionForm', () => ({
   GuidedVulnerabilityExceptionForm: ({ cveIds, acceptRisk }: any) => (
@@ -94,8 +121,10 @@ vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', () => ({
   ),
   // like Headlamp's table: the toolbar with the filters and export of a view, and only a
   // message without the toolbar when there are no rows
-  Table: ({ data = [], columns, renderTopToolbarCustomActions, emptyMessage }: any) =>
-    data.length === 0 ? (
+  Table: ({ data = [], columns, renderTopToolbarCustomActions, emptyMessage }: any) => {
+    // kept for the tests of what the rows do not show, such as how a column sorts
+    mocks.columns = columns;
+    return data.length === 0 ? (
       <div>{emptyMessage ?? 'No data to be shown.'}</div>
     ) : (
       <>
@@ -126,20 +155,28 @@ vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', () => ({
           </tbody>
         </table>
       </>
-    ),
+    );
+  },
 }));
 
 beforeEach(() => {
   mocks.saveToFile.mockReset();
   mocks.request.mockReset();
-  mocks.imageGet.mockReset();
-  mocks.sbomGet.mockReset();
-  mocks.sbomFilteredGet.mockReset();
+  mocks.fetchObject.mockReset();
+  // still being read, unless a test gives the object
+  mocks.fetchObject.mockReturnValue(new Promise(() => {}));
   mocks.lookupImageVersion.mockReset();
   mocks.lookupImageVersion.mockResolvedValue({});
+  // a user who may not create exceptions, such as with GitOps
+  mocks.post.mockReset();
+  mocks.post.mockResolvedValue({ status: { allowed: false } });
   mocks.cluster = 'cluster-a';
   mocks.name = 'workload-123';
   mocks.severity = null;
+  mocks.clusters = ['cluster-a', 'cluster-b'];
+  mocks.allowedNamespaces = [];
+  mocks.readVulnerabilityScans.mockReset();
+  mocks.context.workloadScans = [];
 });
 afterEach(cleanup);
 
@@ -147,34 +184,50 @@ function valueFor(label: string) {
   return screen.getByText(label, { selector: 'dt' }).nextElementSibling!;
 }
 
-it('refreshes image evaluation time through the existing hook and preserves record creation', async () => {
-  let receive: Dispatch<SetStateAction<any>>;
-  mocks.imageGet.mockImplementation((callback: typeof receive) => {
-    receive = callback;
-  });
-  render(<ImageDetails />);
-  const first = manifest();
-  await act(async () => receive({ metadata: first.metadata, jsonData: first }));
-  expect(valueFor('Last evaluated').textContent).toBe(T1);
+it('reads the report of an image once, in the cluster of the page', async () => {
+  mocks.fetchObject.mockResolvedValue(manifest());
+  const view = render(<ImageDetails />);
+  expect(screen.getByText('Reading the vulnerabilities of the image…')).toBeTruthy();
+  await waitFor(() => expect(valueFor('Last evaluated').textContent).toBe(T1));
   expect(valueFor('Scan record created').textContent).toBe(T0);
-  const second = manifest(T2);
-  await act(async () => receive({ metadata: second.metadata, jsonData: second }));
-  expect(valueFor('Last evaluated').querySelector('time')?.dateTime).toBe(T2);
-  expect(valueFor('Scan record created').textContent).toBe(T0);
-  expect(mocks.imageGet.mock.calls.every(call => call[4].cluster === 'cluster-a')).toBe(true);
   expect(screen.getByText('CVE-1')).toBeTruthy();
+  // a GET, not Headlamp's useApiGet, whose watch of the storage would replace the report with
+  // one without its matches
+  expect(mocks.fetchObject).toHaveBeenCalledWith('workload-123', 'workloads', 'cluster-a', {
+    pluralName: 'vulnerabilitymanifests',
+  });
+
+  // drawn again, such as when exceptions are read, the page keeps the report it read
+  view.rerender(<ImageDetails />);
+  await act(async () => {});
+  expect(mocks.fetchObject).toHaveBeenCalledTimes(1);
+  expect(screen.getByText('CVE-1')).toBeTruthy();
+
+  // another image of the URL is read, without the report of the image before
+  mocks.name = 'image-456';
+  const other = manifest(T2);
+  other.spec.payload.matches = [match('CVE-9')];
+  mocks.fetchObject.mockResolvedValue(other);
+  view.rerender(<ImageDetails />);
+  expect(screen.queryByText('CVE-1')).toBeNull();
+  await waitFor(() => expect(screen.getByText('CVE-9')).toBeTruthy());
+  expect(valueFor('Last evaluated').querySelector('time')?.dateTime).toBe(T2);
+  expect(mocks.fetchObject).toHaveBeenCalledTimes(2);
+});
+
+it('says why the report of an image could not be read', async () => {
+  mocks.fetchObject.mockRejectedValue({ status: 404, message: 'vulnerabilitymanifests not found' });
+  render(<ImageDetails />);
+  expect(await screen.findByText('Resource not found')).toBeTruthy();
+  expect(screen.getByText('vulnerabilitymanifests not found')).toBeTruthy();
 });
 
 it('keeps legacy image findings readable beside Unknown evaluation time', async () => {
-  let receive: (item: any) => void;
-  mocks.imageGet.mockImplementation((callback: typeof receive) => {
-    receive = callback;
-  });
-  render(<ImageDetails />);
   const legacy = manifest();
   delete legacy.spec.metadata;
-  await act(async () => receive({ metadata: legacy.metadata, jsonData: legacy }));
-  expect(valueFor('Last evaluated').textContent).toBe('Unknown');
+  mocks.fetchObject.mockResolvedValue(legacy);
+  render(<ImageDetails />);
+  await waitFor(() => expect(valueFor('Last evaluated').textContent).toBe('Unknown'));
   expect(screen.getByText('CVE-1')).toBeTruthy();
 });
 
@@ -217,7 +270,7 @@ it('reads a report from the operator namespace when it is not where the summary 
   s.spec.vulnerabilitiesRef.relevant = undefined;
   mocks.request.mockImplementation(async (url: string) => {
     if (url.includes('summaries/')) return s;
-    if (url.startsWith('api/v1/pods?'))
+    if (url.replace(/^\//, '').startsWith('api/v1/pods?'))
       return { items: [{ metadata: { namespace: 'kubescape' } }] };
     if (url.includes('/namespaces/kubescape/vulnerabilitymanifests/image-123')) return manifest(T2);
     throw Object.assign(new Error('not found'), { status: 404 });
@@ -229,6 +282,34 @@ it('reads a report from the operator namespace when it is not where the summary 
   expect(mocks.request.mock.calls.map(([url]) => url.split('?')[0])).toContain(
     '/apis/spdx.softwarecomposition.kubescape.io/v1beta1/namespaces/workloads/vulnerabilitymanifests/image-123'
   );
+});
+
+it('reads a report from the default namespace of Kubescape while the operator namespace is unknown', async () => {
+  window.sessionStorage.clear();
+  const s = summary();
+  s.spec.vulnerabilitiesRef.all = {
+    kind: 'vulnerabilitymanifests',
+    name: 'image-123',
+    namespace: 'workloads',
+  };
+  s.spec.vulnerabilitiesRef.relevant = undefined;
+  mocks.request.mockImplementation(async (url: string) => {
+    if (url.includes('summaries/')) return s;
+    // a user who may not list pods, so the namespace of the operator cannot be looked up
+    if (url.includes('/pods?')) throw Object.assign(new Error('forbidden'), { status: 403 });
+    if (url.includes('/namespaces/kubescape/vulnerabilitymanifests/image-123')) return manifest(T2);
+    throw Object.assign(new Error('not found'), { status: 404 });
+  });
+
+  // like the list of the workloads, which reads the report there too
+  const [, all, , errors] = await fetchVulnerabilityManifest(
+    'workload-123',
+    'workloads',
+    'cluster-a'
+  );
+
+  expect(all?.metadata.name).toBe('image-123');
+  expect(errors).toEqual([]);
 });
 
 it.each(['all', 'relevant'] as const)(
@@ -262,16 +343,77 @@ it('isolates failed reports and uses kubescape only for legacy references withou
     if (url.endsWith('/image-123')) throw new Error('not found');
     return manifest(T2);
   });
-  const [, all, relevant] = await fetchVulnerabilityManifest(
+  const [, all, relevant, errors] = await fetchVulnerabilityManifest(
     'workload-123',
     'workloads',
     'cluster-a'
   );
   expect(all).toBeNull();
   expect(relevant?.spec.metadata?.report?.createdAt).toBe(T2);
+  // which report could not be read, and why, for the page to show
+  expect(errors).toEqual(['the report of the image (image-123): not found']);
   expect(mocks.request.mock.calls[1][0]).toContain('/namespaces/kubescape/');
   expect(mocks.request.mock.calls[2][0]).toContain('/namespaces/relevant-reports/');
   error.mockRestore();
+});
+
+it('says why a report of a workload could not be read, instead of showing no findings', async () => {
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  mocks.request.mockImplementation(async (url: string) => {
+    if (url.includes('summaries/')) return summary();
+    if (url.endsWith('/image-123')) {
+      throw Object.assign(new Error('the storage timed out'), { status: 504 });
+    }
+    return manifest(T2);
+  });
+  render(<WorkloadDetails />);
+
+  expect(
+    await screen.findByText(
+      'Unable to read the report of the image (image-123): the storage timed out'
+    )
+  ).toBeTruthy();
+  // what the summary says is shown
+  expect(valueFor('Workload').textContent).toBe('workload');
+  expect(screen.queryByText('CVE-1')).toBeNull();
+  error.mockRestore();
+});
+
+it('shows the findings of a report that has no source', async () => {
+  const all = manifest();
+  (all.spec.payload as { source: unknown }).source = null;
+  mocks.request.mockImplementation(async (url: string) =>
+    url.includes('summaries/') ? summary() : url.endsWith('/image-123') ? all : manifest(T2)
+  );
+  render(<WorkloadDetails />);
+
+  expect(await screen.findByText('CVE-1')).toBeTruthy();
+  expect(valueFor('Type').textContent).toBe('');
+});
+
+it('links a finding to its data source only when that is a web address', async () => {
+  const report = manifest();
+  report.spec.payload.matches = [match('CVE-1'), match('CVE-2')];
+  // the address is what the report says, which could be a script
+  report.spec.payload.matches[1].vulnerability.dataSource = 'javascript:alert(1)';
+  const expectLinks = async () => {
+    expect((await screen.findByText('CVE-1')).closest('a')?.getAttribute('href')).toBe(
+      'https://example.com/cve'
+    );
+    expect(screen.getByText('CVE-2').closest('a')).toBeNull();
+  };
+
+  // the report of the image and of the relevant findings
+  mocks.request.mockImplementation(async (url: string) =>
+    url.includes('summaries/') ? summary() : report
+  );
+  const workload = render(<WorkloadDetails />);
+  await expectLinks();
+  workload.unmount();
+
+  mocks.fetchObject.mockResolvedValue(report);
+  render(<ImageDetails />);
+  await expectLinks();
 });
 
 it('shows independent workload dates and preserves relevancy filtering and exception controls', async () => {
@@ -289,6 +431,34 @@ it('shows independent workload dates and preserves relevancy filtering and excep
   expect(screen.getByText('CVE-2')).toBeTruthy();
   fireEvent.click(screen.getAllByRole('button', { name: 'Create Vulnerability Exception' })[0]);
   expect(screen.getByText('Exception for CVE-1')).toBeTruthy();
+});
+
+it('shows a CVE of several packages as relevant only for the packages the relevant report has', async () => {
+  // busybox, busybox-binsh and ssl_client share the busybox CVEs; the workload was only seen
+  // to use two of them, which Kubescape counts as 2 relevant findings
+  const all = manifest();
+  all.spec.payload.matches = ['busybox', 'busybox-binsh', 'ssl_client'].map(name => ({
+    ...match('CVE-1'),
+    artifact: { name, version: '1.37.0' },
+  }));
+  const relevant = manifest(T2);
+  relevant.spec.payload.matches = ['busybox', 'ssl_client'].map(name => ({
+    ...match('CVE-1'),
+    artifact: { name, version: '1.37.0' },
+  }));
+  mocks.request.mockImplementation(async (url: string) =>
+    url.includes('summaries/') ? summary() : url.endsWith('/image-123') ? all : relevant
+  );
+  render(<WorkloadDetails />);
+  await waitFor(() => expect(screen.getByText('ssl_client')).toBeTruthy());
+
+  expect(screen.getByText('busybox')).toBeTruthy();
+  expect(screen.queryByText('busybox-binsh')).toBeNull();
+
+  // switched off, the other package is listed as not relevant
+  fireEvent.click(screen.getByRole('checkbox'));
+  const row = screen.getByText('busybox-binsh').closest('tr')!;
+  expect(within(row).getByText('No')).toBeTruthy();
 });
 
 it('exports the findings that are shown as CSV', async () => {
@@ -409,10 +579,6 @@ it('accepts the risk of the open CVEs of a workload from its page', async () => 
 });
 
 it('accepts the risk of the open CVEs of an image in the whole cluster from its page', async () => {
-  let receive: (item: any) => void = () => {};
-  mocks.imageGet.mockImplementation((callback: typeof receive) => {
-    receive = callback;
-  });
   const imageException = (name: string, match: object) => ({
     kind: 'ClusterSecurityException',
     metadata: { name },
@@ -442,10 +608,10 @@ it('accepts the risk of the open CVEs of an image in the whole cluster from its 
         }
       : { items: [] }
   );
-  render(<ImageDetails />);
   const report = manifest();
   report.spec.payload.matches = [match('CVE-1'), match('CVE-2')];
-  await act(async () => receive({ metadata: report.metadata, jsonData: report }));
+  mocks.fetchObject.mockResolvedValue(report);
+  render(<ImageDetails />);
 
   expect(await screen.findByText('Accepted')).toBeTruthy();
   fireEvent.click(screen.getByRole('button', { name: 'Accept the risk of the open CVE' }));
@@ -485,21 +651,15 @@ it.each([
       </MemoryRouter>
     );
     expect(window.location.search).toBe('');
-    expect(mocks.sbomFilteredGet).toHaveBeenCalledTimes(filtered ? 1 : 0);
-    expect(mocks.sbomGet).toHaveBeenCalledTimes(filtered ? 0 : 1);
+    expect(mocks.fetchObject).toHaveBeenCalledTimes(1);
+    expect(mocks.fetchObject.mock.calls[0][3]).toEqual({
+      pluralName: filtered ? 'sbomsyftfiltereds' : 'sbomsyfts',
+    });
+    expect(screen.getByText('Reading the SBOM…')).toBeTruthy();
   }
 );
 
 it('shows an SBOM without artifacts', async () => {
-  let receive: (item: any) => void = () => {};
-  mocks.sbomFilteredGet.mockImplementation((callback: typeof receive) => {
-    receive = callback;
-  });
-  render(
-    <MemoryRouter initialEntries={['/sbom/relevant-reports/relevant-123?filtered']}>
-      <SBOMDetail />
-    </MemoryRouter>
-  );
   const noPackagesInUse = {
     metadata: { annotations: { 'kubescape.io/image-tag': 'example:latest' } },
     spec: {
@@ -507,24 +667,27 @@ it('shows an SBOM without artifacts', async () => {
       syft: { distro: { name: 'debian' }, artifacts: null },
     },
   };
-  await act(async () => receive({ jsonData: noPackagesInUse }));
-  expect(screen.getByText('Showing in use artifacts only')).toBeTruthy();
+  mocks.fetchObject.mockResolvedValue(noPackagesInUse);
+  render(
+    <MemoryRouter initialEntries={['/sbom/relevant-reports/relevant-123?filtered']}>
+      <SBOMDetail />
+    </MemoryRouter>
+  );
+  expect(await screen.findByText('Showing in use artifacts only')).toBeTruthy();
   expect(valueFor('Components').textContent).toBe('0');
 });
 
 it('downloads the SBOM as Syft JSON, CycloneDX and a CSV of its packages', async () => {
-  let receive: (item: any) => void = () => {};
-  mocks.sbomGet.mockImplementation((callback: typeof receive) => {
-    receive = callback;
-  });
+  mocks.fetchObject.mockResolvedValue(sbom());
   render(
     <MemoryRouter initialEntries={['/sbom/kubescape/docker.io-velero-velero-v1.18.1-b55b90']}>
       <SBOMDetail />
     </MemoryRouter>
   );
-  await act(async () => receive({ jsonData: sbom() }));
 
-  fireEvent.click(screen.getByRole('button', { name: 'Download Syft JSON' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Download Syft JSON' }));
+  expect(valueFor('Distro').textContent).toBe('Ubuntu 22.04.5 LTS');
+  expect(valueFor('Components').textContent).toBe('2');
   fireEvent.click(screen.getByRole('button', { name: 'Download CycloneDX' }));
   fireEvent.click(screen.getByRole('button', { name: 'Export CSV' }));
 
@@ -661,9 +824,11 @@ it('skips empty references and missing reference containers without fetching rep
   s.spec.vulnerabilitiesRef.all!.name = '';
   s.spec.vulnerabilitiesRef.relevant!.name = '';
   mocks.request.mockResolvedValue(s);
+  // no reports, and nothing that could not be read
   expect((await fetchVulnerabilityManifest('workload-123', 'workloads')).slice(1)).toEqual([
     null,
     null,
+    [],
   ]);
   expect(mocks.request).toHaveBeenCalledTimes(1);
   Reflect.deleteProperty(s.spec, 'vulnerabilitiesRef');
@@ -671,11 +836,14 @@ it('skips empty references and missing reference containers without fetching rep
   expect((await fetchVulnerabilityManifest('workload-123', 'workloads')).slice(1)).toEqual([
     null,
     null,
+    [],
   ]);
   expect(mocks.request).toHaveBeenCalledTimes(1);
 });
 
-it('keeps workload navigation on the source cluster and uses the relevant SBOM namespace', () => {
+it('keeps workload navigation on the source cluster and uses the relevant SBOM namespace', async () => {
+  // no exceptions
+  mocks.request.mockResolvedValue({ items: [] });
   const s = summary();
   s.metadata.cluster = 'cluster-b';
   const image = toImageScan(manifest());
@@ -683,6 +851,9 @@ it('keeps workload navigation on the source cluster and uses the relevant SBOM n
   const relevant = { ...image, manifestName: 'relevant-123', namespace: 'relevant-reports' };
   const images = new Map([image, relevant].map(scan => [getImageScanKey(scan), scan]));
   render(<ResourceList workloadScans={[toWorkloadScan(s, images)]} />);
+  // the exceptions are read
+  await act(async () => {});
+  expect(screen.queryByText(/Unable to read the security exceptions/)).toBeNull();
   expect(screen.getByText('workload').getAttribute('href')).toBe(
     '/cluster-b/workload/workloads/workload-123'
   );
@@ -692,6 +863,182 @@ it('keeps workload navigation on the source cluster and uses the relevant SBOM n
   expect(screen.getByLabelText('1 High findings').getAttribute('href')).toBe(
     '/cluster-b/workload/workloads/workload-123?severity=High'
   );
+});
+
+it('counts a finding that an exception hid from the relevant report as relevant, like the page of the workload', async () => {
+  // no exceptions are read here; kubevuln applied one when it scanned the workload
+  mocks.request.mockResolvedValue({ items: [] });
+  const image = toImageScan(manifest());
+  image.matches = [match('CVE-1'), match('CVE-2')];
+  const relevant = {
+    ...image,
+    manifestName: 'relevant-123',
+    namespace: 'relevant-reports',
+    matches: [match('CVE-1')],
+    // the report of the image is shared with a workload without the exception
+    ignoredMatches: [match('CVE-2')],
+  };
+  const images = new Map([image, relevant].map(scan => [getImageScanKey(scan), scan]));
+  render(<ResourceList workloadScans={[toWorkloadScan(summary(), images)]} />);
+  await act(async () => {});
+
+  expect(screen.getByText('2 of 2')).toBeTruthy();
+});
+
+// the column of the table that was drawn last, by its id or header
+function column(name: string) {
+  return mocks.columns.find(found => (found.id ?? found.header) === name);
+}
+
+it('sorts the counts of workloads and images by their numbers, in a table of any size', async () => {
+  mocks.request.mockResolvedValue({ items: [] });
+  const image = toImageScan(manifest());
+  const scans = [toWorkloadScan(summary(), new Map([[getImageScanKey(image), image]]))];
+  const resources = render(<ResourceList workloadScans={scans} />);
+  await act(async () => {});
+  // Headlamp's table picks how to sort a column from the rows after the tenth, so that ten rows
+  // or fewer would sort these counts as text: 9 findings above 12
+  expect(column('CVE').sortingFn).toBe('alphanumeric');
+  expect(column('Relevant').sortingFn).toBe('alphanumeric');
+  resources.unmount();
+
+  render(<ImageList workloadScans={scans} />);
+  expect(column('Vulnerabilities').sortingFn).toBe('alphanumeric');
+  // as text, which puts the lines without an announced end after the dated ones; by the numbers
+  // in the values, as the table sorts more than ten rows by itself, they would come first
+  expect(column('End of life').sortingFn).toBe('basic');
+});
+
+it('links the SBOM of a workload whose relevant report is read before the report of its image', async () => {
+  mocks.request.mockResolvedValue({ items: [] });
+  const image = toImageScan(manifest());
+  const relevant = { ...image, manifestName: 'relevant-123', namespace: 'relevant-reports' };
+  const scan = toWorkloadScan(summary(), new Map([[getImageScanKey(relevant), relevant]]));
+  expect(scan.imageScan).toBeUndefined();
+  render(<ResourceList workloadScans={[scan]} />);
+  await act(async () => {});
+
+  // the value of the cell names the relevant report, and stays the same when the report of the
+  // image arrives, so Headlamp does not draw the cell again: the link has to be there by now
+  expect(column('SBOM').accessorFn(scan)).toBe('relevant-123');
+  expect(screen.getByText('SBOM').getAttribute('href')).toBe(
+    '/cluster-a/sbom/relevant-reports/relevant-123?filtered'
+  );
+});
+
+it('gives the image of a workload as text before its report is read, so the table searches it', async () => {
+  mocks.request.mockResolvedValue({ items: [] });
+  const reading = toWorkloadScan(summary(), new Map());
+  render(<ResourceList workloadScans={[reading]} />);
+  await act(async () => {});
+
+  // Headlamp's table leaves a column out of its search when its value in the first row is
+  // neither text nor a number
+  expect(column('Image').accessorFn(reading)).toBe('');
+});
+
+it('has a column for the cluster only when several are selected, and no empty one otherwise', async () => {
+  mocks.request.mockResolvedValue({ items: [] });
+  const scans = [toWorkloadScan(summary(), new Map())];
+  const headers = () => mocks.columns.map(found => found.header);
+  const several = render(<ResourceList workloadScans={scans} />);
+  await act(async () => {});
+  expect(headers().slice(3, 6)).toEqual(['Namespace', 'Cluster', 'Image']);
+  several.unmount();
+
+  mocks.clusters = ['cluster-a'];
+  render(<ResourceList workloadScans={scans} />);
+  await act(async () => {});
+  // the last column, of the action, has no title
+  expect(headers()).toEqual([
+    'Name',
+    'Container',
+    'Kind',
+    'Namespace',
+    'Image',
+    'CVE',
+    'Relevant',
+    'Accepted',
+    'SBOM',
+    '',
+  ]);
+});
+
+it('shows a whole EPSS percentile as it is', () => {
+  // a hundred times 0.29 is 28.999999999999996
+  expect([0.29, 0.57, 0.58].map(formatPercentile)).toEqual(['29th', '57th', '58th']);
+});
+
+// a workload with the CVE, for the page of a CVE
+function scanWith(cluster: string, name: string, dataSource?: string): WorkloadScan {
+  const image = toImageScan(manifest());
+  image.cluster = cluster;
+  if (dataSource) image.matches[0].vulnerability.dataSource = dataSource;
+  const s = summary();
+  s.metadata.cluster = cluster;
+  s.metadata.labels['kubescape.io/workload-name'] = name;
+  return toWorkloadScan(s, new Map([[getImageScanKey(image), image]]));
+}
+
+it('lists the workloads with a CVE of the selected clusters only, also before they are read', async () => {
+  mocks.name = 'CVE-1';
+  mocks.clusters = ['cluster-a'];
+  // the cache of the other pages still has the scans of a cluster that is no longer selected
+  mocks.context.workloadScans = [scanWith('cluster-a', 'web'), scanWith('cluster-old', 'left')];
+  // still reading
+  mocks.readVulnerabilityScans.mockReturnValue(new Promise(() => {}));
+  render(<KubescapeCVEResults />);
+
+  expect(await screen.findByText('web')).toBeTruthy();
+  expect(screen.queryByText('left')).toBeNull();
+  expect(valueFor('CVE ID').querySelector('a')?.getAttribute('href')).toBe(
+    'https://example.com/cve'
+  );
+});
+
+it('drops the workloads and the error of the clusters that are no longer selected from the page of a CVE', async () => {
+  mocks.name = 'CVE-1';
+  mocks.clusters = ['cluster-a', 'cluster-b'];
+  mocks.readVulnerabilityScans.mockResolvedValue([
+    scanWith('cluster-a', 'web'),
+    scanWith('cluster-b', 'api'),
+  ]);
+  const view = render(<KubescapeCVEResults />);
+  expect(await screen.findByText('web')).toBeTruthy();
+  expect(screen.getByText('api')).toBeTruthy();
+
+  // cluster-a is deselected: its workload goes at once, and the read of cluster-b fails
+  mocks.clusters = ['cluster-b'];
+  mocks.readVulnerabilityScans.mockRejectedValue(new Error('forbidden'));
+  view.rerender(<KubescapeCVEResults />);
+  expect(
+    await screen.findByText('Unable to read the vulnerability reports: forbidden')
+  ).toBeTruthy();
+  expect(screen.queryByText('web')).toBeNull();
+  expect(screen.getByText('api')).toBeTruthy();
+
+  // cluster-a is selected again and read: the error of the read before is not shown for it
+  mocks.clusters = ['cluster-a', 'cluster-b'];
+  mocks.readVulnerabilityScans.mockResolvedValue([
+    scanWith('cluster-a', 'web'),
+    scanWith('cluster-b', 'api'),
+  ]);
+  view.rerender(<KubescapeCVEResults />);
+  expect(await screen.findByText('web')).toBeTruthy();
+  expect(screen.queryByText(/Unable to read the vulnerability reports/)).toBeNull();
+});
+
+it('names a CVE whose report gives a script as its source without a link', async () => {
+  mocks.name = 'CVE-1';
+  mocks.clusters = ['cluster-a'];
+  mocks.readVulnerabilityScans.mockResolvedValue([
+    scanWith('cluster-a', 'web', 'javascript:alert(1)'),
+  ]);
+  render(<KubescapeCVEResults />);
+
+  expect(await screen.findByText('web')).toBeTruthy();
+  expect(valueFor('CVE ID').textContent).toBe('CVE-1');
+  expect(valueFor('CVE ID').querySelector('a')).toBeNull();
 });
 
 it('links image severity counts to the findings of that severity', () => {
@@ -727,25 +1074,17 @@ it('shows only findings of the linked severity, including irrelevant ones', asyn
 });
 
 it('filters image findings by the linked severity', async () => {
-  let receive: (item: any) => void = () => {};
-  mocks.imageGet.mockImplementation((callback: typeof receive) => {
-    receive = callback;
-  });
   mocks.severity = 'Critical';
-  render(<ImageDetails />);
   const report = manifest();
   report.spec.payload.matches = [match('CVE-1'), match('CVE-2')];
   report.spec.payload.matches[1].vulnerability.severity = 'Critical';
-  await act(async () => receive({ metadata: report.metadata, jsonData: report }));
-  expect(screen.getByText('CVE-2')).toBeTruthy();
+  mocks.fetchObject.mockResolvedValue(report);
+  render(<ImageDetails />);
+  expect(await screen.findByText('CVE-2')).toBeTruthy();
   expect(screen.queryByText('CVE-1')).toBeNull();
 });
 
 it('lists the workloads that run the image, with when it was last scanned', async () => {
-  let receive: (item: any) => void = () => {};
-  mocks.imageGet.mockImplementation((callback: typeof receive) => {
-    receive = callback;
-  });
   mocks.request.mockImplementation(async (url: string) => ({
     items: url.includes('vulnerabilitymanifestsummaries?labelSelector=')
       ? [
@@ -765,10 +1104,10 @@ it('lists the workloads that run the image, with when it was last scanned', asyn
         ]
       : [],
   }));
-  render(<ImageDetails />);
   const report = manifest(null);
   report.metadata.labels = { 'kubescape.io/image-id': 'docker-io-ci-sha256-e62c' };
-  await act(async () => receive({ metadata: report.metadata, jsonData: report }));
+  mocks.fetchObject.mockResolvedValue(report);
+  render(<ImageDetails />);
 
   const workload = await screen.findByText('ci', { selector: 'a' });
   expect(workload.getAttribute('href')).toBe('/cluster-a/deployment/ci/ci');
@@ -780,6 +1119,29 @@ it('lists the workloads that run the image, with when it was last scanned', asyn
     expect.stringContaining('labelSelector=kubescape.io/image-id=docker-io-ci-sha256-e62c')
   );
   expect(valueFor('Last scanned').textContent).toBe('2026-10-30T18:17:52.000Z');
+});
+
+it('names the namespaces whose workloads of the image could not be read', async () => {
+  mocks.allowedNamespaces = ['ci', 'secret'];
+  mocks.request.mockImplementation(async (url: string) => {
+    if (url.includes('/namespaces/secret/')) throw new Error('forbidden');
+    return { items: [] };
+  });
+  const report = manifest(null);
+  report.metadata.labels = { 'kubescape.io/image-id': 'docker-io-ci-sha256-e62c' };
+  mocks.fetchObject.mockResolvedValue(report);
+  render(<ImageDetails />);
+
+  expect(
+    await screen.findByText(
+      'Unable to read all workloads that run the image: namespace secret: forbidden'
+    )
+  ).toBeTruthy();
+  // the image may run in the namespace that could not be read
+  expect(
+    screen.getByText('No workload of the namespaces that could be read runs this image.')
+  ).toBeTruthy();
+  expect(screen.queryByText('No workload runs this image anymore.')).toBeNull();
 });
 
 it('links the image of a workload to its page and to the tags in its registry', async () => {
@@ -850,4 +1212,153 @@ it('offers a rescan only for workloads whose scan names the workload', async () 
   render(<WorkloadDetails />);
   await waitFor(() => expect(valueFor('Image last evaluated').textContent).toBe(T1));
   expect(screen.queryByRole('button', { name: 'Rescan' })).toBeNull();
+});
+
+it('shows the findings without a CVSS score of a workload as scored 0', async () => {
+  const all = manifest();
+  all.spec.payload.matches = [match('CVE-1'), unscoredMatch('CVE-2')];
+  const relevant = manifest(T2);
+  relevant.spec.payload.matches = [match('CVE-1'), unscoredMatch('CVE-2')];
+  mocks.request.mockImplementation(async (url: string) =>
+    url.includes('summaries/') ? summary() : url.endsWith('/image-123') ? all : relevant
+  );
+  render(<WorkloadDetails />);
+
+  const row = (await screen.findByText('CVE-2')).closest('tr')!;
+  expect(within(row).getByText('0')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Export CSV' }));
+  // no score to export
+  expect(mocks.saveToFile.mock.calls[0][0].split('\r\n')).toContain(
+    'High,CVE-2,,package,1.0,Yes,fixed,2.0,,test finding'
+  );
+});
+
+it('shows the findings without a CVSS score of an image as scored 0', async () => {
+  const report = manifest();
+  report.spec.payload.matches = [unscoredMatch('CVE-2')];
+  mocks.fetchObject.mockResolvedValue(report);
+  render(<ImageDetails />);
+
+  const row = (await screen.findByText('CVE-2')).closest('tr')!;
+  expect(within(row).getByText('0')).toBeTruthy();
+});
+
+it('forgets the workloads of the image shown before', async () => {
+  mocks.request.mockImplementation(async (url: string) => {
+    const selector = decodeURIComponent(url);
+    if (selector.includes('kubescape.io/image-id=image-a')) {
+      return {
+        items: [
+          {
+            metadata: {
+              name: 'deployment-ci-ci',
+              namespace: 'ci',
+              labels: {
+                'kubescape.io/workload-kind': 'deployment',
+                'kubescape.io/workload-name': 'ci',
+                'kubescape.io/workload-namespace': 'ci',
+                'kubescape.io/workload-container-name': 'server',
+              },
+            },
+          },
+        ],
+      };
+    }
+    // still being read
+    if (selector.includes('kubescape.io/image-id=image-b')) return new Promise(() => {});
+    if (selector.includes('kubescape.io/image-id=image-c')) throw new Error('forbidden');
+    return { items: [] };
+  });
+  // the report of the image of the URL, whose name is its image id here
+  mocks.fetchObject.mockImplementation(async (name: string) => {
+    const found = manifest();
+    found.metadata.labels = { 'kubescape.io/image-id': name };
+    return found;
+  });
+  const show = (imageId: string) => {
+    mocks.name = imageId;
+    view.rerender(<ImageDetails />);
+  };
+  mocks.name = 'image-a';
+  const view = render(<ImageDetails />);
+  expect(await screen.findByText('ci', { selector: 'a' })).toBeTruthy();
+
+  // another image: its workloads are being read
+  show('image-b');
+  expect(await screen.findByText('Reading workloads…')).toBeTruthy();
+  expect(screen.queryByText('ci', { selector: 'a' })).toBeNull();
+
+  // the error of one image is not shown for the next
+  show('image-c');
+  expect(await screen.findByText(/Unable to read the workloads that run the image/)).toBeTruthy();
+  show('image-a');
+  expect(await screen.findByText('ci', { selector: 'a' })).toBeTruthy();
+  expect(screen.queryByText(/Unable to read the workloads that run the image/)).toBeNull();
+});
+
+it('opens the exception forms for a user who may not create exceptions, as they offer YAML', async () => {
+  const all = manifest();
+  all.spec.payload.matches!.push(match('CVE-2'));
+  mocks.request.mockImplementation(async (url: string) => {
+    if (url.endsWith('securityexceptions') || url === '/api/v1/namespaces') return { items: [] };
+    return url.includes('summaries/') ? summary() : url.endsWith('/image-123') ? all : manifest(T2);
+  });
+  render(<WorkloadDetails />);
+
+  const accept = await screen.findByRole('button', { name: 'Accept the risk of the 2 open CVEs' });
+  const create = screen.getAllByRole('button', { name: 'Create Vulnerability Exception' })[0];
+  expect((accept as HTMLButtonElement).disabled).toBe(false);
+  expect((create as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(create);
+  expect(screen.getByText('Exception for CVE-1')).toBeTruthy();
+  fireEvent.click(accept);
+  expect(screen.getByText('Accept risk of CVE-1, CVE-2')).toBeTruthy();
+  // the forms check the permission to create the exception themselves
+  expect(mocks.post).not.toHaveBeenCalled();
+});
+
+it('reads the vulnerability summary of a namespace once, as the storage cannot watch it', async () => {
+  mocks.name = 'shop';
+  mocks.fetchObject.mockResolvedValue({
+    metadata: { name: 'shop' },
+    spec: {
+      vulnerabilitiesRef: [
+        { kind: 'VulnerabilityManifestSummary', name: 'deployment-web-nginx', namespace: 'shop' },
+      ],
+    },
+  });
+  render(<VulnerabilitiesNamespaceSummary />);
+  expect(screen.getByText('Reading the vulnerability summary of the namespace…')).toBeTruthy();
+
+  const workload = await screen.findByText('web-nginx', { selector: 'a' });
+  expect(workload.getAttribute('href')).toContain('/workload/shop/deployment-web-nginx');
+  expect(screen.getByText('Deployment')).toBeTruthy();
+  expect(mocks.fetchObject).toHaveBeenCalledTimes(1);
+  expect(mocks.fetchObject).toHaveBeenCalledWith('shop', '', 'cluster-a', {
+    pluralName: 'vulnerabilitysummaries',
+  });
+});
+
+it('says why the vulnerability summary of a namespace could not be read', async () => {
+  mocks.name = 'empty';
+  mocks.fetchObject.mockRejectedValue({ status: 404, message: 'vulnerabilitysummaries not found' });
+  render(<VulnerabilitiesNamespaceSummary />);
+  expect(await screen.findByText('Resource not found')).toBeTruthy();
+  expect(screen.getByText('vulnerabilitysummaries not found')).toBeTruthy();
+});
+
+it('names the distribution of an image with its version', () => {
+  expect(
+    distroLabel({
+      id: 'debian',
+      name: 'Debian GNU/Linux',
+      prettyName: 'Debian GNU/Linux 11 (bullseye)',
+    })
+  ).toBe('Debian GNU/Linux 11 (bullseye)');
+  expect(distroLabel({ id: 'alpine', name: 'Alpine Linux', versionID: '3.19.1' })).toBe(
+    'Alpine Linux 3.19.1'
+  );
+  // a distroless image
+  expect(distroLabel({})).toBe('');
+  expect(distroLabel(undefined)).toBe('');
 });

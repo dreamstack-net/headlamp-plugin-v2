@@ -1,16 +1,21 @@
-/* 
-  Build a horizontack stack with seperate cells for critical, high, medium, low and unknown. 
+/*
+  Build a horizontack stack with seperate cells for critical, high, medium, low and unknown.
 */
 import { Box, Stack, Tooltip } from '@mui/material';
-import { WorkloadConfigurationScanSummary } from '../softwarecomposition/WorkloadConfigurationScanSummary';
 
-export function getControlsSummary(scanSummary: WorkloadConfigurationScanSummary) {
-  const severities = scanSummary?.spec.severities;
+/** Failed controls per severity, such as spec.severities of a configuration scan summary. */
+export interface ControlCounts {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+}
 
-  const criticalCount = severities.critical;
-  const mediumCount = severities.medium;
-  const highCount = severities.high;
-  const lowCount = severities.low;
+export function getControlsSummary(counts: ControlCounts) {
+  const criticalCount = counts.critical;
+  const mediumCount = counts.medium;
+  const highCount = counts.high;
+  const lowCount = counts.low;
 
   function controlsBox(color: string, severity: string, countScan: number) {
     return (

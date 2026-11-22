@@ -198,3 +198,36 @@ it('converts legacy grouped profile APIs to the same rule mock shape', () => {
   ]);
   expect(network.containers.app.ingress).toEqual([{ ipAddress: '', dns: ['internal.example'] }]);
 });
+
+it('passes the HTTP endpoints and every address and name of a neighbor', () => {
+  const profile = {
+    metadata: { name: 'web', namespace: 'team' },
+    spec: {
+      containers: [
+        {
+          name: 'app',
+          endpoints: [{ endpoint: ':8080/api/⋯/orders', methods: ['GET'] }, { endpoint: ':8080/' }],
+          egress: [
+            {
+              ipAddress: '10.0.0.1',
+              ipAddresses: ['10.0.0.2', '10.0.0.1'],
+              dns: 'api.example.',
+              dnsNames: ['mirror.example.', 'api.example.'],
+            },
+          ],
+        },
+      ],
+    },
+  } as ContainerProfile;
+
+  const behavior = yaml.load(containerProfileToMockYAML(profile, 'application')) as any;
+  const network = yaml.load(containerProfileToMockYAML(profile, 'network')) as any;
+  expect(behavior.containers.app.endpoints).toEqual([
+    { endpoint: ':8080/api/⋯/orders', methods: ['GET'] },
+    { endpoint: ':8080/', methods: [] },
+  ]);
+  expect(network.containers.app.egress).toEqual([
+    { ipAddress: '10.0.0.1', dns: ['api.example.', 'mirror.example.'] },
+    { ipAddress: '10.0.0.2', dns: ['api.example.', 'mirror.example.'] },
+  ]);
+});

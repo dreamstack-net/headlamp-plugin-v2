@@ -38,6 +38,13 @@ export function match(id: string): VulnerabilityManifest.Match {
   };
 }
 
+/** A finding without a CVSS score: Grype lists no scores for some advisories. */
+export function unscoredMatch(id: string): VulnerabilityManifest.Match {
+  const found = match(id);
+  found.vulnerability.cvss = [];
+  return found;
+}
+
 export function summary(): VulnerabilityManifestSummary {
   return {
     metadata: {

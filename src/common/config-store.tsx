@@ -21,6 +21,13 @@ export type KubescapeConfig = {
   // also looking up images that may be private, whose names then go to shields.io and jsDelivr,
   // off unless true
   possiblyPrivateImages?: boolean;
+  // the vulnerability reports kept in the browser storage between sessions, on unless false
+  keepVulnerabilityReports?: boolean;
+  // CVEs marked when CISA's catalog of known exploited vulnerabilities lists them, the catalog
+  // downloaded whole from jsDelivr, off unless true
+  knownExploited?: boolean;
+  // the EPSS score of CVEs, whose ids then go to api.first.org, off unless true
+  epss?: boolean;
 };
 
 export const kubescapeConfigStore = new ConfigStore<KubescapeConfig>(PLUGIN_NAME);
@@ -45,11 +52,23 @@ export function isValidAlertmanagerAddress(address: string): boolean {
   return /^[a-z0-9-]+\/[a-z0-9-]+:[0-9]+$/.test(address);
 }
 
-export function getAlertmanagerUrl(): string | undefined {
-  const address = kubescapeConfigStore.get()?.alertmanagerUrl;
+/** The API server proxy path of a service at namespace/service-name:port. */
+export function serviceProxyPath(address: string | undefined): string | undefined {
   if (!address || !isValidAlertmanagerAddress(address)) return undefined;
   const [namespace, serviceAndPort] = address.split('/');
   return `/api/v1/namespaces/${namespace}/services/${serviceAndPort}/proxy`;
+}
+
+export function getAlertmanagerUrl(): string | undefined {
+  return serviceProxyPath(kubescapeConfigStore.get()?.alertmanagerUrl);
+}
+
+/**
+ * The framework chosen on the Compliance page, whose exceptions limited to a framework apply;
+ * undefined for the combined view of all controls.
+ */
+export function selectedFrameworkName(): string | undefined {
+  return kubescapeConfigStore.get()?.framework || undefined;
 }
 
 // Helper function to get page size from config
@@ -60,8 +79,5 @@ export function getPageSize(): number {
 
 /** The API server proxy path of the configured Prometheus service. */
 export function getPrometheusUrl(): string | undefined {
-  const address = kubescapeConfigStore.get()?.prometheusUrl;
-  if (!address || !isValidAlertmanagerAddress(address)) return undefined;
-  const [namespace, serviceAndPort] = address.split('/');
-  return `/api/v1/namespaces/${namespace}/services/${serviceAndPort}/proxy`;
+  return serviceProxyPath(kubescapeConfigStore.get()?.prometheusUrl);
 }

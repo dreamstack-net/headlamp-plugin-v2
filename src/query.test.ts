@@ -1,5 +1,12 @@
 import { vi } from 'vitest';
-import { handleListPaginationTasks, paginatedListQuery, QueryTask } from './query';
+import {
+  fullSpecListQuery,
+  handleListPaginationTasks,
+  listInNamespaces,
+  paginatedListQuery,
+  QueryTask,
+  queryTaskErrors,
+} from './query';
 import { T1, T2 } from './vulnerabilities/testFixtures';
 
 const request = vi.hoisted(() => vi.fn());
@@ -137,4 +144,232 @@ it('reads clusters in parallel and the tasks of one cluster in order', async () 
     'cluster-b vulnerabilitymanifests',
   ]);
   expect(setLoading.mock.calls).toEqual([[true], [false]]);
+});
+
+function pagedTask(cluster: string, handled: string[], taskClass = objectClass): QueryTask {
+  return {
+    cluster,
+    allowedNamespaces: [],
+    pageSize: 50,
+    continuation: '',
+    objectClass: taskClass,
+    handleData: (_task, items) => handled.push(...items.map((item: any) => item.metadata.name)),
+  };
+}
+
+// three pages: page-1, page-2 and page-3
+function threePages(url: string) {
+  const page = Number(url.match(/continue=page-(\d)/)?.[1] ?? 1);
+  return Promise.resolve({
+    items: [{ metadata: { name: `page-${page}` } }],
+    metadata: { continue: page < 3 ? `page-${page + 1}` : '' },
+  });
+}
+
+it('reads each page once when two pages read the same tasks at once', async () => {
+  request.mockReset().mockImplementation(threePages);
+  const handled: string[] = [];
+  const task = pagedTask('cluster-a', handled);
+
+  await Promise.all([
+    handleListPaginationTasks([task], { current: true }, vi.fn()),
+    handleListPaginationTasks([task], { current: true }, vi.fn()),
+  ]);
+
+  expect(handled).toEqual(['page-1', 'page-2', 'page-3']);
+  expect(request).toHaveBeenCalledTimes(3);
+});
+
+it('goes on reading when the page that started the read stops', async () => {
+  request.mockReset().mockImplementation(threePages);
+  const handled: string[] = [];
+  const task = pagedTask('cluster-a', handled);
+  const left = { current: true };
+
+  const first = handleListPaginationTasks([task], left, vi.fn());
+  // the page that started it is left while its first page is read
+  left.current = false;
+  await Promise.all([first, handleListPaginationTasks([task], { current: true }, vi.fn())]);
+
+  expect(handled).toEqual(['page-1', 'page-2', 'page-3']);
+});
+
+it('keeps a page that failed for the next read and stops the tasks after it', async () => {
+  let fail = true;
+  request.mockReset().mockImplementation((url: string) => {
+    if (fail && url.includes('continue=page-2')) return Promise.reject(new Error('timeout'));
+    return threePages(url);
+  });
+  const handled: string[] = [];
+  const summaryClass = {
+    ...objectClass,
+    pluralName: 'vulnerabilitymanifestsummaries',
+  } as unknown as typeof objectClass;
+  const tasks = [pagedTask('cluster-a', handled), pagedTask('cluster-a', handled, summaryClass)];
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+  await handleListPaginationTasks(tasks, { current: true }, vi.fn());
+
+  expect(consoleError).toHaveBeenCalledWith(
+    'Error fetching data in cluster cluster-a:',
+    expect.objectContaining({ message: 'timeout' })
+  );
+  consoleError.mockRestore();
+  expect(handled).toEqual(['page-1']);
+  expect(tasks[0].continuation).toBe('page-2');
+  expect(queryTaskErrors(tasks)).toEqual([{ cluster: 'cluster-a', message: 'timeout' }]);
+  // the summaries need the manifests, so they are not read yet
+  expect(request.mock.calls.some(([url]) => url.includes('summaries'))).toBe(false);
+
+  fail = false;
+  await handleListPaginationTasks(tasks, { current: true }, vi.fn());
+
+  expect(handled).toEqual(['page-1', 'page-2', 'page-3', 'page-1', 'page-2', 'page-3']);
+  expect(queryTaskErrors(tasks)).toEqual([]);
+});
+
+it('keeps the items of the namespaces that could be read', async () => {
+  request.mockReset().mockImplementation(async (url: string) => {
+    if (url.includes('/namespaces/secret/')) throw new Error('forbidden');
+    return { items: [{ metadata: { name: 'shop-1' } }], metadata: {} };
+  });
+
+  const result = await paginatedListQuery('cluster-a', objectClass, '', 50, ['shop', 'secret']);
+
+  expect(result.items.map((item: any) => item.metadata.name)).toEqual(['shop-1']);
+  expect(result.errors).toEqual(['namespace secret: forbidden']);
+  // none at all is an error of the list
+  await expect(paginatedListQuery('cluster-a', objectClass, '', 50, ['secret'])).rejects.toThrow(
+    'forbidden'
+  );
+});
+
+it('reads the allowed namespaces that failed again, and only those', async () => {
+  let secretFails = true;
+  request.mockReset().mockImplementation(async (url: string) => {
+    const namespace = url.split('/')[5];
+    if (namespace === 'secret' && secretFails) throw new Error('timeout');
+    return { items: [{ metadata: { name: `${namespace}-1` } }], metadata: {} };
+  });
+  const handled: string[] = [];
+  const summaryClass = {
+    ...objectClass,
+    pluralName: 'vulnerabilitymanifestsummaries',
+  } as unknown as typeof objectClass;
+  const tasks = [pagedTask('cluster-a', handled), pagedTask('cluster-a', handled, summaryClass)];
+  for (const task of tasks) task.allowedNamespaces = ['shop', 'secret'];
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+  await handleListPaginationTasks(tasks, { current: true }, vi.fn());
+
+  // the namespace that could be read does not wait for the one that could not
+  expect(handled).toEqual(['shop-1', 'shop-1']);
+  expect(tasks[0].failedNamespaces).toEqual(['secret']);
+  expect(tasks[0].continuation).toBe('');
+  expect(queryTaskErrors(tasks)).toEqual([
+    { cluster: 'cluster-a', message: 'namespace secret: timeout' },
+  ]);
+
+  // still failing: the error is kept, and nothing is read twice
+  request.mockClear();
+  await handleListPaginationTasks(tasks, { current: true }, vi.fn());
+  expect(request.mock.calls.map(([url]) => url.split('/')[5])).toEqual(['secret', 'secret']);
+  expect(handled).toEqual(['shop-1', 'shop-1']);
+  expect(queryTaskErrors(tasks)).toEqual([
+    { cluster: 'cluster-a', message: 'namespace secret: timeout' },
+  ]);
+  consoleError.mockRestore();
+
+  secretFails = false;
+  request.mockClear();
+  await handleListPaginationTasks(tasks, { current: true }, vi.fn());
+
+  expect(request).toHaveBeenCalledTimes(2);
+  expect(handled).toEqual(['shop-1', 'shop-1', 'secret-1', 'secret-1']);
+  expect(queryTaskErrors(tasks)).toEqual([]);
+  expect(tasks.map(task => [task.continuation, task.failedNamespaces])).toEqual([
+    [undefined, undefined],
+    [undefined, undefined],
+  ]);
+});
+
+it('names the namespaces that could not be read', async () => {
+  request.mockReset().mockImplementation(async (url: string) => {
+    if (url.includes('/namespaces/secret/')) throw new Error('forbidden');
+    return { items: [], metadata: {} };
+  });
+
+  const result = await paginatedListQuery('cluster-a', objectClass, '', 50, ['shop', 'secret']);
+
+  expect(result.failedNamespaces).toEqual(['secret']);
+  expect(
+    (await paginatedListQuery('cluster-a', objectClass, '', 50, ['shop'])).failedNamespaces
+  ).toBeUndefined();
+});
+
+it('reads all objects with their spec, naming the namespaces that could not be read', async () => {
+  request.mockReset().mockImplementation(async (url: string) => {
+    if (url.includes('/namespaces/secret/')) throw new Error('forbidden');
+    return { items: [{ metadata: { name: 'web' } }], metadata: {} };
+  });
+
+  const result = await fullSpecListQuery('cluster-a', objectClass, ['shop', 'secret']);
+
+  expect(result).toEqual({
+    items: [{ metadata: { name: 'web', cluster: 'cluster-a' } }],
+    errors: ['namespace secret: forbidden'],
+  });
+  expect(request.mock.calls[0][0]).toContain('?resourceVersion=fullSpec&limit=500');
+  // none at all is an error of the list
+  await expect(fullSpecListQuery('cluster-a', objectClass, ['secret'])).rejects.toThrow(
+    'forbidden'
+  );
+});
+
+it('keeps the pages of the cluster read before one that could not be read', async () => {
+  request.mockReset().mockImplementation(async (url: string) => {
+    if (url.includes('continue=page-3')) throw new Error('timeout');
+    const page = url.includes('continue=page-2') ? 2 : 1;
+    return {
+      items: [{ metadata: { name: `web-${page}` } }],
+      metadata: { continue: `page-${page + 1}` },
+    };
+  });
+
+  const result = await fullSpecListQuery('cluster-a', objectClass, [], 1);
+
+  expect(result.items.map((item: any) => item.metadata.name)).toEqual(['web-1', 'web-2']);
+  expect(result.errors).toEqual(['the objects after the first 2: timeout']);
+  // the first page is an error of the list
+  request.mockReset().mockRejectedValue(new Error('timeout'));
+  await expect(fullSpecListQuery('cluster-a', objectClass)).rejects.toThrow('timeout');
+});
+
+it('lists the namespaces that can be read and names those that cannot', async () => {
+  request.mockReset().mockImplementation(async (url: string) => {
+    if (url.includes('/namespaces/secret/')) throw new Error('forbidden');
+    // a list without items, as some API servers answer for an empty list
+    if (url.includes('/namespaces/empty/')) return { items: null };
+    return { items: [{ metadata: { name: 'web' } }] };
+  });
+
+  const result = await listInNamespaces(objectClass, 'cluster-a', ['shop', 'secret', 'empty']);
+
+  expect(result.items).toEqual([{ metadata: { name: 'web', cluster: 'cluster-a' } }]);
+  expect(result.errors).toEqual(['namespace secret: forbidden']);
+  expect(request.mock.calls.map(([url, options]) => [url, options])).toContainEqual([
+    '/apis/spdx.softwarecomposition.kubescape.io/v1beta1/namespaces/shop/vulnerabilitymanifests',
+    { cluster: 'cluster-a' },
+  ]);
+
+  // none at all is an error of the list
+  await expect(listInNamespaces(objectClass, 'cluster-a', ['secret'])).rejects.toThrow('forbidden');
+
+  // without allowed namespaces, the cluster is listed at once
+  request.mockReset().mockResolvedValue({ items: null });
+  expect(await listInNamespaces(objectClass, null, [])).toEqual({ items: [], errors: [] });
+  expect(request).toHaveBeenCalledWith(
+    '/apis/spdx.softwarecomposition.kubescape.io/v1beta1/vulnerabilitymanifests',
+    {}
+  );
 });

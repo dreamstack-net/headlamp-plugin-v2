@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
-import { forwardRef, ReactNode } from 'react';
+import { ReactElement } from 'react';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { vi } from 'vitest';
 import { KubescapeSearchButton, KubescapeSearchDialog } from './KubescapeSearch';
 
@@ -23,24 +24,17 @@ vi.mock('../common/config-store', () => ({
 }));
 vi.mock('../vulnerabilities/Vulnerabilities', () => ({
   readVulnerabilityScans: mocks.readVulnerabilityScans,
+  vulnerabilityContext: { queryTasks: [] },
 }));
 vi.mock('../rego/RegoDataProvider', () => ({ fetchRegoData: mocks.fetchRegoData }));
-vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', () => ({
-  Link: forwardRef(
-    (
-      { routeName, params, activeCluster, children, ...rest }: any,
-      ref: React.Ref<HTMLAnchorElement>
-    ) => (
-      // like Headlamp's link, the address it builds wins over an href of the caller
-      <a
-        ref={ref}
-        {...rest}
-        href={`/${activeCluster ?? 'current'}/${routeName}/${Object.values(params).join('/')}`}
-      >
-        {children as ReactNode}
-      </a>
-    )
-  ),
+// like Headlamp's: the cluster of the URL when the parameters name none
+vi.mock('@kinvolk/headlamp-plugin/lib', () => ({
+  Router: {
+    createRouteURL: (route: string, params: Record<string, string>) => {
+      const { cluster = 'current', ...rest } = params;
+      return `/c/${cluster}/${route}/${Object.values(rest).join('/')}`;
+    },
+  },
 }));
 
 const nginx = {
@@ -90,9 +84,27 @@ function type(text: string) {
   });
 }
 
+// the page the router shows, which the search navigates to
+let location = '';
+function LocationProbe() {
+  const current = useLocation();
+  location = current.pathname;
+  return null;
+}
+
+function renderInApp(ui: ReactElement) {
+  location = '';
+  return render(
+    <MemoryRouter initialEntries={['/c/cluster-a/kubescape']}>
+      {ui}
+      <LocationProbe />
+    </MemoryRouter>
+  );
+}
+
 it('opens from the top bar with the search field focused', async () => {
   mocks.readVulnerabilityScans.mockResolvedValue(scans);
-  render(<KubescapeSearchButton />);
+  renderInApp(<KubescapeSearchButton />);
   fireEvent.click(screen.getByRole('button', { name: 'Search Kubescape' }));
   expect(await screen.findByRole('dialog', { name: 'Search Kubescape' })).toBeTruthy();
   expect(document.activeElement).toBe(screen.getByRole('textbox', { name: 'Search Kubescape' }));
@@ -113,45 +125,92 @@ it('searches the controls while the vulnerability reports are read, then the CVE
     }
   );
   const onClose = vi.fn();
-  render(<KubescapeSearchDialog onClose={onClose} />);
+  renderInApp(<KubescapeSearchDialog onClose={onClose} />);
   expect(mocks.readVulnerabilityScans.mock.calls[0][0]).toEqual(['cluster-a']);
   expect(await screen.findByText(/cluster-a: Reading 120 Images/)).toBeTruthy();
 
   type('C-0017');
   const control = await screen.findByText('C-0017 Immutable container filesystem');
-  expect(control.closest('a')?.getAttribute('href')).toBe('/current/control/C-0017');
+  expect(control.closest('a')?.getAttribute('href')).toBe('/c/current/control/C-0017');
 
   type('cve-2024');
   expect(screen.getByText(/Nothing found for “cve-2024” yet/)).toBeTruthy();
+  // nothing to open yet
+  fireEvent.keyDown(screen.getByRole('textbox', { name: 'Search Kubescape' }), { key: 'Enter' });
+  expect(onClose).not.toHaveBeenCalled();
   await act(async () => finish(scans));
 
   const cve = screen.getByText('CVE-2024-3094');
-  expect(cve.closest('a')?.getAttribute('href')).toBe('/current/cve/CVE-2024-3094');
+  expect(cve.closest('a')?.getAttribute('href')).toBe('/c/current/cve/CVE-2024-3094');
   expect(screen.getByText('xz-utils · 1 image · 1 workload')).toBeTruthy();
   expect(screen.getByText('Critical')).toBeTruthy();
 
   // Enter opens the first result and closes the search
   fireEvent.keyDown(screen.getByRole('textbox', { name: 'Search Kubescape' }), { key: 'Enter' });
   expect(onClose).toHaveBeenCalled();
+  expect(location).toBe('/c/current/cve/CVE-2024-3094');
 });
 
-it('links images and workloads to their pages in their cluster', async () => {
+it('opens the first group with results on Enter, in the cluster of the result', async () => {
+  mocks.clusters = ['cluster-a', 'cluster-b'];
   mocks.readVulnerabilityScans.mockResolvedValue(scans);
-  render(<KubescapeSearchDialog onClose={() => {}} />);
-  type('nginx');
-  const images = await screen.findByText('Images (1)');
-  const list = images.closest('ul')!;
-  expect(
-    within(list).getByText('docker.io/library/nginx:1.31.3').closest('a')?.getAttribute('href')
-  ).toBe('/cluster-a/image/kubescape/docker.io-library-nginx-1.31.3-0c1752');
-  expect(within(list).getByText('web / nginx').closest('a')?.getAttribute('href')).toBe(
-    '/cluster-a/workload/web/deployment-web-nginx'
+  const onClose = vi.fn();
+  renderInApp(<KubescapeSearchDialog onClose={onClose} />);
+  // no CVE has the name of the image, so the image comes first
+  type('library/nginx');
+  await screen.findByText('Images (1)');
+
+  fireEvent.keyDown(screen.getByRole('textbox', { name: 'Search Kubescape' }), { key: 'Enter' });
+
+  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(location).toBe(
+    '/c/cluster-a+cluster-b/image/kubescape/docker.io-library-nginx-1.31.3-0c1752'
   );
 });
 
-it('asks for a cluster outside of one', () => {
+it('closes the search and navigates when a result is clicked', async () => {
+  mocks.readVulnerabilityScans.mockResolvedValue(scans);
+  const onClose = vi.fn();
+  renderInApp(<KubescapeSearchDialog onClose={onClose} />);
+  type('web');
+
+  fireEvent.click(await screen.findByText('web / nginx'));
+
+  expect(onClose).toHaveBeenCalledTimes(1);
+  expect(location).toBe('/c/cluster-a/workload/web/deployment-web-nginx');
+});
+
+it('links images and workloads to their pages in their cluster', async () => {
+  mocks.clusters = ['cluster-b', 'cluster-a'];
+  mocks.readVulnerabilityScans.mockResolvedValue(scans);
+  renderInApp(<KubescapeSearchDialog onClose={() => {}} />);
+  type('nginx');
+  const images = await screen.findByText('Images (1)');
+  const list = images.closest('ul')!;
+  // the cluster of the result first, the other selected clusters stay selected
+  expect(
+    within(list).getByText('docker.io/library/nginx:1.31.3').closest('a')?.getAttribute('href')
+  ).toBe('/c/cluster-a+cluster-b/image/kubescape/docker.io-library-nginx-1.31.3-0c1752');
+  expect(within(list).getByText('web / nginx').closest('a')?.getAttribute('href')).toBe(
+    '/c/cluster-a+cluster-b/workload/web/deployment-web-nginx'
+  );
+});
+
+it('asks for a cluster outside of one, and still finds controls', async () => {
   mocks.clusters = [];
-  render(<KubescapeSearchDialog onClose={() => {}} />);
+  const onClose = vi.fn();
+  renderInApp(<KubescapeSearchDialog onClose={onClose} />);
   expect(screen.getByText('Open a cluster to search its Kubescape data.')).toBeTruthy();
   expect(mocks.readVulnerabilityScans).not.toHaveBeenCalled();
+  const shown = location;
+
+  type('C-0017');
+  const control = await screen.findByText('C-0017 Immutable container filesystem');
+
+  // the page of a control is a page of a cluster: Headlamp's address for it without one is its
+  // home page, so the result is no link and Enter opens nothing
+  expect(control.closest('a')).toBeNull();
+  fireEvent.keyDown(screen.getByRole('textbox', { name: 'Search Kubescape' }), { key: 'Enter' });
+  expect(onClose).not.toHaveBeenCalled();
+  expect(location).toBe(shown);
 });

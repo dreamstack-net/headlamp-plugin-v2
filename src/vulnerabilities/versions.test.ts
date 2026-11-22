@@ -63,6 +63,14 @@ describe('newestTag', () => {
     expect(newestTag('v3.15.0-rc.1', prometheusTags)).toBe('v3.15.1');
   });
 
+  it('keeps release lines and builds of a date apart', () => {
+    // alpine tags its release line 3 and builds such as 20260805
+    const alpineTags = ['2', '3', '20250708', '20260805', 'edge'];
+    expect(newestTag('3', alpineTags)).toBe('3');
+    expect(newestTag('2', alpineTags)).toBe('3');
+    expect(newestTag('20250708', alpineTags)).toBe('20260805');
+  });
+
   it('compares the version in a variant', () => {
     expect(newestTag('1.31.3-alpine3.24', ['1.31.3-alpine3.25', '1.31.2-alpine3.26'])).toBe(
       '1.31.3-alpine3.25'
@@ -91,6 +99,14 @@ describe('newestRelease', () => {
   it('takes numbered builds for releases', () => {
     // versions with a build number, as endoflife.date lists some products
     expect(newestRelease('3.95.0', ['3.95.4-01', '3.97.2-02', '3.96.4-01'])).toBe('3.97.2-02');
+  });
+
+  it('does not take a date that tags a build for a release of dotted versions', () => {
+    expect(newestRelease('1.2.3', ['1.2.4', '20240101'])).toBe('1.2.4');
+    // a project whose releases are dates keeps them
+    expect(newestRelease('20240101', ['20240101', '20250301'])).toBe('20250301');
+    // and calendar versions with dots are releases
+    expect(newestRelease('1.2.3', ['2024.1.0', '1.2.4'])).toBe('2024.1.0');
   });
 });
 

@@ -35,7 +35,7 @@ export function FrameworkControls() {
             id: 'ID',
             header: 'ID',
             accessorKey: 'controlID',
-            Cell: ({ cell }: any) => (
+            Cell: ({ cell }) => (
               <Link
                 target="_blank"
                 href={'https://kubescape.io/docs/controls/' + cell.getValue().toLowerCase()}
@@ -48,7 +48,7 @@ export function FrameworkControls() {
           {
             header: 'Control Name',
             accessorKey: 'name',
-            Cell: ({ cell, row }: any) => (
+            Cell: ({ cell, row }) => (
               <Tooltip
                 title={row.original.description}
                 slotProps={{ tooltip: { sx: { fontSize: '0.9em' } } }}
@@ -78,13 +78,15 @@ export function FrameworkControls() {
           },
           {
             header: 'Severity',
-            accessorFn: (control: Control) => severityLabel(control.baseScore),
+            // the score sorts; the label is drawn in the cell
+            accessorFn: (control: Control) => control.baseScore,
+            Cell: ({ row }) => severityLabel(row.original.baseScore),
             gridTemplate: 'min-content',
           },
           {
             header: 'Example',
             accessorFn: (control: Control) => control.example,
-            Cell: ({ cell }: any) => {
+            Cell: ({ cell }) => {
               const value = cell.getValue();
               if (value?.length > 0 && value[0] === '@')
                 return (

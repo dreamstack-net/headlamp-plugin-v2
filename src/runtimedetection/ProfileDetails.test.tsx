@@ -1,22 +1,22 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { vi } from 'vitest';
 import { ApplicationProfileDetail } from './ApplicationProfileDetail';
 
 const mocks = vi.hoisted(() => ({
-  containerProfileGet: vi.fn(),
-  applicationProfileGet: vi.fn(),
-  networkNeighborhoodGet: vi.fn(),
+  // the GET of the profile, which the page reads once
+  fetchObject: vi.fn(),
   discoverProfileResource: vi.fn(),
   name: 'deployment-web-app',
   namespace: 'workloads',
 }));
 
 vi.mock('../model', () => ({
-  containerProfileClass: { useApiGet: mocks.containerProfileGet },
-  applicationProfileClass: { useApiGet: mocks.applicationProfileGet },
-  networkNeighborhoodsClass: { useApiGet: mocks.networkNeighborhoodGet },
+  fetchObject: mocks.fetchObject,
+  containerProfileClass: { pluralName: 'containerprofiles', kind: 'ContainerProfile' },
+  applicationProfileClass: { pluralName: 'applicationprofiles', kind: 'ApplicationProfile' },
 }));
+vi.mock('@kinvolk/headlamp-plugin/lib/Utils', () => ({ getCluster: () => 'cluster-a' }));
 vi.mock('../softwarecomposition/profileApi', () => ({
   discoverProfileResource: mocks.discoverProfileResource,
 }));
@@ -136,9 +136,9 @@ const legacyApplicationProfile = {
 beforeEach(() => {
   mocks.discoverProfileResource.mockReset();
   mocks.discoverProfileResource.mockResolvedValue({ plural: 'containerprofiles', modern: true });
-  mocks.containerProfileGet.mockReset();
-  mocks.applicationProfileGet.mockReset();
-  mocks.networkNeighborhoodGet.mockReset();
+  mocks.fetchObject.mockReset();
+  // still being read, unless a test gives the profile
+  mocks.fetchObject.mockReturnValue(new Promise(() => {}));
 });
 afterEach(cleanup);
 
@@ -149,21 +149,22 @@ function tabYaml(label: string) {
   );
 }
 
+function valueFor(label: string) {
+  return screen.getByText(label, { selector: 'dt' }).nextElementSibling!;
+}
+
 async function renderProfile(profile: typeof learnedProfile | typeof authoredProfile) {
+  mocks.fetchObject.mockResolvedValue(profile);
   render(<ApplicationProfileDetail />);
-  await waitFor(() => expect(mocks.discoverProfileResource).toHaveBeenCalledWith('behavior'));
-  await waitFor(() =>
-    expect(mocks.containerProfileGet).toHaveBeenCalledWith(
-      expect.any(Function),
-      'deployment-web-app',
-      'workloads',
-      expect.any(Function)
-    )
-  );
-  expect(mocks.applicationProfileGet).not.toHaveBeenCalled();
-  expect(mocks.networkNeighborhoodGet).not.toHaveBeenCalled();
-  const receive = mocks.containerProfileGet.mock.calls[0][0];
-  act(() => receive({ jsonData: profile, metadata: profile.metadata }));
+  await screen.findByRole('heading', { name: 'Application Profile' });
+  expect(mocks.discoverProfileResource).toHaveBeenCalledWith('behavior');
+  // one GET, not Headlamp's useApiGet, whose watch of the storage would replace the profile
+  // with one without its spec
+  expect(mocks.fetchObject).toHaveBeenCalledTimes(1);
+  expect(mocks.fetchObject).toHaveBeenCalledWith('deployment-web-app', 'workloads', 'cluster-a', {
+    pluralName: 'containerprofiles',
+    kind: 'ContainerProfile',
+  });
 }
 
 it('shows the behaviour of a learned ContainerProfile without its network peers', async () => {
@@ -171,6 +172,9 @@ it('shows the behaviour of a learned ContainerProfile without its network peers'
 
   expect(screen.getByRole('heading', { name: 'Application Profile' })).toBeTruthy();
   expect(screen.getByText('web-app')).toBeTruthy();
+  expect(valueFor('Execs').textContent).toBe('1');
+  expect(valueFor('Opens').textContent).toBe('1');
+  expect(valueFor('Egress').textContent).toBe('1');
   const yaml = tabYaml('Behaviour');
   expect(yaml).toContain('/bin/learned-web');
   expect(yaml).toContain('/etc/learned.conf');
@@ -238,42 +242,23 @@ it('draws the network graph of the workload only when its tab is open', async ()
 });
 
 it('reports a failed ContainerProfile GET at an existing detail URL', async () => {
+  mocks.fetchObject.mockRejectedValue(new Error('ContainerProfile not found'));
   render(<ApplicationProfileDetail />);
 
-  await waitFor(() =>
-    expect(mocks.containerProfileGet).toHaveBeenCalledWith(
-      expect.any(Function),
-      'deployment-web-app',
-      'workloads',
-      expect.any(Function)
-    )
-  );
-  const onError = mocks.containerProfileGet.mock.calls[0][3];
-  act(() => onError(new Error('ContainerProfile not found')));
-
-  expect(screen.getByRole('alert').textContent).toContain('ContainerProfile not found');
+  expect((await screen.findByRole('alert')).textContent).toContain('ContainerProfile not found');
   expect(screen.queryByTestId('profile-yaml')).toBeNull();
 });
 
 it('keeps the behavior detail usable against an older ApplicationProfile API', async () => {
   mocks.discoverProfileResource.mockResolvedValue({ plural: 'applicationprofiles', modern: false });
 
+  mocks.fetchObject.mockResolvedValue(legacyApplicationProfile);
   render(<ApplicationProfileDetail />);
 
-  await waitFor(() => expect(mocks.discoverProfileResource).toHaveBeenCalledWith('behavior'));
-  await waitFor(() =>
-    expect(mocks.applicationProfileGet).toHaveBeenCalledWith(
-      expect.any(Function),
-      'deployment-web-app',
-      'workloads',
-      expect.any(Function)
-    )
-  );
-  expect(mocks.containerProfileGet).not.toHaveBeenCalled();
-  const receive = mocks.applicationProfileGet.mock.calls[0][0];
-  act(() => receive({ jsonData: legacyApplicationProfile, metadata }));
-
-  expect(screen.getByRole('heading', { name: 'Application Profile' })).toBeTruthy();
+  expect(await screen.findByRole('heading', { name: 'Application Profile' })).toBeTruthy();
+  expect(mocks.discoverProfileResource).toHaveBeenCalledWith('behavior');
+  expect(mocks.fetchObject).toHaveBeenCalledTimes(1);
+  expect(mocks.fetchObject.mock.calls[0][3].pluralName).toBe('applicationprofiles');
   const yaml = tabYaml('Behaviour');
   expect(yaml).toContain('kind: ApplicationProfile');
   expect(yaml).toContain('/bin/legacy-web');
@@ -289,7 +274,6 @@ it('shows a discovery failure instead of guessing a detail API', async () => {
   render(<ApplicationProfileDetail />);
 
   expect((await screen.findByRole('alert')).textContent).toContain('Discovery forbidden');
-  expect(mocks.containerProfileGet).not.toHaveBeenCalled();
-  expect(mocks.applicationProfileGet).not.toHaveBeenCalled();
+  expect(mocks.fetchObject).not.toHaveBeenCalled();
   expect(screen.queryByTestId('profile-yaml')).toBeNull();
 });

@@ -24,7 +24,9 @@ declare global {
       eventType: string,
       eventData: string,
       profileYAML: string,
-      networkYAML: string
+      networkYAML: string,
+      // optional Kubernetes mock YAML: apiServerAddress and pods
+      k8sYAML?: string
     ) => string;
   }
 }

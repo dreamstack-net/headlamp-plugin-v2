@@ -1,9 +1,7 @@
 import { post } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import {
   Box,
-  Button,
   Dialog,
-  DialogActions,
   DialogContent,
   DialogTitle,
   FormControl,
@@ -18,13 +16,17 @@ import {
 import { FormControlLabel } from '@mui/material';
 import { useSnackbar } from 'notistack';
 import { useState } from 'react';
+import { errorMessage } from '../common/errors';
+import { createExceptionCheck } from '../common/permissions';
 import { SetupCheck } from '../common/SetupCheck';
 import {
   ClusterSecurityException,
   SecurityException,
 } from '../softwarecomposition/SecurityException';
+import { ExceptionDialogActions } from './ExceptionDialogActions';
+import { AnyException, saveExceptionYaml } from './exceptionYaml';
 import { recordChangeByCurrentUser } from './history';
-import { ContextBadge, MetadataFields, sanitizeName } from './shared';
+import { ContextBadge, expiryTimestamp, MetadataFields, sanitizeName } from './shared';
 
 export interface GuidedComplianceFormProps {
   controlID: string;
@@ -32,13 +34,17 @@ export interface GuidedComplianceFormProps {
   workloadName: string;
   workloadNamespace: string;
   workloadKind: string;
+  // the cluster of the workload, the current one by default
+  cluster?: string;
   onClose: () => void;
+  onCreated?: () => void;
 }
 
 type ComplianceScope = 'workload' | 'namespace' | 'kind-cluster' | 'cluster';
 
 export function GuidedComplianceExceptionForm(props: Readonly<GuidedComplianceFormProps>) {
-  const { controlID, workloadName, workloadNamespace, workloadKind, onClose } = props;
+  const { controlID, workloadName, workloadNamespace, workloadKind, cluster, onClose, onCreated } =
+    props;
   const { enqueueSnackbar } = useSnackbar();
 
   const [scope, setScope] = useState<ComplianceScope>('workload');
@@ -47,19 +53,32 @@ export function GuidedComplianceExceptionForm(props: Readonly<GuidedComplianceFo
   const [reason, setReason] = useState('');
   const [expiresDate, setExpiresDate] = useState('');
 
-  const isCluster = scope === 'kind-cluster' || scope === 'cluster';
+  // A resource without a namespace, such as a ClusterRole, has no namespace for a
+  // SecurityException: its exception is a cluster-wide one that names the resource
+  const clusterScopedResource = !workloadNamespace;
+  const isCluster = clusterScopedResource || scope === 'kind-cluster' || scope === 'cluster';
 
   const scopeOptions: { value: ComplianceScope; label: string; description: string }[] = [
-    {
-      value: 'workload',
-      label: 'This workload only',
-      description: `${workloadKind}/${workloadName} in namespace "${workloadNamespace}"`,
-    },
-    {
-      value: 'namespace',
-      label: 'All workloads in namespace',
-      description: `All workloads in namespace "${workloadNamespace}"`,
-    },
+    ...(clusterScopedResource
+      ? [
+          {
+            value: 'workload' as ComplianceScope,
+            label: 'This resource only',
+            description: `${workloadKind}/${workloadName}, which has no namespace`,
+          },
+        ]
+      : [
+          {
+            value: 'workload' as ComplianceScope,
+            label: 'This workload only',
+            description: `${workloadKind}/${workloadName} in namespace "${workloadNamespace}"`,
+          },
+          {
+            value: 'namespace' as ComplianceScope,
+            label: 'All workloads in namespace',
+            description: `All workloads in namespace "${workloadNamespace}"`,
+          },
+        ]),
     {
       value: 'kind-cluster',
       label: `All ${workloadKind} resources cluster-wide`,
@@ -72,18 +91,12 @@ export function GuidedComplianceExceptionForm(props: Readonly<GuidedComplianceFo
     },
   ];
 
-  const handleSubmit = async () => {
+  // The exception that Create sends, or undefined after saying what is missing
+  const buildException = async (): Promise<AnyException | undefined> => {
     if (!name) {
       enqueueSnackbar('Name is required', { variant: 'error' });
-      return;
+      return undefined;
     }
-    if (!isCluster && !workloadNamespace) {
-      enqueueSnackbar('Workload namespace is required for namespace-scoped exceptions', {
-        variant: 'error',
-      });
-      return;
-    }
-
     const match: Record<string, any> = {};
     if (scope === 'workload') {
       match.resources = [{ kind: workloadKind, name: workloadName }];
@@ -94,38 +107,60 @@ export function GuidedComplianceExceptionForm(props: Readonly<GuidedComplianceFo
 
     const spec = {
       ...(reason && { reason }),
-      ...(expiresDate && { expiresAt: `${expiresDate}T00:00:00Z` }),
+      ...(expiresDate && { expiresAt: expiryTimestamp(expiresDate) }),
       match,
       posture: [{ controlID, action }],
     };
 
-    try {
-      if (isCluster) {
-        await post(
-          '/apis/kubescape.io/v1beta1/clustersecurityexceptions',
-          await recordChangeByCurrentUser<ClusterSecurityException>({
-            apiVersion: 'kubescape.io/v1beta1',
-            kind: 'ClusterSecurityException',
-            metadata: { name },
-            spec,
-          })
-        );
-      } else {
-        await post(
-          `/apis/kubescape.io/v1beta1/namespaces/${workloadNamespace}/securityexceptions`,
-          await recordChangeByCurrentUser<SecurityException>({
-            apiVersion: 'kubescape.io/v1beta1',
-            kind: 'SecurityException',
-            metadata: { name, namespace: workloadNamespace },
-            spec,
-          })
-        );
-      }
-      enqueueSnackbar('Security exception created', { variant: 'success' });
-      onClose();
-    } catch (err: any) {
-      enqueueSnackbar(`Failed to create: ${err?.message ?? err}`, { variant: 'error' });
+    if (isCluster) {
+      return recordChangeByCurrentUser<ClusterSecurityException>(
+        {
+          apiVersion: 'kubescape.io/v1beta1',
+          kind: 'ClusterSecurityException',
+          metadata: { name },
+          spec,
+        },
+        undefined,
+        cluster
+      );
     }
+    return recordChangeByCurrentUser<SecurityException>(
+      {
+        apiVersion: 'kubescape.io/v1beta1',
+        kind: 'SecurityException',
+        metadata: { name, namespace: workloadNamespace },
+        spec,
+      },
+      undefined,
+      cluster
+    );
+  };
+
+  const handleSubmit = async () => {
+    const exception = await buildException();
+    if (!exception) return;
+    const options = cluster ? { cluster } : undefined;
+    try {
+      await post(
+        exception.kind === 'ClusterSecurityException'
+          ? '/apis/kubescape.io/v1beta1/clustersecurityexceptions'
+          : `/apis/kubescape.io/v1beta1/namespaces/${workloadNamespace}/securityexceptions`,
+        exception,
+        true,
+        options
+      );
+      enqueueSnackbar('Security exception created', { variant: 'success' });
+      onCreated?.();
+      onClose();
+    } catch (err) {
+      enqueueSnackbar(`Failed to create: ${errorMessage(err)}`, { variant: 'error' });
+    }
+  };
+
+  // the exception that Create would send, for a GitOps repository
+  const handleDownload = async () => {
+    const exception = await buildException();
+    if (exception) await saveExceptionYaml(exception, enqueueSnackbar);
   };
 
   return (
@@ -142,10 +177,12 @@ export function GuidedComplianceExceptionForm(props: Readonly<GuidedComplianceFo
             onReasonChange={setReason}
             expiresDate={expiresDate}
             onExpiresDateChange={setExpiresDate}
+            cluster={cluster}
           />
 
           <ContextBadge label="Control" value={controlID} />
           <ContextBadge label="Workload" value={`${workloadKind}/${workloadName}`} />
+          {cluster && <ContextBadge label="Cluster" value={cluster} />}
 
           <Box>
             <Typography variant="subtitle2" gutterBottom>
@@ -198,12 +235,14 @@ export function GuidedComplianceExceptionForm(props: Readonly<GuidedComplianceFo
           </FormControl>
         </Stack>
       </DialogContent>
-      <DialogActions>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button onClick={handleSubmit} variant="contained">
-          Create
-        </Button>
-      </DialogActions>
+      <ExceptionDialogActions
+        onCancel={onClose}
+        onDownload={handleDownload}
+        onSubmit={handleSubmit}
+        submitLabel="Create"
+        check={createExceptionCheck(isCluster ? undefined : workloadNamespace)}
+        clusters={[cluster]}
+      />
     </Dialog>
   );
 }

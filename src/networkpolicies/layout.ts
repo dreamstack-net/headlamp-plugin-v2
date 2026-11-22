@@ -120,6 +120,15 @@ export interface PolicyPeer {
 }
 
 /**
+ * Whether a peer stands for every source or destination: that of a rule without peers, which
+ * the storage generates for traffic whose peer it could not name. A peer of a NetworkPolicy
+ * names at least a selector or a range.
+ */
+export function isAllPeers(peer: NetworkPolicy.Peer): boolean {
+  return !peer.ipBlock && !peer.podSelector && !peer.namespaceSelector;
+}
+
+/**
  * The peers of the policy, each once per direction. Generated policies often have a rule
  * per port with the same peers, such as one for each passive port of an FTP server.
  */
@@ -130,10 +139,11 @@ export function policyPeers(networkPolicy: GeneratedNetworkPolicy): PolicyPeer[]
   >();
   const collect = (
     direction: Direction,
-    peers: NetworkPolicy.Peer[] = [],
+    peers: NetworkPolicy.Peer[] | undefined,
     ports: NetworkPolicy.Port[] | undefined
   ) => {
-    for (const peer of peers) {
+    // a rule without peers allows its ports from or to any peer (isAllPeers)
+    for (const peer of peers?.length ? peers : [{}]) {
       const shown = withoutPerPodLabels(peer);
       const key = JSON.stringify([direction, shown]);
       let entry = found.get(key);
@@ -175,8 +185,8 @@ export function policyPeers(networkPolicy: GeneratedNetworkPolicy): PolicyPeer[]
 }
 
 // Labels with a value per run of a Job, per rollout or per placement of a pod, such as those
-// of the pods of every CronJob run. Peers are shown without them, so that all pods of a
-// workload share one node.
+// of the pods of every CronJob run, or per pod of a StatefulSet. Peers are shown without them,
+// so that all pods of a workload share one node.
 export const perPodLabels = new Set([
   'controller-uid',
   'job-name',
@@ -186,7 +196,28 @@ export const perPodLabels = new Set([
   'controller-revision-hash',
   'pod-template-generation',
   'topology.kubernetes.io/zone',
+  'statefulset.kubernetes.io/pod-name',
+  'apps.kubernetes.io/pod-index',
 ]);
+
+/** The labels without those that differ per run, rollout or pod (perPodLabels). */
+export function sharedLabels(labels: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(labels).filter(([key]) => !perPodLabels.has(key)));
+}
+
+/**
+ * A selector without the labels that differ per run, rollout or pod, which Kubescape copies
+ * from the pods it saw. A selector that would then select every pod keeps them: it would
+ * otherwise stand for, look up or allow every pod of the namespace.
+ */
+export function withoutPerPodSelectorLabels(
+  selector: NetworkPolicy.LabelSelector | undefined
+): NetworkPolicy.LabelSelector | undefined {
+  if (!selector?.matchLabels) return selector;
+  const kept = sharedLabels(selector.matchLabels);
+  if (Object.keys(kept).length === 0 && !selector.matchExpressions?.length) return selector;
+  return { ...selector, matchLabels: kept };
+}
 
 // More IP ranges of one direction with the same ports than this share one node
 export const maxSeparateRanges = 5;
@@ -278,16 +309,12 @@ export function isClusterRange(cidr: string): boolean {
   );
 }
 
+/**
+ * The peer without the labels that differ per run, rollout or pod; a peer that has only such
+ * labels keeps them (withoutPerPodSelectorLabels), as the generated policy does when it is
+ * applied.
+ */
 export function withoutPerPodLabels(peer: NetworkPolicy.Peer): NetworkPolicy.Peer {
-  const matchLabels = peer.podSelector?.matchLabels;
-  if (!matchLabels) return peer;
-  return {
-    ...peer,
-    podSelector: {
-      ...peer.podSelector,
-      matchLabels: Object.fromEntries(
-        Object.entries(matchLabels).filter(([key]) => !perPodLabels.has(key))
-      ),
-    },
-  };
+  if (!peer.podSelector?.matchLabels) return peer;
+  return { ...peer, podSelector: withoutPerPodSelectorLabels(peer.podSelector) };
 }

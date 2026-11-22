@@ -36,6 +36,8 @@ export namespace WorkloadConfigurationScan {
     rules: Rule[];
 
     exceptedByPolicy: boolean; // maintained from the UI
+    // the frameworks (lowercase) whose exceptions alone cover the result; maintained from the UI
+    exceptedInFrameworks?: string[];
   }
 
   export interface RelatedObject {

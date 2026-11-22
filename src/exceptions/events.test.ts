@@ -10,10 +10,15 @@ it('reads the matches the scanner reported for a namespaced exception, newest fi
   request.mockResolvedValue({
     items: [
       {
+        reason: 'ExceptionMatched',
         message: 'Matched control C-0001 on Deployment/web',
         lastTimestamp: '2026-10-30T10:00:00Z',
       },
-      { message: 'Matched control C-0002 on Deployment/web', eventTime: '2026-10-30T11:00:00Z' },
+      {
+        reason: 'ExceptionMatched',
+        message: 'Matched control C-0002 on Deployment/web',
+        eventTime: '2026-10-30T11:00:00Z',
+      },
     ],
   });
 
@@ -26,8 +31,29 @@ it('reads the matches the scanner reported for a namespaced exception, newest fi
   const [path, query] = request.mock.calls[0][0].split('?');
   expect(path).toBe('/api/v1/namespaces/shop/events');
   expect(new URLSearchParams(query).get('fieldSelector')).toBe(
-    'involvedObject.kind=SecurityException,involvedObject.name=web,reason=ExceptionMatched'
+    'involvedObject.kind=SecurityException,involvedObject.name=web'
   );
+});
+
+it('reads the CVEs kubevuln suppressed as well, and leaves out other events', async () => {
+  request.mockResolvedValue({
+    items: [
+      {
+        reason: 'VulnerabilitySuppressed',
+        message: 'Suppressed CVE-2024-1 in package openssl',
+        lastTimestamp: '2026-10-30T10:00:00Z',
+      },
+      {
+        reason: 'FailedValidation',
+        message: 'some other event of the object',
+        lastTimestamp: '2026-10-30T12:00:00Z',
+      },
+    ],
+  });
+
+  const events = await fetchExceptionEvents('SecurityException', 'web', 'shop');
+
+  expect(events.map(event => event.message)).toEqual(['Suppressed CVE-2024-1 in package openssl']);
 });
 
 it('looks in all namespaces for a cluster-wide exception', async () => {

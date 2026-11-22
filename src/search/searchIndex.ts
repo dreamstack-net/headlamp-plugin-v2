@@ -104,7 +104,8 @@ export function buildVulnerabilityIndex(workloadScans: WorkloadScan[]): Vulnerab
       entry.clusters.add(imageScan.cluster);
     }
     images.push({
-      image: imageScan.imageName,
+      // a report without the annotation of its image has no name to find it by
+      image: imageScan.imageName ?? '',
       cluster: imageScan.cluster,
       namespace: imageScan.namespace,
       manifestName: imageScan.manifestName,

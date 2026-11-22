@@ -1,5 +1,6 @@
 import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { getKubescapeNamespace } from '../custom-objects/api-queries';
+import { errorMessage } from './errors';
 
 export type Feature =
   | 'compliance'
@@ -185,8 +186,8 @@ export function clearClusterSetups() {
 async function lookUpClusterSetup(cluster: string): Promise<ClusterSetup> {
   const setup: ClusterSetup = {};
   const [discovery, namespace] = await Promise.all([
-    request(`/apis/${storageGroupVersion}`, { cluster }).catch((error: any) => {
-      setup.storageError = error?.message ?? String(error);
+    request(`/apis/${storageGroupVersion}`, { cluster }).catch((error: unknown) => {
+      setup.storageError = errorMessage(error);
       return null;
     }),
     getKubescapeNamespace(cluster),

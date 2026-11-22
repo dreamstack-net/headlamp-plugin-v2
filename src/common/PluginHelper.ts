@@ -1,35 +1,174 @@
+/*
+  Where Headlamp serves the files of this plugin, such as the Kubescape data in public/ and
+  main.wasm. Headlamp may hold several copies of a plugin (development, user and shipped plugins)
+  and serves everything under its base URL, so the copy is the one Headlamp loaded.
+*/
+
+// the name in package.json, by which Headlamp tells the copies of a plugin apart
+const packageName = 'kubescape-plugin';
+
+type PluginType = 'development' | 'user' | 'shipped';
+
+/** A plugin as Headlamp's /plugins lists it: the URL path and the folder name. */
+export interface PluginEntry {
+  path: string;
+  name: string;
+  type?: PluginType;
+}
+
+/** What Headlamp keeps in localStorage about a plugin. */
+export interface StoredPluginSetting {
+  name?: string;
+  folderName?: string;
+  type?: PluginType;
+  isEnabled?: boolean;
+  isLoaded?: boolean;
+}
+
+// Headlamp loads the copy of a plugin of the first type of these that is not disabled
+const priority: PluginType[] = ['development', 'user', 'shipped'];
+
 let cachedUrl: Promise<string> | null = null;
 
+/**
+ * The URL of the folder of the plugin, without a trailing slash. It is remembered once the plugin
+ * was found in Headlamp's list; a default URL, used when the list cannot be read, is not.
+ */
 export function getKubescapePluginUrl(): Promise<string> {
-  cachedUrl ??= fetchPluginUrl();
+  if (!cachedUrl) {
+    const lookup = fetchPluginUrl().then(({ url, found }) => {
+      if (!found && cachedUrl === lookup) cachedUrl = null;
+      return url;
+    });
+    cachedUrl = lookup;
+  }
   return cachedUrl;
 }
 
-async function fetchPluginUrl(): Promise<string> {
-  let port: number | null = null;
-  if (isElectron()) {
-    port = (window as any)?.headlampBackendPort ?? 4466;
-  } else if (isDockerDesktop()) {
-    port = 64446;
-  }
-  const origin = port ? `http://localhost:${port}` : '';
+/**
+ * The path under which Headlamp serves its pages and backend, such as /headlamp for a Headlamp in
+ * a cluster behind a path prefix, or '' (like Headlamp's getBaseUrl, which plugins cannot import).
+ */
+export function headlampBaseUrl(): string {
+  // Headlamp desktop serves no base URL
+  if (isElectron()) return '';
+  const baseUrl: unknown = (window as any)?.headlampBaseUrl;
+  if (typeof baseUrl !== 'string' || baseUrl === './' || baseUrl === '.') return '';
+  return baseUrl.replace(/\/+$/, '');
+}
 
+/** The URL of Headlamp's backend with its base URL and a trailing slash, like Headlamp's getAppUrl. */
+export function headlampAppUrl(): string {
+  if (isElectron()) {
+    return `http://localhost:${(window as any)?.headlampBackendPort ?? 4466}/`;
+  }
+  const origin = isDockerDesktop() ? 'http://localhost:64446' : window.location.origin;
+  return `${origin}${headlampBaseUrl()}/`;
+}
+
+async function fetchPluginUrl(): Promise<{ url: string; found: boolean }> {
+  const appUrl = headlampAppUrl();
   try {
-    const response = await fetch(`${origin}/plugins`);
+    const response = await fetch(`${appUrl}plugins`);
     if (response.ok) {
-      const plugins: Array<{ path: string; name: string }> = await response.json();
-      const entry = plugins.find(p => p.name.includes('kubescape'));
-      if (entry) {
-        return `${origin}/${entry.path.replaceAll('\\', '/')}`;
-      }
+      const entries = pluginEntries(await response.json());
+      const entry =
+        loadedPlugin(entries, storedPluginSettings()) ??
+        (await preferredPlugin(entries, storedPluginSettings(), path =>
+          readPackageName(appUrl, path)
+        ));
+      if (entry) return { url: `${appUrl}${entry.path}`, found: true };
     }
   } catch {
-    // fall through to defaults
+    // fall through to the default
   }
+  // where the Plugin Catalog of Headlamp desktop and the plugin's container image put the plugin
+  return {
+    url: isElectron()
+      ? `${appUrl}user-plugins/headlamp_kubescape`
+      : `${appUrl}plugins/kubescape-plugin`,
+    found: false,
+  };
+}
 
-  return port
-    ? `http://localhost:${port}/user-plugins/headlamp_kubescape`
-    : '/plugins/kubescape-plugin';
+/**
+ * The entries of Headlamp's /plugins: objects with the path, type and folder name, or, from
+ * Headlamp releases before plugin types, paths.
+ */
+export function pluginEntries(list: unknown): PluginEntry[] {
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((item): PluginEntry[] => {
+    if (typeof item === 'string') {
+      const path = item.replaceAll('\\', '/');
+      return [{ path, name: path.split('/').pop() ?? path }];
+    }
+    if (typeof item?.path !== 'string') return [];
+    const path = item.path.replaceAll('\\', '/');
+    const name = typeof item.name === 'string' ? item.name : path.split('/').pop() ?? path;
+    return [{ path, name, type: priority.includes(item.type) ? item.type : undefined }];
+  });
+}
+
+function storedPluginSettings(): StoredPluginSetting[] {
+  try {
+    const settings = JSON.parse(window.localStorage.getItem('headlampPluginSettings') ?? '[]');
+    return Array.isArray(settings) ? settings : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The copy of the plugin that Headlamp loaded, which it records in its plugin settings before it
+ * runs the plugins.
+ */
+export function loadedPlugin(
+  entries: PluginEntry[],
+  settings: StoredPluginSetting[]
+): PluginEntry | undefined {
+  const loaded = settings.find(
+    setting => setting?.name === packageName && setting.isLoaded === true && setting.folderName
+  );
+  if (!loaded) return undefined;
+  return entries.find(
+    entry =>
+      entry.name === loaded.folderName &&
+      (!loaded.type || !entry.type || entry.type === loaded.type)
+  );
+}
+
+/**
+ * The copy of the plugin that Headlamp loads when its settings do not say: of the plugins whose
+ * package.json names this plugin, the first that is not disabled of the development, user and
+ * shipped plugins.
+ */
+export async function preferredPlugin(
+  entries: PluginEntry[],
+  settings: StoredPluginSetting[],
+  readName: (path: string) => Promise<string | undefined>
+): Promise<PluginEntry | undefined> {
+  const names = await Promise.all(
+    entries.map(entry => readName(entry.path).catch(() => undefined))
+  );
+  const disabled = (entry: PluginEntry) =>
+    settings.some(
+      setting =>
+        setting?.name === packageName &&
+        setting.isEnabled === false &&
+        setting.folderName === entry.name &&
+        (!setting.type || !entry.type || setting.type === entry.type)
+    );
+  const rank = (entry: PluginEntry) => priority.indexOf(entry.type ?? 'shipped');
+  return entries
+    .filter((entry, i) => names[i] === packageName && !disabled(entry))
+    .sort((a, b) => rank(a) - rank(b))[0];
+}
+
+async function readPackageName(appUrl: string, path: string): Promise<string | undefined> {
+  const response = await fetch(`${appUrl}${path}/package.json`);
+  if (!response.ok) return undefined;
+  const info = await response.json();
+  return typeof info?.name === 'string' ? info.name : undefined;
 }
 
 /**
@@ -37,7 +176,7 @@ async function fetchPluginUrl(): Promise<string> {
  * Note: The isElectron code (Licence: MIT) is taken from
  *   https://github.com/cheton/is-electron/blob/master/index.js
  */
-function isElectron(): boolean {
+export function isElectron(): boolean {
   // Renderer process
   if (
     typeof window !== 'undefined' &&

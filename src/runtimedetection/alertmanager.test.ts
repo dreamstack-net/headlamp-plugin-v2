@@ -214,8 +214,9 @@ it('creates a silence in the cluster of the alert, recording the user and the re
   );
 
   expect(id).toBe('silence-1');
-  const [url, silence, , options] = mocks.post.mock.calls[0];
+  const [url, silence, autoLogoutOnAuthError, options] = mocks.post.mock.calls[0];
   expect(url).toBe(`${proxy}/api/v2/silences`);
+  expect(autoLogoutOnAuthError).toBe(false);
   expect(options).toEqual({ cluster: 'cluster-b' });
   expect(silence).toMatchObject({
     startsAt: '2026-10-30T12:00:00.000Z',
@@ -251,15 +252,17 @@ it('lists the silences that have not ended, soonest to end first', async () => {
   );
 });
 
-it('ends a silence in its cluster', async () => {
+it('ends a silence in its cluster, without reading the empty answer as JSON', async () => {
   mocks.alertmanagerUrl = proxy;
   await expireSilence({ id: 'silence-1', cluster: 'cluster-b' } as any);
   expect(mocks.remove).toHaveBeenCalledWith(`${proxy}/api/v2/silence/silence-1`, {
     cluster: 'cluster-b',
+    autoLogoutOnAuthError: false,
+    isJSON: false,
   });
 });
 
-it('asks for permission to proxy to the Alertmanager service', () => {
+it('asks for permission to proxy to the Alertmanager service, named with its port', () => {
   expect(alertmanagerProxyCheck()).toBeNull();
   mocks.address = 'monitoring/alertmanager:9093';
   expect(alertmanagerProxyCheck('delete')).toEqual({
@@ -268,5 +271,6 @@ it('asks for permission to proxy to the Alertmanager service', () => {
     subresource: 'proxy',
     verb: 'delete',
     namespace: 'monitoring',
+    name: 'alertmanager:9093',
   });
 });

@@ -15,6 +15,7 @@ import * as yaml from 'js-yaml';
 import { useSnackbar } from 'notistack';
 import { useState } from 'react';
 import { copyToClipboard } from '../common/clipboard';
+import { errorMessage } from '../common/errors';
 import { saveToFile } from '../common/filedialog';
 import { Permitted } from '../common/permissions';
 import { GeneratedNetworkPolicy } from '../softwarecomposition/GeneratedNetworkPolicy';
@@ -26,8 +27,13 @@ import {
 } from './apply';
 
 export function NetworkPolicyActions(
-  props: Readonly<{ generatedNetworkPolicy: GeneratedNetworkPolicy }>
+  props: Readonly<{
+    generatedNetworkPolicy: GeneratedNetworkPolicy;
+    // called once the NetworkPolicy was created or replaced, to compare with it
+    onApplied?: () => void;
+  }>
 ) {
+  const { onApplied } = props;
   const policy = toNetworkPolicy(props.generatedNetworkPolicy);
   const policyYaml = yaml.dump(policy);
   const { enqueueSnackbar } = useSnackbar();
@@ -40,8 +46,8 @@ export function NetworkPolicyActions(
     setError('');
     try {
       setExisting(await getExistingNetworkPolicy(policy));
-    } catch (err: any) {
-      enqueueSnackbar(`Unable to check for an existing NetworkPolicy: ${err?.message ?? err}`, {
+    } catch (err) {
+      enqueueSnackbar(`Unable to check for an existing NetworkPolicy: ${errorMessage(err)}`, {
         variant: 'error',
       });
     }
@@ -59,8 +65,9 @@ export function NetworkPolicyActions(
         { variant: 'success' }
       );
       setExisting(undefined);
-    } catch (err: any) {
-      setError(err?.message ?? String(err));
+      onApplied?.();
+    } catch (err) {
+      setError(errorMessage(err));
     } finally {
       setApplying(false);
     }
@@ -71,8 +78,8 @@ export function NetworkPolicyActions(
     try {
       await copyToClipboard(policyYaml);
       enqueueSnackbar('NetworkPolicy YAML copied to the clipboard', { variant: 'success' });
-    } catch (err: any) {
-      enqueueSnackbar(`Unable to copy the YAML: ${err?.message ?? err}`, { variant: 'error' });
+    } catch (err) {
+      enqueueSnackbar(`Unable to copy the YAML: ${errorMessage(err)}`, { variant: 'error' });
     }
   };
 
@@ -89,13 +96,23 @@ export function NetworkPolicyActions(
         >
           Download YAML
         </Button>
+        {/* the dialog reads the policy with this name first, to replace it if it exists */}
         <Permitted
-          check={{
-            group: 'networking.k8s.io',
-            resource: 'networkpolicies',
-            verb: 'create',
-            namespace: policy.metadata.namespace,
-          }}
+          check={[
+            {
+              group: 'networking.k8s.io',
+              resource: 'networkpolicies',
+              verb: 'create',
+              namespace: policy.metadata.namespace,
+            },
+            {
+              group: 'networking.k8s.io',
+              resource: 'networkpolicies',
+              verb: 'get',
+              namespace: policy.metadata.namespace,
+              name: policy.metadata.name,
+            },
+          ]}
         >
           {allowed => (
             <Button
@@ -134,9 +151,27 @@ export function NetworkPolicyActions(
           <Button startIcon={<Icon icon="mdi:content-copy" />} onClick={copy}>
             Copy YAML
           </Button>
-          <Button variant="contained" color="warning" disabled={applying} onClick={apply}>
-            {existing ? 'Replace' : 'Create'}
-          </Button>
+          {/* replacing the policy of that name is an update of it */}
+          <Permitted
+            check={{
+              group: 'networking.k8s.io',
+              resource: 'networkpolicies',
+              verb: existing ? 'update' : 'create',
+              namespace: policy.metadata.namespace,
+              ...(existing && { name: policy.metadata.name }),
+            }}
+          >
+            {allowed => (
+              <Button
+                variant="contained"
+                color="warning"
+                disabled={applying || !allowed}
+                onClick={apply}
+              >
+                {existing ? 'Replace' : 'Create'}
+              </Button>
+            )}
+          </Permitted>
         </DialogActions>
       </Dialog>
     </>

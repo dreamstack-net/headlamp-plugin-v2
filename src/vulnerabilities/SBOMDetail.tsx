@@ -1,11 +1,12 @@
 import { Icon } from '@iconify/react';
+import { ApiError } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import { NameValueTable, SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
-import { KubeObject } from '@kinvolk/headlamp-plugin/lib/k8s/cluster';
-import { Button, Stack } from '@mui/material';
+import { Button, Stack, Typography } from '@mui/material';
 import { useSnackbar } from 'notistack';
-import { useState } from 'react';
 import { useLocation } from 'react-router';
+import { ErrorMessage } from '../common/ErrorMessage';
 import { saveToFile } from '../common/filedialog';
+import { useStorageObject } from '../common/readOnce';
 import HeadlampTable from '../common/Table';
 import { getURLSegments } from '../common/url';
 import { newGuid } from '../common/uuid';
@@ -19,17 +20,30 @@ export default function SBOMDetail() {
   const urlParams = new URLSearchParams(useLocation().search);
   const filtered = urlParams.has('filtered');
 
-  const [sbomSyftObject, setSbomSyftObject] = useState<KubeObject | null>(null);
   const { enqueueSnackbar } = useSnackbar();
 
-  const sbomClass = filtered ? sbomSyftFilteredClass : sbomSyftClass;
-  sbomClass.useApiGet(setSbomSyftObject, name, namespace);
+  // read once: a watch of the storage would replace the SBOM with one without its packages
+  const { data: sbomSyft, error } = useStorageObject<SBOMSyft>(
+    filtered ? sbomSyftFilteredClass : sbomSyftClass,
+    name,
+    namespace,
+    undefined
+  );
 
-  if (!sbomSyftObject) {
-    return <></>;
+  if (!sbomSyft) {
+    return (
+      <SectionBox title={'SBOM' + (filtered ? ' Filtered' : '')} backLink>
+        {error ? (
+          <ErrorMessage error={error as ApiError} />
+        ) : (
+          <Typography variant="body2" color="text.secondary">
+            Reading the SBOM…
+          </Typography>
+        )}
+      </SectionBox>
+    );
   }
 
-  const sbomSyft: SBOMSyft = sbomSyftObject.jsonData;
   const artifacts = sbomSyft.spec.syft.artifacts ?? [];
   const message = filtered ? 'Showing in use artifacts only' : 'Showing all artifacts';
   // the name of the SBOM is the image with its digest, made safe for file names
@@ -76,7 +90,7 @@ export default function SBOMDetail() {
             },
             {
               name: 'Distro',
-              value: sbomSyft.spec.syft.distro.name,
+              value: distroLabel(sbomSyft.spec.syft.distro),
             },
             {
               name: 'Components',
@@ -89,6 +103,15 @@ export default function SBOMDetail() {
       <Artifacts artifacts={artifacts} fileName={fileName} />
     </>
   );
+}
+
+/**
+ * The distribution of the image with its version, such as Debian GNU/Linux 11 (bullseye); an
+ * image without one, such as a distroless image, has none.
+ */
+export function distroLabel(distro: Partial<SBOMSyft.Distro> | null | undefined): string {
+  if (!distro) return '';
+  return distro.prettyName || [distro.name, distro.versionID].filter(Boolean).join(' ');
 }
 
 function licenses(artifact: SBOMSyft.Artifact) {

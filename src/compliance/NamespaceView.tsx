@@ -10,8 +10,9 @@ import { useMemo } from 'react';
 import Table from '../common/Table';
 import { RoutingName, useHLSelectedClusters } from '../index';
 import { WorkloadConfigurationScanSummary } from '../softwarecomposition/WorkloadConfigurationScanSummary';
+import { isControlExcepted } from './workload-scanning';
 
-class NamespaceResult {
+export class NamespaceResult {
   namespace: string;
   cluster: string;
   criticalCount: number = 0;
@@ -29,18 +30,30 @@ class NamespaceResult {
     this.namespace = namespace;
     this.cluster = cluster;
   }
+
+  // the share of the checks that passed or that an exception excludes, as the compliance score
+  // of a control counts them
+  get passedShare(): number {
+    return this.total === 0 ? 1 : (this.passed + this.exceptedControls) / this.total;
+  }
 }
 
 export default function NamespaceView(
   props: Readonly<{
     workloadScanData: WorkloadConfigurationScanSummary[] | null;
+    // the framework whose exceptions limited to a framework apply
+    frameworkName?: string;
+    // the controls of the chosen framework, which the counts are limited to; undefined for the
+    // combined view of all controls
+    controlIDs?: Set<string>;
   }>
 ) {
   const clusters = useHLSelectedClusters();
-  const { workloadScanData } = props;
+  const { workloadScanData, frameworkName, controlIDs } = props;
   const namespaceResults = useMemo(
-    () => (workloadScanData ? getNamespaceResults(workloadScanData) : []),
-    [workloadScanData]
+    () =>
+      workloadScanData ? getNamespaceResults(workloadScanData, frameworkName, controlIDs) : [],
+    [workloadScanData, frameworkName, controlIDs]
   );
   if (!workloadScanData) {
     return <></>;
@@ -50,53 +63,56 @@ export default function NamespaceView(
     <SectionBox>
       <Table
         data={namespaceResults}
+        getRowId={(result: NamespaceResult) => `${result.cluster}/${result.namespace}`}
         columns={[
           {
             id: 'Namespace',
             header: 'Namespace',
             accessorKey: 'namespace',
-            Cell: ({ cell }: any) => (
+            Cell: ({ cell }) => (
               <HeadlampLink
                 routeName={RoutingName.KubescapeConfigurationScanNamespaceSummary}
                 params={{
                   namespace: cell.getValue(),
                 }}
+                activeCluster={cell.row.original.cluster}
               >
                 {cell.getValue()}
               </HeadlampLink>
             ),
           },
-          clusters.length > 1
-            ? {
-                header: 'Cluster',
-                accessorKey: 'cluster',
-              }
-            : ({} as TableColumn<NamespaceResult>),
+          // no column without clusters to tell apart: an empty one would take its width
+          ...(clusters.length > 1
+            ? [
+                {
+                  header: 'Cluster',
+                  accessorKey: 'cluster',
+                } as TableColumn<NamespaceResult>,
+              ]
+            : []),
           {
+            id: 'Passed',
             header: 'Passed',
-            accessorFn: (namespaceResult: NamespaceResult) =>
-              namespaceResult.total === namespaceResult.exceptedControls
-                ? 100
-                : namespaceResult.passed / namespaceResult.total,
-            Cell: ({ cell }: any) => <progress value={cell.getValue()} />,
+            accessorFn: (namespaceResult: NamespaceResult) => namespaceResult.passedShare,
+            Cell: ({ cell }) => <progress value={cell.getValue()} />,
           },
           {
             header: 'Excluded Namespace',
             accessorKey: 'exceptedNamespace',
-            Cell: ({ cell }: any) => (cell.getValue() ? 'Yes' : 'No'),
+            Cell: ({ cell }) => (cell.getValue() ? 'Yes' : 'No'),
             gridTemplate: 'auto',
           },
           {
+            id: 'Compliance',
             header: 'Compliance',
             accessorFn: (namespaceResult: NamespaceResult) =>
-              namespaceResult.total === namespaceResult.exceptedControls
-                ? 100
-                : Math.trunc((namespaceResult.passed / namespaceResult.total) * 100),
-            Cell: ({ cell }: any) => cell.getValue() + '%',
+              Math.trunc(namespaceResult.passedShare * 100),
+            Cell: ({ cell }) => cell.getValue() + '%',
             gridTemplate: 'auto',
           },
           {
-            header: 'Excluded Controls',
+            // the results of controls in the workloads of the namespace that exceptions exclude
+            header: 'Excluded Control Results',
             accessorKey: 'exceptedControls',
             gridTemplate: 'min-content',
           },
@@ -145,8 +161,14 @@ export default function NamespaceView(
   );
 }
 
-function getNamespaceResults(
-  workloadScanData: WorkloadConfigurationScanSummary[]
+/**
+ * The results per namespace of each cluster, with the exceptions that apply in the framework;
+ * of the controls of the framework when given, else of all controls.
+ */
+export function getNamespaceResults(
+  workloadScanData: WorkloadConfigurationScanSummary[],
+  frameworkName?: string,
+  controlIDs?: Set<string>
 ): NamespaceResult[] {
   // the same namespace in two clusters is two rows
   const namespaces = new Map<string, NamespaceResult>();
@@ -163,9 +185,10 @@ function getNamespaceResults(
     if (!scan.exceptedByPolicy) namespaceResult.exceptedNamespace = false;
 
     for (const controlResult of Object.values(scan.spec.controls)) {
+      if (controlIDs && !controlIDs.has(controlResult.controlID)) continue;
       namespaceResult.total++;
 
-      if (scan.exceptedByPolicy || controlResult.exceptedByPolicy) {
+      if (scan.exceptedByPolicy || isControlExcepted(controlResult, frameworkName)) {
         namespaceResult.exceptedControls++;
       } else if (controlResult.status.status === WorkloadConfigurationScanSummary.Status.Failed) {
         namespaceResult.failed++;

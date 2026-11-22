@@ -1,5 +1,4 @@
-import { ApiProxy } from '@kinvolk/headlamp-plugin/lib';
-import { useClustersConf } from '@kinvolk/headlamp-plugin/lib/k8s';
+import { request } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import Alert from '@mui/material/Alert';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
@@ -12,17 +11,48 @@ import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import React from 'react';
 import { detectPrometheus } from '../overview/prometheus';
+import { RegoDataProvider } from '../rego';
 import { detectAlertmanager } from '../runtimedetection/alertmanager';
+import { changeExploitSetting, epssBatchSize } from '../vulnerabilities/exploitData';
 import { changeImageVersionSetting } from '../vulnerabilities/ImageVersion';
-import { isValidAlertmanagerAddress, KubescapeConfig } from './config-store';
+import { clearReportCache } from '../vulnerabilities/reportCache';
+import { useClustersConf } from './clustersConf';
+import { isValidAlertmanagerAddress, KubescapeConfig, serviceProxyPath } from './config-store';
+import { errorMessage } from './errors';
+import { FrameworkSettings } from './FrameworkSettings';
 
 interface SettingsProps {
   data?: { [key: string]: any };
   onDataChange?: (data: { [key: string]: any }) => void;
 }
 
+type SettingsData = { [key: string]: any };
+
+// the service addresses that Detect found, and the cluster it found them in
+type DetectedAddresses = { cluster: string; addresses: string[] };
+
 export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps>) {
   const kubescapeData = data as KubescapeConfig | undefined;
+  // Headlamp replaces all settings with what onDataChange gets, so a change is merged into the
+  // latest settings: a detection answers after the user may have changed others, and two
+  // changes before Headlamp renders again must both be kept
+  const latestData = React.useRef(data);
+  const lastDataProp = React.useRef(data);
+  if (lastDataProp.current !== data) {
+    lastDataProp.current = data;
+    latestData.current = data;
+  }
+  const changeData = (
+    change: SettingsData | ((current: SettingsData | undefined) => SettingsData)
+  ) => {
+    if (!onDataChange) return;
+    const next =
+      typeof change === 'function'
+        ? change(latestData.current)
+        : { ...latestData.current, ...change };
+    latestData.current = next;
+    onDataChange(next);
+  };
   const clusters = useClustersConf() || {};
   const [selectedCluster, setSelectedCluster] = React.useState('');
 
@@ -42,20 +72,27 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
     'idle'
   );
   const [testMessage, setTestMessage] = React.useState('');
-  // Alertmanager addresses found in the selected cluster, null before looking
-  const [detected, setDetected] = React.useState<string[] | null>(null);
+  // Alertmanager addresses found in a cluster, null before looking
+  const [alertmanagers, setAlertmanagers] = React.useState<DetectedAddresses | null>(null);
+  // those of the selected cluster: what another cluster has is not shown as found in this one
+  const detected = alertmanagers?.cluster === selectedCluster ? alertmanagers.addresses : null;
   const [detecting, setDetecting] = React.useState(false);
   const prometheusAddress = kubescapeData?.prometheusUrl ?? '';
   const prometheusAddressError =
     !!prometheusAddress && !isValidAlertmanagerAddress(prometheusAddress);
-  // Prometheus addresses found in the selected cluster, null before looking
-  const [detectedPrometheus, setDetectedPrometheus] = React.useState<string[] | null>(null);
+  // Prometheus addresses found in a cluster, null before looking, and those of the selected one
+  const [prometheuses, setPrometheuses] = React.useState<DetectedAddresses | null>(null);
+  const detectedPrometheus =
+    prometheuses?.cluster === selectedCluster ? prometheuses.addresses : null;
 
   const handleDetectPrometheus = async () => {
-    const addresses = await detectPrometheus(selectedCluster).catch(() => []);
-    setDetectedPrometheus(addresses);
-    if (!prometheusAddress && addresses.length > 0 && onDataChange) {
-      onDataChange({ ...data, prometheusUrl: addresses[0] });
+    // the cluster that is asked; the user may choose another before it answers
+    const cluster = selectedCluster;
+    const addresses = await detectPrometheus(cluster).catch(() => []);
+    setPrometheuses({ cluster, addresses });
+    // not over an address the user typed meanwhile
+    if (!latestData.current?.prometheusUrl && addresses.length > 0) {
+      changeData({ prometheusUrl: addresses[0] });
     }
   };
 
@@ -66,17 +103,22 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
 
   const changeAlertmanagerAddress = (address: string) => {
     setAlertmanagerAddress(address);
-    if (onDataChange) onDataChange({ ...data, alertmanagerUrl: address });
+    changeData({ alertmanagerUrl: address });
   };
 
   const handleDetect = async (fillIn: boolean) => {
+    // the cluster that is asked; the user may choose another before it answers
+    const cluster = selectedCluster;
     setDetecting(true);
     try {
-      const addresses = await detectAlertmanager(selectedCluster);
-      setDetected(addresses);
-      if (fillIn && addresses.length > 0) changeAlertmanagerAddress(addresses[0]);
+      const addresses = await detectAlertmanager(cluster);
+      setAlertmanagers({ cluster, addresses });
+      // not over an address the user typed meanwhile
+      if (fillIn && addresses.length > 0 && !latestData.current?.alertmanagerUrl) {
+        changeAlertmanagerAddress(addresses[0]);
+      }
     } catch {
-      setDetected([]);
+      setAlertmanagers({ cluster, addresses: [] });
     } finally {
       setDetecting(false);
     }
@@ -84,7 +126,7 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
 
   // Suggest the Alertmanager of the cluster while none is configured
   React.useEffect(() => {
-    if (selectedCluster && !kubescapeData?.alertmanagerUrl && detected === null) {
+    if (selectedCluster && !kubescapeData?.alertmanagerUrl && alertmanagers === null) {
       handleDetect(true);
     }
     // only when the cluster is known; handleDetect changes on every render
@@ -119,17 +161,16 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
     const rawValue = event.target.value;
     setInputValue(rawValue);
     setError('');
-    if (onDataChange && rawValue !== '') {
+    if (rawValue !== '') {
       const validation = validatePageSize(rawValue);
-      if (validation.isValid) onDataChange({ ...data, pageSize: parseInt(rawValue, 10) });
+      if (validation.isValid) changeData({ pageSize: parseInt(rawValue, 10) });
     }
   };
 
   const handlePageSizeBlur = () => {
     const validation = validatePageSize(inputValue);
     setError(validation.error);
-    if (validation.isValid && onDataChange)
-      onDataChange({ ...data, pageSize: parseInt(inputValue, 10) });
+    if (validation.isValid) changeData({ pageSize: parseInt(inputValue, 10) });
   };
 
   const handleTestConnection = async () => {
@@ -145,14 +186,17 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
 
     try {
       if (!selectedCluster) throw new Error('No cluster selected');
-      const [namespace, serviceAndPort] = alertmanagerAddress.split('/');
-      const proxyUrl = `/clusters/${selectedCluster}/api/v1/namespaces/${namespace}/services/${serviceAndPort}/proxy/api/v2/alerts`;
-      await ApiProxy.request(proxyUrl);
+      // with the cluster, Headlamp sends the headers of its kubeconfig; an Alertmanager that
+      // refuses the user does not log them out of the cluster
+      await request(`${serviceProxyPath(alertmanagerAddress)}/api/v2/alerts`, {
+        cluster: selectedCluster,
+        autoLogoutOnAuthError: false,
+      });
       setTestStatus('success');
       setTestMessage('Connection successful!');
     } catch (err) {
       setTestStatus('error');
-      setTestMessage(`Connection failed: ${err instanceof Error ? err.message : String(err)}`);
+      setTestMessage(`Connection failed: ${errorMessage(err)}`);
     }
   };
 
@@ -175,12 +219,22 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
         margin="normal"
       />
 
+      {/* the settings page is no route of the plugin, so it reads Kubescape's frameworks itself */}
+      <RegoDataProvider>
+        <FrameworkSettings
+          activeFrameworks={kubescapeData?.activeFrameworks}
+          framework={kubescapeData?.framework}
+          clusters={Object.keys(clusters)}
+          onChange={choice => changeData(choice)}
+        />
+      </RegoDataProvider>
+
       <Box display="flex" flexDirection="column">
         <FormControlLabel
           control={
             <Switch
               checked={kubescapeData?.tableColumns !== false}
-              onChange={(_, checked) => onDataChange?.({ ...data, tableColumns: checked })}
+              onChange={(_, checked) => changeData({ tableColumns: checked })}
             />
           }
           label="Show CVEs and failed controls in the Headlamp lists of workloads and pods"
@@ -189,7 +243,7 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
           control={
             <Switch
               checked={kubescapeData?.notifications !== false}
-              onChange={(_, checked) => onDataChange?.({ ...data, notifications: checked })}
+              onChange={(_, checked) => changeData({ notifications: checked })}
             />
           }
           label="Notify about critical runtime alerts and security exceptions that expire within a week"
@@ -197,9 +251,27 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
         <FormControlLabel
           control={
             <Switch
+              checked={kubescapeData?.keepVulnerabilityReports !== false}
+              onChange={(_, checked) => {
+                changeData({ keepVulnerabilityReports: checked });
+                if (!checked) clearReportCache();
+              }}
+            />
+          }
+          label="Keep vulnerability reports between sessions"
+        />
+        <Typography variant="body2" component="div" color="text.secondary" sx={{ ml: 6, mt: -0.5 }}>
+          On by default. When on, the findings of the image reports of your clusters are kept in
+          Headlamp&apos;s browser storage on this computer, so that the next session only reads the
+          reports that changed. Reports not used for a week are removed; switching it off removes
+          them all.
+        </Typography>
+        <FormControlLabel
+          control={
+            <Switch
               checked={kubescapeData?.imageVersions === true}
               onChange={(_, checked) =>
-                onDataChange?.(changeImageVersionSetting(data, 'imageVersions', checked))
+                changeData(current => changeImageVersionSetting(current, 'imageVersions', checked))
               }
             />
           }
@@ -236,7 +308,9 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
               }
               disabled={kubescapeData?.imageVersions !== true}
               onChange={(_, checked) =>
-                onDataChange?.(changeImageVersionSetting(data, 'possiblyPrivateImages', checked))
+                changeData(current =>
+                  changeImageVersionSetting(current, 'possiblyPrivateImages', checked)
+                )
               }
             />
           }
@@ -264,7 +338,9 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
             <Switch
               checked={kubescapeData?.imageVersions === true && kubescapeData?.endOfLife === true}
               disabled={kubescapeData?.imageVersions !== true}
-              onChange={(_, checked) => onDataChange?.({ ...data, endOfLife: checked })}
+              onChange={(_, checked) =>
+                changeData(current => changeImageVersionSetting(current, 'endOfLife', checked))
+              }
             />
           }
           label="Show when the release line of an image reaches its end of life (from endoflife.date)"
@@ -281,6 +357,45 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
           endoflife.date for the release lines: the product name only, never the name, registry or
           organisation of an image. Their newest release also serves as the newest version when no
           other service knows it. When off, endoflife.date is not asked at all.
+        </Typography>
+        <FormControlLabel
+          control={
+            <Switch
+              checked={kubescapeData?.knownExploited === true}
+              onChange={(_, checked) =>
+                changeData(current => changeExploitSetting(current, 'knownExploited', checked))
+              }
+            />
+          }
+          label="Mark CVEs that are known to be exploited (CISA KEV)"
+        />
+        <Typography variant="body2" component="div" color="text.secondary" sx={{ ml: 6, mt: -0.5 }}>
+          Off by default. When on, your browser downloads CISA&apos;s catalog of Known Exploited
+          Vulnerabilities whole, once a day, from cdn.jsdelivr.net (a copy of the cisagov/kev-data
+          repository on GitHub, as CISA&apos;s own address does not allow other sites), without
+          cookies. jsDelivr sees your IP address, but nothing about your clusters: the CVEs are
+          matched against the catalog in the browser. The catalog is kept in Headlamp&apos;s browser
+          storage on this computer.
+        </Typography>
+        <FormControlLabel
+          control={
+            <Switch
+              checked={kubescapeData?.epss === true}
+              onChange={(_, checked) =>
+                changeData(current => changeExploitSetting(current, 'epss', checked))
+              }
+            />
+          }
+          label="Show the EPSS score of CVEs"
+        />
+        <Typography variant="body2" component="div" color="text.secondary" sx={{ ml: 6, mt: -0.5 }}>
+          Off by default. When on, your browser asks api.first.org, the API of FIRST&apos;s Exploit
+          Prediction Scoring System, for the scores of the CVEs that the vulnerability pages show,
+          without cookies, {epssBatchSize} CVE ids per request. FIRST sees your IP address and the
+          CVE ids found in your clusters, which tell it which vulnerabilities your infrastructure
+          has; no names of images, workloads or clusters are sent. Scores are kept for a day in
+          Headlamp&apos;s browser storage on this computer. Leave it off if the vulnerabilities of
+          your clusters are confidential.
         </Typography>
       </Box>
 
@@ -375,7 +490,7 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
                 ? 'Invalid format. Use: namespace/service-name:port'
                 : 'Prometheus with the metrics of the Kubescape exporter, for the trends on the Overview page. Format: namespace/service-name:port'
             }
-            onChange={e => onDataChange?.({ ...data, prometheusUrl: e.target.value })}
+            onChange={e => changeData({ prometheusUrl: e.target.value })}
             fullWidth
           />
           <Button
@@ -403,7 +518,7 @@ export function KubescapeSettings({ data, onDataChange }: Readonly<SettingsProps
                 label={address}
                 size="small"
                 color={address === prometheusAddress ? 'primary' : 'default'}
-                onClick={() => onDataChange?.({ ...data, prometheusUrl: address })}
+                onClick={() => changeData({ prometheusUrl: address })}
               />
             ))}
           </Box>

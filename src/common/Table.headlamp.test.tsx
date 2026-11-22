@@ -1,16 +1,20 @@
 // Renders Headlamp's real table, to check that it keeps the sorting the plugin gives it
 import { lightTheme } from '@kinvolk/headlamp-plugin/lib/components/App/defaultAppThemes';
 import { createMuiTheme } from '@kinvolk/headlamp-plugin/lib/lib/themes';
+import {
+  defaultTableRowsPerPageOptions,
+  setAppSettings,
+} from '@kinvolk/headlamp-plugin/lib/redux/configSlice';
 import store from '@kinvolk/headlamp-plugin/lib/redux/stores/store';
 import { ThemeProvider } from '@mui/material/styles';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { Provider } from 'react-redux';
 import { MemoryRouter } from 'react-router-dom';
 import { vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ saveToFile: vi.fn() }));
 vi.mock('./filedialog', () => ({ saveToFile: mocks.saveToFile }));
-import Table from './Table';
+import Table, { withColumnIds } from './Table';
 
 const data = [
   { name: 'beta', score: 3 },
@@ -89,6 +93,69 @@ it('keeps the sorting of each kind of table apart', () => {
 
   renderTable();
   expect(names()).toEqual(sortedByScore);
+});
+
+it('keeps the sorting on its column when a column appears before it', () => {
+  // without ids, as most columns of the plugin: Headlamp names such a column by its index
+  const table = (withCluster: boolean) => (
+    <Provider store={store}>
+      <ThemeProvider theme={createMuiTheme(lightTheme)}>
+        <MemoryRouter>
+          <Table
+            data={data}
+            sortingKey="scores"
+            columns={[
+              { header: 'Name', accessorKey: 'name' },
+              ...(withCluster ? [{ header: 'Cluster', accessorFn: () => 'cluster-a' }] : []),
+              { header: 'Score', accessorKey: 'score' },
+            ]}
+          />
+        </MemoryRouter>
+      </ThemeProvider>
+    </Provider>
+  );
+  const view = render(table(false));
+  // numbers are sorted largest first
+  fireEvent.click(screen.getByText('Score'));
+  expect(names()).toEqual(['beta', 'gamma', 'alpha']);
+
+  // a second cluster is selected while the page is shown
+  view.rerender(table(true));
+  expect(names()).toEqual(['beta', 'gamma', 'alpha']);
+  cleanup();
+
+  // and back on the page
+  render(table(true));
+  expect(names()).toEqual(['beta', 'gamma', 'alpha']);
+});
+
+it('names a column by its header, unless that is taken or could be an index', () => {
+  const ids = withColumnIds([
+    { id: 'name', header: 'Name' },
+    { header: 'Score' },
+    { header: 'Score' },
+    { header: 'name' },
+    { header: '' },
+    { header: '2' },
+  ]).map(column => column.id);
+
+  expect(ids).toEqual(['name', 'Score', undefined, undefined, undefined, undefined]);
+});
+
+it('keeps the sorting through a search', async () => {
+  renderTable();
+  fireEvent.click(screen.getByText('Score'));
+  expect(names()).toEqual(['beta', 'gamma', 'alpha']);
+
+  fireEvent.click(screen.getByRole('button', { name: 'Show/Hide search' }));
+  fireEvent.change(screen.getByPlaceholderText('Search'), { target: { value: 'aa' } });
+  // the search waits a moment for more typing; beta has one a
+  await waitFor(() => expect(names()).toEqual(['gamma', 'alpha']));
+  cleanup();
+
+  // back on the page, as after opening a row of the results
+  renderTable();
+  expect(names()).toEqual(['beta', 'gamma', 'alpha']);
 });
 
 it('offers an action for the selected rows', () => {
@@ -223,20 +290,40 @@ it('keeps the filters when they leave no rows, which Headlamp shows without a to
   expect(screen.queryByRole('button', { name: 'Export CSV' })).toBeNull();
 });
 
-it('offers 100 and 200 rows per page', async () => {
+describe('rows per page', () => {
   const many = Array.from({ length: 30 }, (_, index) => ({ name: `row-${index}`, score: index }));
-  render(
-    <Provider store={store}>
-      <ThemeProvider theme={createMuiTheme(lightTheme)}>
-        <MemoryRouter>
-          <Table data={many} columns={columns} />
-        </MemoryRouter>
-      </ThemeProvider>
-    </Provider>
-  );
+  const sizes = async () => {
+    render(
+      <Provider store={store}>
+        <ThemeProvider theme={createMuiTheme(lightTheme)}>
+          <MemoryRouter>
+            <Table data={many} columns={columns} />
+          </MemoryRouter>
+        </ThemeProvider>
+      </Provider>
+    );
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    return (await screen.findAllByRole('option')).map(option => option.textContent);
+  };
 
-  fireEvent.mouseDown(screen.getByRole('combobox'));
+  afterEach(() => {
+    // before the settings change, which a mounted table would follow
+    cleanup();
+    store.dispatch(setAppSettings({ tableRowsPerPageOptions: defaultTableRowsPerPageOptions }));
+    localStorage.removeItem('settings');
+    localStorage.removeItem('tables_rows_per_page');
+  });
 
-  const options = await screen.findAllByRole('option');
-  expect(options.map(option => option.textContent)).toEqual(['15', '25', '50', '100', '200']);
+  it('offers the sizes of Headlamp, whose own tables take the size chosen in any table', async () => {
+    expect(await sizes()).toEqual(['15', '25', '50']);
+
+    // a size of the plugin's own would show in Headlamp's lists, which do not offer it
+    fireEvent.click(screen.getByRole('option', { name: '50' }));
+    expect(localStorage.getItem('tables_rows_per_page')).toBe('50');
+  });
+
+  it('offers the size the user added in the settings of Headlamp', async () => {
+    store.dispatch(setAppSettings({ tableRowsPerPageOptions: [15, 25, 50, 200] }));
+    expect(await sizes()).toEqual(['15', '25', '50', '200']);
+  });
 });

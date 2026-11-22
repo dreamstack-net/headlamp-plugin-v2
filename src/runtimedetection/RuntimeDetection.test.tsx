@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   applicationProfileClass: { pluralName: 'applicationprofiles' },
   discoverProfileResource: vi.fn(),
   listQuery: vi.fn(),
+  namespaceErrors: [] as string[],
   fetchObject: vi.fn(),
   seccompProfileClass: { pluralName: 'seccompprofiles' },
   request: vi.fn(),
@@ -44,11 +45,22 @@ vi.mock('../model', () => ({
   containerProfileClass: mocks.containerProfileClass,
   applicationProfileClass: mocks.applicationProfileClass,
   listQuery: mocks.listQuery,
+  // the namespaces that could not be read are named by mocks.namespaceErrors
+  listQueryWithErrors: async (...args: unknown[]) => ({
+    items: await mocks.listQuery(...args),
+    errors: mocks.namespaceErrors,
+  }),
   fetchObject: mocks.fetchObject,
   seccompProfileClass: mocks.seccompProfileClass,
-  seccompProfileStorageClass: { pluralName: 'seccompprofiles' },
+  seccompProfileStorageClass: {
+    apiEndpoint: {
+      apiInfo: [{ group: 'spdx.softwarecomposition.kubescape.io', version: 'v1beta1' }],
+    },
+    pluralName: 'seccompprofiles',
+  },
   rulesClass: { useList: () => [mocks.ruleObjects] },
 }));
+vi.mock('../common/clusterContext', () => ({ getAllowedNamespaces: () => [] }));
 vi.mock('../softwarecomposition/profileApi', () => ({
   discoverProfileResource: mocks.discoverProfileResource,
 }));
@@ -76,70 +88,83 @@ vi.mock('@kinvolk/headlamp-plugin/lib/ApiProxy', () => ({
   patch: mocks.patch,
   post: mocks.post,
 }));
-vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', () => ({
-  NameValueTable: ({ rows }: any) => (
-    <dl>
-      {rows.map((row: any) => (
-        <div key={row.name}>
-          <dt>{row.name}</dt>
-          <dd>{row.value}</dd>
-        </div>
-      ))}
-    </dl>
-  ),
-  SectionBox: ({ title, children }: { title: string; children: ReactNode }) => (
-    <section>
-      <h1>{title}</h1>
-      {children}
-    </section>
-  ),
-  ShowHideLabel: ({ children }: { children: ReactNode }) => <>{children}</>,
-  Link: ({ children, routeName, params, activeCluster }: any) => (
-    <a
-      href={`${activeCluster ? `/${activeCluster}` : ''}/${routeName}/${params.namespace}/${
-        params.name
-      }`}
-    >
-      {children}
-    </a>
-  ),
-  Table: ({ data = [], columns }: any) => (
-    <table data-testid={`table-${columns.map((column: any) => column.header).join('-')}`}>
-      <thead>
-        <tr>
-          {columns.map((column: any, index: number) => (
-            <th key={index}>{column.header}</th>
-          ))}
-        </tr>
-      </thead>
-      <tbody>
-        {data.map((item: any, index: number) => (
-          <tr key={index}>
-            {columns.map((column: any, cellIndex: number) => {
-              const value = column.accessorFn?.(item) ?? item[column.accessorKey];
-              const cell = { getValue: () => value };
-              // the cell props of the column; Headlamp replaces those of the table
-              const props =
-                typeof column.muiTableBodyCellProps === 'function'
-                  ? column.muiTableBodyCellProps({ cell, row: { original: item } })
-                  : {};
-              return (
-                <td
-                  key={cellIndex}
-                  onClick={props.onClick}
-                  onKeyDown={props.onKeyDown}
-                  tabIndex={props.tabIndex}
-                >
-                  {column.Cell ? column.Cell({ cell, row: { original: item } }) : value}
-                </td>
-              );
-            })}
-          </tr>
+vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', () => {
+  // the values of the rows of each data array
+  const tableValues = new WeakMap<object, unknown[][]>();
+  return {
+    NameValueTable: ({ rows }: any) => (
+      <dl>
+        {rows.map((row: any) => (
+          <div key={row.name}>
+            <dt>{row.name}</dt>
+            <dd>{row.value}</dd>
+          </div>
         ))}
-      </tbody>
-    </table>
-  ),
-}));
+      </dl>
+    ),
+    SectionBox: ({ title, children }: { title: string; children: ReactNode }) => (
+      <section>
+        <h1>{title}</h1>
+        {children}
+      </section>
+    ),
+    ShowHideLabel: ({ children }: { children: ReactNode }) => <>{children}</>,
+    Link: ({ children, routeName, params, activeCluster }: any) => (
+      <a
+        href={`${activeCluster ? `/${activeCluster}` : ''}/${routeName}/${params.namespace}/${
+          params.name
+        }`}
+      >
+        {children}
+      </a>
+    ),
+    // like Headlamp's table, it keeps the values of the rows until the data changes
+    Table: ({ data = [], columns }: any) => {
+      const values: any[][] =
+        tableValues.get(data) ??
+        data.map((item: any) =>
+          columns.map((column: any) => column.accessorFn?.(item) ?? item[column.accessorKey])
+        );
+      tableValues.set(data, values);
+      return (
+        <table data-testid={`table-${columns.map((column: any) => column.header).join('-')}`}>
+          <thead>
+            <tr>
+              {columns.map((column: any, index: number) => (
+                <th key={index}>{column.header}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {data.map((item: any, index: number) => (
+              <tr key={index}>
+                {columns.map((column: any, cellIndex: number) => {
+                  const value = values[index]?.[cellIndex];
+                  const cell = { getValue: () => value };
+                  // the cell props of the column; Headlamp replaces those of the table
+                  const props =
+                    typeof column.muiTableBodyCellProps === 'function'
+                      ? column.muiTableBodyCellProps({ cell, row: { original: item } })
+                      : {};
+                  return (
+                    <td
+                      key={cellIndex}
+                      onClick={props.onClick}
+                      onKeyDown={props.onKeyDown}
+                      tabIndex={props.tabIndex}
+                    >
+                      {column.Cell ? column.Cell({ cell, row: { original: item } }) : value}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      );
+    },
+  };
+});
 
 const profile = {
   kind: 'ContainerProfile',
@@ -159,6 +184,7 @@ beforeEach(() => {
   mocks.discoverProfileResource.mockReset();
   mocks.discoverProfileResource.mockResolvedValue({ plural: 'containerprofiles', modern: true });
   mocks.listQuery.mockReset();
+  mocks.namespaceErrors = [];
   mocks.request.mockReset();
   mocks.request.mockResolvedValue({ items: [] });
   mocks.remove.mockReset();
@@ -261,6 +287,133 @@ it('relearns a workload: restarts it and deletes the profiles it recorded', asyn
   // the list is read again
   await waitFor(() => expect(mocks.listQuery.mock.calls.length).toBeGreaterThan(listsBefore));
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+});
+
+it('only deletes the profiles when it tries again after the restart', async () => {
+  const workloadProfile = {
+    kind: 'ContainerProfile',
+    metadata: {
+      name: 'replicaset-web-app-6d4cf56db6-web-1a2b-3c4d',
+      namespace: 'workloads',
+      cluster: 'cluster-a',
+      labels: {
+        'kubescape.io/workload-name': 'web-app',
+        'kubescape.io/workload-kind': 'Deployment',
+      },
+    },
+  };
+  mocks.listQuery.mockResolvedValue([workloadProfile]);
+  mocks.request.mockImplementation(async (url: string) =>
+    url.endsWith('/namespaces/workloads/containerprofiles')
+      ? { items: [workloadProfile] }
+      : url === '/apis/apps/v1/namespaces/workloads/deployments/web-app'
+      ? { spec: { replicas: 3 } }
+      : { items: [] }
+  );
+  mocks.patch.mockResolvedValue({});
+  mocks.remove.mockRejectedValueOnce(new Error('storage unavailable')).mockResolvedValue({});
+
+  renderRuntimeDetection();
+  openProfileTab();
+  fireEvent.click(await screen.findByRole('button', { name: 'Relearn' }));
+  const dialog = screen.getByRole('dialog', { name: 'Relearn Deployment web-app' });
+  await within(dialog).findByText('Delete the 1 recorded profile of this workload');
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Restart and relearn' }));
+
+  expect(
+    await within(dialog).findByText(
+      'Restarted Deployment web-app: its new pods are learned from their start. Then failed: storage unavailable'
+    )
+  ).toBeTruthy();
+  // the restart is done, so trying again does not roll the workload out once more
+  expect(within(dialog).queryByText(/^This restarts/)).toBeNull();
+  expect(within(dialog).getByText('Restarted the Deployment')).toBeTruthy();
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Retry deleting profiles' }));
+
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(mocks.patch).toHaveBeenCalledTimes(1);
+  expect(mocks.remove).toHaveBeenCalledTimes(2);
+});
+
+// the only profile of the Deployment web-app, whose spec the tests give
+const webAppProfile = {
+  kind: 'ContainerProfile',
+  metadata: {
+    name: 'replicaset-web-app-6d4cf56db6-web-1a2b-3c4d',
+    namespace: 'workloads',
+    cluster: 'cluster-a',
+    labels: {
+      'kubescape.io/workload-name': 'web-app',
+      'kubescape.io/workload-kind': 'Deployment',
+    },
+  },
+};
+
+it('does not propose to delete the profiles of pods that a restart leaves running', async () => {
+  mocks.listQuery.mockResolvedValue([webAppProfile]);
+  mocks.request.mockImplementation(async (url: string) =>
+    url.endsWith('/namespaces/workloads/containerprofiles')
+      ? { items: [webAppProfile] }
+      : url === '/apis/apps/v1/namespaces/workloads/deployments/web-app'
+      ? { spec: { replicas: 2, paused: true } }
+      : { items: [] }
+  );
+  mocks.patch.mockResolvedValue({});
+
+  renderRuntimeDetection();
+  openProfileTab();
+  fireEvent.click(await screen.findByRole('button', { name: 'Relearn' }));
+  const dialog = screen.getByRole('dialog', { name: 'Relearn Deployment web-app' });
+  // a paused Deployment rolls nothing out, so its pods go on with the profile they have
+  expect(await within(dialog).findByText(/Its rollouts are paused/)).toBeTruthy();
+  expect(within(dialog).queryByText(/Every pod of the workload is replaced/)).toBeNull();
+  const cleanup = await within(dialog).findByRole('checkbox', {
+    name: /Delete the 1 recorded profile of this workload/,
+  });
+  expect(cleanup).toHaveProperty('checked', false);
+  // the user may still choose it, and is told what it does
+  fireEvent.click(cleanup);
+  expect(within(dialog).getByText(/The pods that keep running lose their profile/)).toBeTruthy();
+  fireEvent.click(cleanup);
+
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Restart and relearn' }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  expect(mocks.patch).toHaveBeenCalledTimes(1);
+  expect(mocks.remove).not.toHaveBeenCalled();
+});
+
+it('waits for the workload and its profiles before it restarts anything', async () => {
+  mocks.listQuery.mockResolvedValue([webAppProfile]);
+  let answerProfiles: (list: unknown) => void = () => {};
+  mocks.request.mockImplementation((url: string) =>
+    url.endsWith('/namespaces/workloads/containerprofiles')
+      ? new Promise(resolve => {
+          answerProfiles = resolve;
+        })
+      : Promise.resolve(
+          url === '/apis/apps/v1/namespaces/workloads/deployments/web-app'
+            ? { spec: { replicas: 3 } }
+            : { items: [] }
+        )
+  );
+  mocks.patch.mockResolvedValue({});
+  mocks.remove.mockResolvedValue({});
+
+  renderRuntimeDetection();
+  openProfileTab();
+  fireEvent.click(await screen.findByRole('button', { name: 'Relearn' }));
+  const dialog = screen.getByRole('dialog', { name: 'Relearn Deployment web-app' });
+  // the workload is read, the profiles that the checked cleanup deletes are not yet
+  expect(await within(dialog).findByText(/Its 3 pods are replaced a few at a time/)).toBeTruthy();
+  const button = within(dialog).getByRole('button', { name: 'Restart and relearn' });
+  expect(button).toHaveProperty('disabled', true);
+  expect(mocks.patch).not.toHaveBeenCalled();
+
+  answerProfiles({ items: [webAppProfile] });
+  await waitFor(() => expect(button).toHaveProperty('disabled', false));
+  fireEvent.click(button);
+  await waitFor(() => expect(mocks.remove).toHaveBeenCalledTimes(1));
+  expect(mocks.patch).toHaveBeenCalledTimes(1);
 });
 
 it('lists the ContainerProfiles with links to their pages and their status', async () => {
@@ -373,6 +526,17 @@ it('lists the profiles of all selected clusters and names the clusters that fail
   ]);
 });
 
+it('names the namespaces whose profiles could not be read', async () => {
+  mocks.listQuery.mockResolvedValue([profile]);
+  mocks.namespaceErrors = ['namespace secret: forbidden'];
+
+  renderRuntimeDetection();
+  openProfileTab();
+
+  expect(await screen.findByText(/namespace secret: forbidden/)).toBeTruthy();
+  expect(await screen.findAllByText('web-app', { selector: 'a' })).toHaveLength(1);
+});
+
 it('offers the Alertmanager found in the cluster while none is configured', async () => {
   mocks.request.mockImplementation(async (url: string) =>
     url === '/api/v1/services'
@@ -478,8 +642,73 @@ it('silences an alert as the current user and ends silences', async () => {
   await waitFor(() =>
     expect(mocks.remove).toHaveBeenCalledWith(`${proxy}/api/v2/silence/silence-1`, {
       cluster: 'cluster-a',
+      autoLogoutOnAuthError: false,
+      isJSON: false,
     })
   );
+  // the proxy of the service itself is what the user must be allowed
+  expect(
+    mocks.post.mock.calls
+      .filter(([url]) => url.includes('selfsubjectaccessreviews'))
+      .map(([, review]) => review.spec.resourceAttributes)
+      .filter(attributes => attributes.subresource === 'proxy')
+      .map(({ verb, namespace, name }) => [verb, namespace, name])
+  ).toEqual(
+    expect.arrayContaining([
+      ['create', 'monitoring', 'alertmanager:9093'],
+      ['delete', 'monitoring', 'alertmanager:9093'],
+    ])
+  );
+});
+
+it('keeps the silence dialog and its reason when the alert leaves the list', async () => {
+  const proxy = '/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy';
+  mocks.alertmanagerUrl = proxy;
+  let alerts: unknown[] = [
+    {
+      labels: {
+        alertname: 'KubescapeRuleViolated',
+        rule_name: 'Unexpected process launched',
+        namespace: 'shop',
+        pod_name: 'web-0',
+      },
+      annotations: {},
+      startsAt: '2026-10-30T10:00:00Z',
+      status: { state: 'active' },
+      fingerprint: 'abc',
+    },
+  ];
+  mocks.request.mockImplementation(async (url: string) => {
+    if (url.startsWith(`${proxy}/api/v2/alerts`)) return alerts;
+    if (url.startsWith(`${proxy}/api/v2/silences`)) return [];
+    return { items: [] };
+  });
+  mocks.post.mockImplementation(async (url: string) =>
+    url.includes('selfsubjectaccessreviews') ? { status: { allowed: true } } : { silenceID: 's3' }
+  );
+
+  renderRuntimeDetection();
+  fireEvent.click(await screen.findByRole('button', { name: 'Silence' }));
+  const dialog = screen.getByRole('dialog', { name: 'Silence an alert' });
+  fireEvent.change(within(dialog).getByRole('textbox', { name: /Reason/ }), {
+    target: { value: 'Known behaviour of the migration' },
+  });
+
+  // a refresh no longer has the alert on the page: it ended, or newer alerts took its place
+  alerts = [];
+  const table = screen.getByTestId('table-Time-Rule-Severity-Pod-Workload-Namespace-Message-');
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh', hidden: true }));
+  await waitFor(() => expect(table.querySelectorAll('tbody tr')).toHaveLength(0));
+
+  // the dialog is not part of the row, so it is still there with what was typed
+  expect(screen.getByRole('dialog', { name: 'Silence an alert' })).toBe(dialog);
+  expect(within(dialog).getByRole('textbox', { name: /Reason/ })).toHaveProperty(
+    'value',
+    'Known behaviour of the migration'
+  );
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Silence' }));
+  expect(await screen.findByText(/^Silenced Unexpected process launched for web /)).toBeTruthy();
+  expect(screen.queryByRole('dialog')).toBeNull();
 });
 
 it('shows an alert of the node-agent by severity, workload and finding, with its details', async () => {
@@ -647,7 +876,101 @@ it('shows an alert of the node-agent by severity, workload and finding, with its
 
   // and so does Enter on the rule
   fireEvent.keyDown(screen.getByText('DNS Anomalies in container'), { key: 'Enter' });
-  expect(screen.getByRole('dialog')).toBeTruthy();
+  const reopened = screen.getByRole('dialog');
+  // which looks up the profile and its domains again
+  expect(
+    await within(reopened).findByText('ReplicaSet cert-watch-b576bb668, watcher')
+  ).toBeTruthy();
+  expect(
+    await within(reopened).findByText('2, and _acme-challenge.example.com is not one of them')
+  ).toBeTruthy();
+});
+
+it('describes the rule of an alert when the rules are read after the alerts', async () => {
+  const proxy = '/api/v1/namespaces/monitoring/services/alertmanager:9093/proxy';
+  mocks.alertmanagerUrl = proxy;
+  mocks.request.mockImplementation(async (url: string) =>
+    url.startsWith(`${proxy}/api/v2/alerts`)
+      ? [
+          {
+            labels: {
+              alertname: 'KubescapeRuleViolated',
+              rule_name: 'Unexpected process launched',
+            },
+            annotations: {},
+            startsAt: '2026-10-30T10:00:00Z',
+            status: { state: 'active' },
+            fingerprint: 'abc',
+            cluster: 'cluster-a',
+          },
+        ]
+      : { items: [] }
+  );
+  const { rerender } = renderRuntimeDetection();
+  const rule = await screen.findByText('Unexpected process launched');
+  fireEvent.mouseOver(rule);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  expect(screen.queryByRole('tooltip')).toBeNull();
+
+  // the rules arrive; the alerts stay the same
+  mocks.ruleObjects = [
+    {
+      cluster: 'cluster-a',
+      jsonData: {
+        metadata: { name: 'default-rules', namespace: 'kubescape' },
+        spec: {
+          rules: [
+            {
+              id: 'R0001',
+              name: 'Unexpected process launched',
+              description: 'Detects processes that are not in the baseline',
+            },
+          ],
+        },
+      },
+    },
+  ];
+  rerender(
+    <MemoryRouter>
+      <RuntimeDetection />
+    </MemoryRouter>
+  );
+  fireEvent.mouseOver(screen.getByText('Unexpected process launched'));
+  expect((await screen.findByRole('tooltip')).textContent).toMatch(
+    /^Detects processes that are not in the baseline/
+  );
+});
+
+it('checks whether new Rules objects may be created in the namespace of Kubescape', async () => {
+  // a cluster of its own, as the namespace and the answers are kept per cluster
+  mocks.currentCluster = 'cluster-security';
+  mocks.request.mockImplementation(async (url: string) =>
+    url.startsWith('/api/v1/pods?')
+      ? { items: [{ metadata: { namespace: 'security' } }] }
+      : { items: [] }
+  );
+  mocks.post.mockResolvedValue({ status: { allowed: true } });
+
+  renderRuntimeDetection();
+  fireEvent.click(screen.getByRole('tab', { name: 'Rules' }));
+
+  await waitFor(() =>
+    expect(mocks.post).toHaveBeenCalledWith(
+      '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews',
+      expect.objectContaining({
+        spec: {
+          resourceAttributes: {
+            group: 'kubescape.io',
+            resource: 'rules',
+            verb: 'create',
+            namespace: 'security',
+          },
+        },
+      }),
+      false,
+      { cluster: 'cluster-security' }
+    )
+  );
 });
 
 it('lists and deletes the rule bindings of each selected cluster', async () => {
@@ -718,6 +1041,28 @@ it('deletes a Rules object only after a confirmation that names it', async () =>
   );
 });
 
+it('asks before deleting a Rules object with the rules it holds now', async () => {
+  const rulesObject = (rules: object[]) => ({
+    cluster: 'cluster-a',
+    jsonData: { metadata: { name: 'custom-rules', namespace: 'kubescape' }, spec: { rules } },
+  });
+  mocks.ruleObjects = [rulesObject([{ id: 'R9001' }, { id: 'R9002' }])];
+
+  const { rerender } = renderRuntimeDetection();
+  fireEvent.click(screen.getByRole('tab', { name: 'Rules' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Delete custom-rules' }));
+  expect(screen.getByRole('dialog').textContent).toContain('the 2 rules it holds');
+
+  // the list is watched: a rule was added, which the row that opened the dialog does not have
+  mocks.ruleObjects = [rulesObject([{ id: 'R9001' }, { id: 'R9002' }, { id: 'R9003' }])];
+  rerender(
+    <MemoryRouter>
+      <RuntimeDetection />
+    </MemoryRouter>
+  );
+  expect(screen.getByRole('dialog').textContent).toContain('the 3 rules it holds');
+});
+
 const seccompProfile = {
   metadata: {
     name: 'deployment-web',
@@ -762,6 +1107,42 @@ it('lists the seccomp profiles that Kubescape generated', async () => {
   const row = link.closest('tr')!;
   expect(within(row).getByText('web, sidecar')).toBeTruthy();
   expect(within(row).getByText('1 of 2')).toBeTruthy();
+});
+
+it('lists the seccomp profiles that were read when a namespace could not be', async () => {
+  serveSeccompProfilesFromCrd();
+  mocks.listQuery.mockResolvedValue([seccompProfile]);
+  mocks.namespaceErrors = ['namespace secret: forbidden'];
+
+  renderRuntimeDetection();
+  fireEvent.click(screen.getByRole('tab', { name: 'Seccomp Profiles' }));
+
+  expect(await screen.findByText(/namespace secret: forbidden/)).toBeTruthy();
+  expect(screen.getByText('web', { selector: 'a' })).toBeTruthy();
+});
+
+it('reads the seccomp profiles of the storage with their spec', async () => {
+  mocks.request.mockImplementation(async (url: string) => {
+    if (url === '/apis/spdx.softwarecomposition.kubescape.io/v1beta1') {
+      return { resources: [{ name: 'seccompprofiles' }] };
+    }
+    // the storage only returns the spec of a list that asks for it
+    if (url.includes('/seccompprofiles?')) {
+      return url.includes('resourceVersion=fullSpec')
+        ? { items: [structuredClone(seccompProfile)], metadata: {} }
+        : { items: [{ metadata: seccompProfile.metadata }], metadata: {} };
+    }
+    return { resources: [] };
+  });
+
+  renderRuntimeDetection();
+  fireEvent.click(screen.getByRole('tab', { name: 'Seccomp Profiles' }));
+
+  const link = await screen.findByText('web', { selector: 'a' });
+  const row = link.closest('tr')!;
+  expect(within(row).getByText('web, sidecar')).toBeTruthy();
+  expect(within(row).getByText('1 of 2')).toBeTruthy();
+  expect(mocks.listQuery).not.toHaveBeenCalled();
 });
 
 it('shows how to apply an installed seccomp profile and explains a missing one', async () => {

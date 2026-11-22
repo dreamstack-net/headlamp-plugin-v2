@@ -4,7 +4,7 @@
   Vulnerabilities pages share, so the first search of a session waits for them.
 */
 import { Icon } from '@iconify/react';
-import { Link as HeadlampLink } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
+import { Router } from '@kinvolk/headlamp-plugin/lib';
 import {
   Alert,
   Box,
@@ -15,6 +15,7 @@ import {
   InputAdornment,
   LinearProgress,
   List,
+  ListItem,
   ListItemButton,
   ListItemText,
   ListSubheader,
@@ -24,14 +25,25 @@ import {
   Typography,
 } from '@mui/material';
 import { ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { Link as RouterLink, useHistory } from 'react-router-dom';
 import { KubescapeConfig, kubescapeConfigStore } from '../common/config-store';
+import { errorMessage } from '../common/errors';
 import makeSeverityLabel from '../common/SeverityLabel';
 import { RoutingName, useHLSelectedClusters } from '../index';
+import { queryTaskErrors } from '../query';
 import type { Control } from '../rego/Control';
 import { fetchRegoData } from '../rego/RegoDataProvider';
 import type { WorkloadScan } from '../vulnerabilities/scanData';
-import { readVulnerabilityScans } from '../vulnerabilities/Vulnerabilities';
-import { buildVulnerabilityIndex, minimumQueryLength, search, SearchGroup } from './searchIndex';
+import { readVulnerabilityScans, vulnerabilityContext } from '../vulnerabilities/Vulnerabilities';
+import {
+  buildVulnerabilityIndex,
+  minimumQueryLength,
+  search,
+  SearchGroup,
+  SearchResults,
+} from './searchIndex';
+
+const { createRouteURL } = Router;
 
 const searchHint = 'CVE, package, image, workload or control';
 
@@ -50,55 +62,75 @@ export function KubescapeSearchButton() {
   );
 }
 
+/** Where a result leads: a route of the plugin, in the cluster of the result if it has one. */
 interface Target {
   routeName: string;
   params: Record<string, string>;
   activeCluster?: string;
 }
 
-function ResultGroup<T>(
-  props: Readonly<{
-    title: string;
-    group: SearchGroup<T>;
-    render: (item: T) => { key: string; primary: ReactNode; secondary: ReactNode; target: Target };
-    onOpen: () => void;
-    firstLink?: React.MutableRefObject<HTMLElement | null>;
-  }>
-) {
-  const { title, group, render, onOpen, firstLink } = props;
-  if (group.total === 0) return null;
+/**
+ * The address of a result. Like Headlamp's links, the cluster of the result comes first and the
+ * other selected clusters stay selected; without one, the route stays in the clusters shown.
+ */
+function targetURL(target: Target, selectedClusters: string[]): string {
+  const params = { ...target.params };
+  if (target.activeCluster) {
+    params.cluster = [
+      target.activeCluster,
+      ...selectedClusters.filter(cluster => cluster !== target.activeCluster),
+    ].join('+');
+  }
+  return createRouteURL(target.routeName, params);
+}
+
+interface ResultRow {
+  key: string;
+  primary: ReactNode;
+  secondary: ReactNode;
+  // the page of the result; none outside of a cluster, where Headlamp has no address for the
+  // pages of the plugin: createRouteURL then gives its home page
+  url?: string;
+}
+
+interface ResultSection {
+  title: string;
+  total: number;
+  rows: ResultRow[];
+}
+
+function ResultGroup(props: Readonly<{ section: ResultSection; onOpen: () => void }>) {
+  const { section, onOpen } = props;
+  if (section.total === 0) return null;
   return (
     <>
       <ListSubheader disableSticky>
-        {title} ({group.total})
+        {section.title} ({section.total})
       </ListSubheader>
-      {group.items.map((item, index) => {
-        const { key, primary, secondary, target } = render(item);
-        return (
-          <ListItemButton
-            key={key}
-            component={HeadlampLink as any}
-            {...({
-              routeName: target.routeName,
-              params: target.params,
-              activeCluster: target.activeCluster,
-              role: 'link',
-            } as any)}
-            ref={index === 0 && firstLink ? firstLink : undefined}
-            onClick={onOpen}
-            dense
-          >
-            <ListItemText
-              primary={primary}
-              secondary={secondary}
-              secondaryTypographyProps={{ noWrap: true }}
-            />
+      {section.rows.map(({ key, primary, secondary, url }) => {
+        const text = (
+          <ListItemText
+            primary={primary}
+            secondary={secondary}
+            secondaryTypographyProps={{ noWrap: true }}
+          />
+        );
+        return url ? (
+          // a link of the router, which closes the search before it navigates; Headlamp's own
+          // link takes neither a ref nor the click handler of its caller
+          <ListItemButton key={key} component={RouterLink} to={url} onClick={onOpen} dense>
+            {text}
           </ListItemButton>
+        ) : (
+          // a result without a page to open is no link
+          <ListItem key={key} dense>
+            {text}
+          </ListItem>
         );
       })}
-      {group.total > group.items.length && (
+      {section.total > section.rows.length && (
         <Typography variant="body2" color="text.secondary" sx={{ px: 2, pb: 1 }}>
-          {group.total - group.items.length} more: type more of the name to narrow them down.
+          {section.total - section.rows.length} more: type more of the name to narrow them down.
         </Typography>
       )}
     </>
@@ -119,8 +151,7 @@ export function KubescapeSearchDialog(props: Readonly<{ onClose: () => void }>) 
   const [progress, setProgress] = useState('');
   const [error, setError] = useState('');
   const [controls, setControls] = useState<Control[]>([]);
-  const continueReading = useRef(true);
-  const firstLink = useRef<HTMLElement | null>(null);
+  const history = useHistory();
   // the search was opened to type in it; the dialog renders its content after it mounts
   const focused = useRef(false);
   const focusOnce = (element: HTMLInputElement | null) => {
@@ -131,25 +162,39 @@ export function KubescapeSearchDialog(props: Readonly<{ onClose: () => void }>) 
   };
 
   useEffect(() => {
+    let active = true;
     fetchRegoData()
-      .then(data => setControls(data.controls))
-      .catch(() => setControls([]));
+      .then(data => active && setControls(data.controls))
+      .catch(() => active && setControls([]));
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
     if (clusters.length === 0) return;
-    continueReading.current = true;
+    let active = true;
+    // each read has its own flag, so the read for the clusters selected before stops
+    const continueReading = { current: true };
     readVulnerabilityScans(
       clusters,
       (kubescapeConfigStore.get() ?? {}) as KubescapeConfig,
       continueReading,
-      setLoading,
-      setProgress
+      loading => active && setLoading(loading),
+      message => active && setProgress(message)
     )
-      .then(setScans)
-      .catch(err => setError(err?.message ?? String(err)));
+      .then(found => {
+        if (!active) return;
+        setScans(found);
+        const errors = queryTaskErrors(vulnerabilityContext.queryTasks);
+        if (errors.length > 0) {
+          setError(errors.map(({ cluster, message }) => `${cluster}: ${message}`).join('; '));
+        }
+      })
+      .catch(err => active && setError(errorMessage(err)));
     // a closed search stops reading; the next one continues where it stopped
     return () => {
+      active = false;
       continueReading.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -157,9 +202,20 @@ export function KubescapeSearchDialog(props: Readonly<{ onClose: () => void }>) 
 
   const index = useMemo(() => (scans ? buildVulnerabilityIndex(scans) : null), [scans]);
   const results = useMemo(() => search(index, controls, query), [index, controls, query]);
-  const found =
-    results &&
-    results.cves.total + results.images.total + results.workloads.total + results.controls.total;
+  const sections = useMemo(
+    () => (results ? resultSections(results, clusters) : []),
+    // clusterKey covers clusters, which is a new array on every render
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [results, clusterKey]
+  );
+  const found = sections.reduce((count, section) => count + section.total, 0);
+  // what Enter opens, when it has a page
+  const firstResult = sections.find(section => section.rows.length > 0)?.rows[0];
+
+  const open = (url: string) => {
+    onClose();
+    history.push(url);
+  };
 
   return (
     <Dialog open onClose={onClose} fullWidth maxWidth="md" aria-labelledby="kubescape-search-title">
@@ -172,7 +228,10 @@ export function KubescapeSearchDialog(props: Readonly<{ onClose: () => void }>) 
           value={query}
           onChange={event => setQuery(event.target.value)}
           onKeyDown={event => {
-            if (event.key === 'Enter') firstLink.current?.click();
+            if (event.key === 'Enter' && firstResult?.url) {
+              event.preventDefault();
+              open(firstResult.url);
+            }
           }}
           inputProps={{ 'aria-label': 'Search Kubescape' }}
           InputProps={{
@@ -215,98 +274,92 @@ export function KubescapeSearchDialog(props: Readonly<{ onClose: () => void }>) 
           </Typography>
         ) : (
           <List dense sx={{ mt: 1 }}>
-            <ResultGroup
-              title="CVEs"
-              group={results.cves}
-              firstLink={firstLink}
-              onOpen={onClose}
-              render={cve => ({
-                key: cve.id,
-                primary: (
-                  <Stack direction="row" spacing={1} alignItems="center" component="span">
-                    <span>{cve.id}</span>
-                    {makeSeverityLabel(cve.severity)}
-                  </Stack>
-                ),
-                secondary: [
-                  cve.packages.slice(0, 3).join(', ') +
-                    (cve.packages.length > 3 ? ` and ${cve.packages.length - 3} more` : ''),
-                  plural(cve.images, 'image'),
-                  plural(cve.workloads, 'workload'),
-                  cve.aliases.length > 0 ? `also ${cve.aliases.join(', ')}` : '',
-                  clusters.length > 1 ? cve.clusters.join(', ') : '',
-                ]
-                  .filter(Boolean)
-                  .join(' · '),
-                target: { routeName: RoutingName.KubescapeCVEResults, params: { cve: cve.id } },
-              })}
-            />
-            <ResultGroup
-              title="Images"
-              group={results.images}
-              firstLink={results.cves.total === 0 ? firstLink : undefined}
-              onOpen={onClose}
-              render={image => ({
-                key: `${image.cluster}/${image.namespace}/${image.manifestName}`,
-                primary: image.image,
-                secondary: [
-                  `${image.critical} critical, ${image.high} high`,
-                  plural(image.workloads, 'workload'),
-                  clusters.length > 1 ? image.cluster : '',
-                ]
-                  .filter(Boolean)
-                  .join(' · '),
-                target: {
-                  routeName: RoutingName.ImageVulnerabilityDetails,
-                  params: { namespace: image.namespace, name: image.manifestName },
-                  activeCluster: image.cluster,
-                },
-              })}
-            />
-            <ResultGroup
-              title="Workloads"
-              group={results.workloads}
-              firstLink={results.cves.total + results.images.total === 0 ? firstLink : undefined}
-              onOpen={onClose}
-              render={workload => ({
-                key: `${workload.cluster}/${workload.namespace}/${workload.manifestName}`,
-                primary: `${workload.name} / ${workload.container}`,
-                secondary: [
-                  workload.kind,
-                  workload.namespace,
-                  clusters.length > 1 ? workload.cluster : '',
-                ]
-                  .filter(Boolean)
-                  .join(' · '),
-                target: {
-                  routeName: RoutingName.KubescapeVulnerabilityDetails,
-                  params: { namespace: workload.namespace, name: workload.manifestName },
-                  activeCluster: workload.cluster,
-                },
-              })}
-            />
-            <ResultGroup
-              title="Controls"
-              group={results.controls}
-              firstLink={
-                results.cves.total + results.images.total + results.workloads.total === 0
-                  ? firstLink
-                  : undefined
-              }
-              onOpen={onClose}
-              render={control => ({
-                key: control.controlID,
-                primary: `${control.controlID} ${control.name}`,
-                secondary: control.description,
-                target: {
-                  routeName: RoutingName.KubescapeControlResults,
-                  params: { control: control.controlID },
-                },
-              })}
-            />
+            {sections.map(section => (
+              <ResultGroup key={section.title} section={section} onOpen={onClose} />
+            ))}
           </List>
         )}
       </DialogContent>
     </Dialog>
   );
+}
+
+/**
+ * The results by group, with the address each one opens. Outside of a cluster, where only the
+ * controls are found, the results have no address: their pages are pages of a cluster.
+ */
+function resultSections(results: SearchResults, clusters: string[]): ResultSection[] {
+  const severalClusters = clusters.length > 1;
+  const section = <T,>(
+    title: string,
+    group: SearchGroup<T>,
+    row: (item: T) => Omit<ResultRow, 'url'> & { target: Target }
+  ): ResultSection => ({
+    title,
+    total: group.total,
+    rows: group.items.map(item => {
+      const { target, ...rest } = row(item);
+      return { ...rest, url: clusters.length > 0 ? targetURL(target, clusters) : undefined };
+    }),
+  });
+
+  return [
+    section('CVEs', results.cves, cve => ({
+      key: cve.id,
+      primary: (
+        <Stack direction="row" spacing={1} alignItems="center" component="span">
+          <span>{cve.id}</span>
+          {makeSeverityLabel(cve.severity)}
+        </Stack>
+      ),
+      secondary: [
+        cve.packages.slice(0, 3).join(', ') +
+          (cve.packages.length > 3 ? ` and ${cve.packages.length - 3} more` : ''),
+        plural(cve.images, 'image'),
+        plural(cve.workloads, 'workload'),
+        cve.aliases.length > 0 ? `also ${cve.aliases.join(', ')}` : '',
+        severalClusters ? cve.clusters.join(', ') : '',
+      ]
+        .filter(Boolean)
+        .join(' · '),
+      target: { routeName: RoutingName.KubescapeCVEResults, params: { cve: cve.id } },
+    })),
+    section('Images', results.images, image => ({
+      key: `${image.cluster}/${image.namespace}/${image.manifestName}`,
+      primary: image.image,
+      secondary: [
+        `${image.critical} critical, ${image.high} high`,
+        plural(image.workloads, 'workload'),
+        severalClusters ? image.cluster : '',
+      ]
+        .filter(Boolean)
+        .join(' · '),
+      target: {
+        routeName: RoutingName.ImageVulnerabilityDetails,
+        params: { namespace: image.namespace, name: image.manifestName },
+        activeCluster: image.cluster,
+      },
+    })),
+    section('Workloads', results.workloads, workload => ({
+      key: `${workload.cluster}/${workload.namespace}/${workload.manifestName}`,
+      primary: `${workload.name} / ${workload.container}`,
+      secondary: [workload.kind, workload.namespace, severalClusters ? workload.cluster : '']
+        .filter(Boolean)
+        .join(' · '),
+      target: {
+        routeName: RoutingName.KubescapeVulnerabilityDetails,
+        params: { namespace: workload.namespace, name: workload.manifestName },
+        activeCluster: workload.cluster,
+      },
+    })),
+    section('Controls', results.controls, control => ({
+      key: control.controlID,
+      primary: `${control.controlID} ${control.name}`,
+      secondary: control.description,
+      target: {
+        routeName: RoutingName.KubescapeControlResults,
+        params: { control: control.controlID },
+      },
+    })),
+  ];
 }

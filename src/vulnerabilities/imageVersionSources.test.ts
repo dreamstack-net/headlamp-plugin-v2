@@ -7,7 +7,11 @@ import {
   lookupImageVersion,
   parseVersionCheckerMetrics,
   possiblyPrivatePermit,
+  preferNewLookups,
   purlKey,
+  shieldsKnowsImage,
+  stopEndOfLifeLookups,
+  stopImageVersionLookups,
   stopPossiblyPrivateLookups,
   versionCheckerResults,
 } from './imageVersionSources';
@@ -301,6 +305,77 @@ describe('lookupImageVersion', () => {
     expect(requestedAt('https://img.shields.io')).toEqual([]);
   });
 
+  it('asks nothing more about public images once the newest versions are switched off', async () => {
+    let answer!: () => void;
+    const answered = new Promise<void>(resolve => (answer = resolve));
+    const repositories = [1, 2, 3, 4, 5, 6, 7].map(n => `team/app${n}`);
+    for (const repository of repositories) {
+      answers[quay(repository)] = async () => {
+        await answered;
+        return new Response(
+          JSON.stringify({
+            tags: [{ name: 'v1.4.0' }, { name: 'v1.2.0' }],
+            // the first repository has a second page of tags
+            has_additional: repository === 'team/app1',
+          })
+        );
+      };
+    }
+    const lookups = repositories.map(repository =>
+      lookupImageVersion(`quay.io/${repository}:v1.2.0`, { endOfLife: false })
+    );
+    await new Promise(resolve => setTimeout(resolve, 10));
+    // four requests at a time, so the others wait their turn
+    const sent = requestedAt('https://quay.io');
+    expect(sent).toHaveLength(4);
+
+    // what the settings do when the newest versions are switched off
+    stopImageVersionLookups();
+    answer();
+    const found = await Promise.all(lookups);
+    // neither the requests that waited nor the second page of a lookup that was under way
+    expect(requestedAt('https://quay.io')).toEqual(sent);
+    expect(found.filter(version => version.latest)).toHaveLength(3);
+
+    // a stopped lookup is not kept as a failure, so it is asked again once the setting is on
+    for (const repository of ['team/app1', 'team/app7']) {
+      answers[quay(repository)] = { tags: [{ name: 'v1.4.0' }, { name: 'v1.2.0' }] };
+      const again = await lookupImageVersion(`quay.io/${repository}:v1.2.0`, { endOfLife: false });
+      expect(again.latest?.latest).toBe('v1.4.0');
+    }
+  });
+
+  it('asks endoflife.date nothing more once the end of life is switched off', async () => {
+    let answer!: () => void;
+    const answered = new Promise<void>(resolve => (answer = resolve));
+    answers[products] = async () => {
+      await answered;
+      return new Response(JSON.stringify({ result: [{ name: 'redis', aliases: [] }] }));
+    };
+    answers[endOfLife('redis')] = redisReleases;
+    answers[quay('team/redis')] = { tags: [{ name: '7.0.15' }, { name: '7.0.12' }] };
+    const lookup = lookupImageVersion('quay.io/team/redis:7.0.12');
+    await vi.waitFor(() => expect(requested()).toContain(products));
+
+    // what the settings do when the end of life is switched off, while its list of products
+    // is read
+    stopEndOfLifeLookups();
+    answer();
+    // the newest version is still looked up, the product is not asked about
+    expect(await lookup).toEqual({
+      latest: {
+        latest: '7.0.15',
+        source: { name: 'Quay', url: 'https://quay.io/repository/team/redis?tab=tags' },
+      },
+      line: undefined,
+    });
+    expect(requested()).not.toContain(endOfLife('redis'));
+
+    // it is asked about once the end of life is switched on again
+    expect((await lookupImageVersion('quay.io/team/redis:7.0.12')).line?.name).toBe('7.0');
+    expect(requested()).toContain(endOfLife('redis'));
+  });
+
   it('reads the release line and the newest release of a well-known product', async () => {
     // redis is named by the image list of endoflife.date
     answers[identifiers] = {
@@ -423,6 +498,71 @@ describe('lookupImageVersion', () => {
     expect(operator.latest?.latest).toBe('3.2.0');
   });
 
+  it('does not take an error of shields.io as knowing the image', async () => {
+    const source = 'https://github.com/team/secret-app';
+    const errors = ['rate limited by upstream service', 'inaccessible', 'no tags found'];
+    for (const [i, value] of errors.entries()) {
+      // a repository each, as the answer about a repository is kept
+      answers[shields(`team/app${i}`)] = { label: 'version', value };
+      await lookupImageVersion(`team/app${i}:1.2.0`, {
+        source,
+        possiblyPrivate: possiblyPrivatePermit(),
+      });
+    }
+    expect(requestedAt('https://img.shields.io')).toHaveLength(3);
+    expect(requested()).not.toContain(jsdelivr('team/secret-app'));
+    expect(shieldsKnowsImage('v1.4.0')).toBe(true);
+    expect(shieldsKnowsImage('2026.2.1')).toBe(true);
+    expect(shieldsKnowsImage('invalid response data')).toBe(true);
+    expect(shieldsKnowsImage('repository or tag not found')).toBe(false);
+    expect(shieldsKnowsImage(null)).toBe(false);
+  });
+
+  it('asks shields.io again after an hour when it could not ask Docker Hub', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const stored = () =>
+      Array.from({ length: window.localStorage.length }, (_, i) => window.localStorage.key(i)!);
+    const answerOfTheDay = (key: string) => key.includes('latest|docker.io/team/app:1.2.0');
+    const possiblyPrivate = { possiblyPrivate: possiblyPrivatePermit() };
+    for (const value of ['rate limited by upstream service', 'inaccessible']) {
+      clearVersionCache();
+      fetchMock.mockClear();
+      answers[shields('team/app')] = { label: 'version', value };
+      expect(await lookupImageVersion('team/app:1.2.0', possiblyPrivate)).toEqual({});
+      // a failure: not asked again at once, and not kept as the answer of the day
+      answers[shields('team/app')] = { label: 'version', value: 'v1.4.0' };
+      expect(await lookupImageVersion('team/app:1.2.0', possiblyPrivate)).toEqual({});
+      expect(requestedAt('https://img.shields.io')).toHaveLength(1);
+      expect(stored().some(answerOfTheDay)).toBe(false);
+    }
+
+    clock.mockReturnValue(now + 3600 * 1000 + 1);
+    expect((await lookupImageVersion('team/app:1.2.0', possiblyPrivate)).latest?.latest).toBe(
+      '1.4.0'
+    );
+    expect(stored().some(answerOfTheDay)).toBe(true);
+  });
+
+  it('never asks about the project in the labels of an image with a tag that Docker does not build', async () => {
+    answers[officialImage('redis')] = text(
+      ['Tags: 7.2.4, 7.2, 7, latest', 'Tags: 7.2.4-alpine, 7.2-alpine, alpine'].join('\n')
+    );
+    answers[jsdelivr('corp/redis-fork')] = { versions: [{ version: '9.0.0' }] };
+    const source = 'https://github.com/corp/redis-fork';
+    // an image named like an official one that is built locally, or comes from a mirror with
+    // builds of its own: its labels are not those of a public image
+    expect(await lookupImageVersion('redis:7.2.4-corp1', { source })).toEqual({});
+    expect(await lookupImageVersion('docker.io/library/redis:7.2.4-corp1', { source })).toEqual({});
+    // an older tag has the official tags for its newest version, which needs no project
+    expect((await lookupImageVersion('redis:6.0.1', { source })).latest).toEqual({
+      latest: '7.2.4',
+      source: { name: 'Docker Hub', url: 'https://hub.docker.com/_/redis/tags' },
+    });
+    expect(requested()).toContain(officialImage('redis'));
+    expect(requestedAt('https://data.jsdelivr.com')).toEqual([officialNames]);
+  });
+
   it('never asks about the project that the labels of a private image name', async () => {
     const source = 'https://github.com/team/secret-app';
     await lookupImageVersion('registry.example.com/team/app:1.2.0', { source });
@@ -508,6 +648,44 @@ describe('lookupImageVersion', () => {
     );
     expect(found.map(version => version.latest?.latest)).toEqual(Array(8).fill('v1.0.0'));
     expect(most).toBe(4);
+  });
+
+  it('serves the lookups of the view that opened last before those of earlier views', async () => {
+    const started: string[] = [];
+    const release: Array<() => void> = [];
+    const slow = (name: string) => async () => {
+      started.push(name);
+      await new Promise<void>(resolve => release.push(resolve));
+      return new Response('{"tags":[{"name":"v1.0.0"}]}');
+    };
+    for (const name of ['busy0', 'busy1', 'busy2', 'busy3', 'old0', 'old1', 'new0']) {
+      answers[quay(`team/${name}`)] = slow(name);
+    }
+    // a page that was left: four requests run and two wait
+    const earlier = ['busy0', 'busy1', 'busy2', 'busy3', 'old0', 'old1'].map(name =>
+      lookupImageVersion(`quay.io/team/${name}:v1.0.0`)
+    );
+    await vi.waitFor(() => expect(started).toHaveLength(4));
+    // the page that opens now
+    preferNewLookups();
+    const latest = lookupImageVersion('quay.io/team/new0:v1.0.0');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    release.shift()!();
+    await vi.waitFor(() => expect(started).toHaveLength(5));
+    expect(started[4]).toBe('new0');
+
+    // the earlier lookups still finish
+    let done = false;
+    const all = Promise.all([...earlier, latest]).then(() => {
+      done = true;
+    });
+    while (!done) {
+      release.shift()?.();
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    await all;
+    expect(started.slice(5).sort()).toEqual(['old0', 'old1']);
   });
 });
 

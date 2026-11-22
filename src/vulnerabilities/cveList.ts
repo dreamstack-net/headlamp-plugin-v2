@@ -1,7 +1,7 @@
 /*
   The CVEs of the scanned images, with the workloads and images they are found in.
 */
-import type { ImageScan, WorkloadScan } from './scanData';
+import { type ImageScan, ofSeveralClusters, workloadLabel, type WorkloadScan } from './scanData';
 
 export interface CVEScan {
   CVE: string;
@@ -11,6 +11,8 @@ export interface CVEScan {
   workloads: Set<string>;
   images: Set<string>;
   artifacts: Set<string>;
+  // the ids of the related vulnerabilities of its findings, such as the CVE of a GHSA
+  relatedIds: Set<string>;
   fixed: boolean;
   relevant: boolean | undefined;
 }
@@ -33,10 +35,11 @@ export function getCVEList(workloadScans: WorkloadScan[]): CVEScan[] {
     return ids;
   };
 
+  const withCluster = ofSeveralClusters(workloadScans);
   for (const workloadScan of workloadScans) {
     const imageScan = workloadScan.imageScan;
     if (!imageScan?.matches) continue;
-    const workload = workloadScan.name + '/' + workloadScan.container;
+    const workload = workloadLabel(workloadScan, withCluster);
     const relevantIds = workloadScan.relevant?.matches
       ? relevantIdsOf(workloadScan.relevant)
       : undefined;
@@ -49,10 +52,11 @@ export function getCVEList(workloadScans: WorkloadScan[]): CVEScan[] {
           CVE: id,
           description: match.vulnerability.description,
           severity: match.vulnerability.severity,
-          baseScore: match.vulnerability.cvss ? match.vulnerability.cvss[0].metrics.baseScore : 0,
+          baseScore: match.vulnerability.cvss?.[0]?.metrics?.baseScore ?? 0,
           workloads: new Set<string>(),
           images: new Set<string>(),
           artifacts: new Set<string>(),
+          relatedIds: new Set<string>(),
           fixed: false,
           relevant: undefined,
         };
@@ -69,7 +73,11 @@ export function getCVEList(workloadScans: WorkloadScan[]): CVEScan[] {
       cve.workloads.add(workload);
       cve.images.add(imageScan.imageName);
       cve.artifacts.add(match.artifact.name + ' ' + match.artifact.version);
-      cve.fixed = cve.fixed || !!match.vulnerability.fix?.versions;
+      for (const related of match.relatedVulnerabilities ?? []) {
+        if (related?.id && related.id !== id) cve.relatedIds.add(related.id);
+      }
+      // not-fixed findings also carry a list of versions, which is empty
+      cve.fixed = cve.fixed || match.vulnerability.fix?.state === 'fixed';
       if (relevantIds) cve.relevant = cve.relevant || relevantIds.has(id);
     }
   }

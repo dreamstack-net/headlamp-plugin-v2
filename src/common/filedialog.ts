@@ -1,3 +1,5 @@
+import { errorMessage, errorName } from './errors';
+
 declare global {
   interface Window {
     showSaveFilePicker: any;
@@ -34,9 +36,9 @@ export const saveToFile = async (
     let fileHandle: FileSystemFileHandle;
     try {
       fileHandle = await window.showSaveFilePicker({ suggestedName: defaultFileName });
-    } catch (error: any) {
+    } catch (error) {
       // the user closed the dialog
-      if (error?.name === 'AbortError') return null;
+      if (errorName(error) === 'AbortError') return null;
       console.error('Error selecting a file:', error);
       download(blob, defaultFileName);
       return null;
@@ -47,10 +49,10 @@ export const saveToFile = async (
       await writable.write(blob);
       await writable.close();
       enqueueSnackbar(`${fileHandle.name} saved successfully`, { variant: 'success' });
-    } catch (error: any) {
+    } catch (error) {
       console.error('Error writing the file:', error);
       enqueueSnackbar(
-        `Unable to write ${fileHandle.name}: ${error?.message ?? error}. Downloading it instead.`,
+        `Unable to write ${fileHandle.name}: ${errorMessage(error)}. Downloading it instead.`,
         { variant: 'warning' }
       );
       download(blob, defaultFileName);

@@ -165,6 +165,20 @@ describe('matchAlertProfile', () => {
       matchAlertProfile([current, webhook], { ...target, container: 'sidecar' })
     ).toBeUndefined();
   });
+
+  it('does not take a profile without a workload for an alert without one', () => {
+    // a profile that someone wrote, without the labels of Kubescape
+    const unlabelled = profile('custom-profile', '', {});
+    expect(
+      matchAlertProfile([unlabelled], { versionNames: [], workload: undefined })
+    ).toBeUndefined();
+    expect(
+      matchAlertProfile([unlabelled, previous], {
+        versionNames: [],
+        workload: 'external-secrets-operator',
+      })
+    ).toEqual({ profile: previous, ofPodVersion: false });
+  });
 });
 
 describe('findAlertProfile', () => {
@@ -271,6 +285,30 @@ describe('learned domains', () => {
     });
     expect(compareDomain('pypi.org', proxyDomains).learned).toBe(true);
     expect(compareDomain('cdn.example.com', ['*.example.com']).learned).toBe(true);
+  });
+
+  it('matches the wildcards of a profile label by label, as the node-agent does', () => {
+    const learned = (domain: string, ...entries: string[]) =>
+      compareDomain(domain, entries).learned;
+    // a leading * is one label
+    expect(learned('CDN.Example.com.', '*.example.com')).toBe(true);
+    // names of either side are compared without case, as splitDNS in go/rules/match.go does
+    expect(learned('cdn.example.com', '*.EXAMPLE.com')).toBe(true);
+    expect(learned('api.example.com', 'API.Example.COM.')).toBe(true);
+    expect(learned('a.cdn.example.com', '*.example.com')).toBe(false);
+    expect(learned('example.com', '*.example.com')).toBe(false);
+    // a last * is one label or more
+    expect(learned('api.example.com', 'api.example.*')).toBe(true);
+    expect(learned('api.example.co.uk', 'api.example.*')).toBe(true);
+    expect(learned('api.example', 'api.example.*')).toBe(false);
+    // ⋯ is one label anywhere
+    expect(learned('eu.api.example.com', '⋯.api.example.com', 'other.org')).toBe(true);
+    expect(learned('api.example.com', 'api.⋯.com')).toBe(true);
+    expect(learned('api.example.com', 'api.⋯')).toBe(false);
+    // a * alone, a ** and an empty label match nothing
+    expect(learned('example', '*')).toBe(false);
+    expect(learned('api.example.com', '**.example.com')).toBe(false);
+    expect(learned('api.example.com', 'api..com')).toBe(false);
   });
 
   it('knows the registered domain of a name', () => {

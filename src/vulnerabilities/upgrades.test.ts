@@ -55,7 +55,7 @@ it('groups fixable CVEs by package with the version that fixes all of them', () 
   ]);
   expect(countBySeverity(upgrades[0], 'Critical')).toBe(1);
   expect(countBySeverity(upgrades[0], 'High')).toBe(1);
-  expect(upgrades[0].workloads).toEqual(['workload/app']);
+  expect(upgrades[0].workloads).toEqual(['workloads/workload/app']);
 });
 
 it('uses the fix for the installed release line when several are listed', () => {
@@ -122,4 +122,16 @@ it('orders images by the most critical CVEs their upgrades fix', () => {
     'other:1.0',
     'example:latest',
   ]);
+});
+
+it('counts a CVE as relevant only in the packages the relevant report has it in', () => {
+  const findings = [
+    finding('CVE-1', 'High', 'busybox', '1.37.0', ['1.37.1']),
+    finding('CVE-1', 'High', 'busybox-binsh', '1.37.0', ['1.37.1']),
+  ];
+  const [scan] = workloadWith(findings, ['CVE-1']);
+  // the workload was only seen to use busybox
+  scan.relevant!.matches = [findings[0]];
+
+  expect(getPackageUpgrades([scan], true).map(u => u.packageName)).toEqual(['busybox']);
 });

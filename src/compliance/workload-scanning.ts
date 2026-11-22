@@ -1,3 +1,4 @@
+import { patternMatches } from '../exceptions/patterns';
 import { Control, FrameWork } from '../rego';
 import { WorkloadConfigurationScanSummary } from '../softwarecomposition/WorkloadConfigurationScanSummary';
 
@@ -21,15 +22,45 @@ interface ScanIndex {
   failed: number;
 }
 
+/** The marks of a control result that say which exceptions cover it. */
+export interface ExceptedMarks {
+  // an exception covers the result in every framework
+  exceptedByPolicy: boolean;
+  // the frameworks, as the exception entries that cover the result in that framework only name
+  // them: names or patterns
+  exceptedInFrameworks?: string[];
+}
+
+/**
+ * Whether an exception covers a control result where the control is checked as part of the
+ * named framework. Like in Kubescape, an exception entry limited to a framework only applies in
+ * that framework, which it names without case or as a pattern of the whole name (opa-utils'
+ * `regexCompareI`); the combined view of all controls is not one.
+ */
+export function isControlExcepted(control: ExceptedMarks, frameworkName?: string): boolean {
+  if (control.exceptedByPolicy) return true;
+  if (!frameworkName || !control.exceptedInFrameworks) return false;
+  const name = frameworkName.toLowerCase();
+  return control.exceptedInFrameworks.some(
+    framework => framework.toLowerCase() === name || patternMatches(framework, frameworkName, true)
+  );
+}
+
 // The pages ask for the results of every control, of every framework, on every render. Each
-// set of scans is indexed once, so asking is a lookup instead of a pass over all scans.
-const indexes = new WeakMap<WorkloadConfigurationScanSummary[], ScanIndex>();
+// set of scans is indexed once per framework, so asking is a lookup instead of a pass over all
+// scans. While no exception is limited to a framework, all frameworks share one index.
+const indexes = new WeakMap<WorkloadConfigurationScanSummary[], Map<string, ScanIndex>>();
 // Applying exceptions changes the scans in place, which makes the indexes outdated
 let exceptionsVersion = 0;
+let frameworkLimitedMarks = false;
 
-/** To call after the excepted marks of scans changed. */
-export function invalidateControlStats() {
+/**
+ * To call after the excepted marks of scans changed, saying whether a mark is limited to
+ * frameworks (`exceptedInFrameworks`).
+ */
+export function invalidateControlStats(frameworkLimited = false) {
   exceptionsVersion++;
+  if (frameworkLimited) frameworkLimitedMarks = true;
 }
 
 function statsOf(controls: Map<string, ControlStats>, controlID: string): ControlStats {
@@ -47,8 +78,17 @@ function statsOf(controls: Map<string, ControlStats>, controlID: string): Contro
   return stats;
 }
 
-function indexScans(workloadScanData: WorkloadConfigurationScanSummary[]): ScanIndex {
-  const cached = indexes.get(workloadScanData);
+function indexScans(
+  workloadScanData: WorkloadConfigurationScanSummary[],
+  frameworkName?: string
+): ScanIndex {
+  const key = frameworkLimitedMarks ? frameworkName?.toLowerCase() ?? '' : '';
+  let perFramework = indexes.get(workloadScanData);
+  if (!perFramework) {
+    perFramework = new Map();
+    indexes.set(workloadScanData, perFramework);
+  }
+  const cached = perFramework.get(key);
   if (cached && cached.version === exceptionsVersion) return cached;
 
   const controls = new Map<string, ControlStats>();
@@ -59,14 +99,12 @@ function indexScans(workloadScanData: WorkloadConfigurationScanSummary[]): ScanI
     for (const scan of Object.values(w.spec.controls)) {
       const stats = statsOf(controls, scan.controlID);
       const status = scan.status.status;
-      const ok =
-        w.exceptedByPolicy ||
-        scan.exceptedByPolicy ||
-        status === WorkloadConfigurationScanSummary.Status.Passed;
+      const excepted = w.exceptedByPolicy || isControlExcepted(scan, frameworkName);
+      const ok = excepted || status === WorkloadConfigurationScanSummary.Status.Passed;
       passedOrExcluded.set(scan.controlID, (passedOrExcluded.get(scan.controlID) ?? false) || ok);
 
       if (status === 'failed') stats.hasFailed = true;
-      if (w.exceptedByPolicy || scan.exceptedByPolicy) {
+      if (excepted) {
         stats.excluded++;
       } else {
         stats.byStatus.set(status, (stats.byStatus.get(status) ?? 0) + 1);
@@ -81,23 +119,30 @@ function indexScans(workloadScanData: WorkloadConfigurationScanSummary[]): ScanI
   }
 
   const index = { version: exceptionsVersion, controls, failed };
-  indexes.set(workloadScanData, index);
+  perFramework.set(key, index);
   return index;
 }
 
-function controlStats(workloadScanData: WorkloadConfigurationScanSummary[], control: Control) {
-  return indexScans(workloadScanData).controls.get(control.controlID);
+function controlStats(
+  workloadScanData: WorkloadConfigurationScanSummary[],
+  control: Control,
+  frameworkName?: string
+) {
+  return indexScans(workloadScanData, frameworkName).controls.get(control.controlID);
 }
 
 // The framework compliance score provides an overall assessment of your cluster's compliance with a specific framework.
 // It is calculated by averaging the Control Compliance Scores of all controls within the framework.
 // https://kubescape.io/docs/frameworks-and-controls/frameworks/
+// A framework without controls, such as a custom framework whose controls are not known, fails
+// nothing and scores 100, like a control that checked no workload.
 export function frameworkComplianceScore(
   workloadScanData: WorkloadConfigurationScanSummary[],
   framework: FrameWork
 ) {
+  if (framework.controls.length === 0) return 100;
   const controlComplianceScores = framework.controls.map(control =>
-    controlComplianceScore(workloadScanData, control)
+    controlComplianceScore(workloadScanData, control, framework.name)
   );
 
   return controlComplianceScores.reduce((a, b) => a + b, 0) / controlComplianceScores.length;
@@ -113,13 +158,19 @@ export function frameworkComplianceScore(
  *
  * @param {WorkloadConfigurationScanSummary[]} workloadScanData - The list of scans to calculate the score for.
  * @param {Control} control - The control to calculate the score for.
+ * @param {string} frameworkName - The framework the control is checked in, for the exceptions limited to it.
  * @returns {number} The compliance score for the control, as a percentage.
  */
 export function controlComplianceScore(
   workloadScanData: WorkloadConfigurationScanSummary[],
-  control: Control
+  control: Control,
+  frameworkName?: string
 ) {
-  const [passedCount, workloadsAffected] = passedOrExcludedCount(workloadScanData, control);
+  const [passedCount, workloadsAffected] = passedOrExcludedCount(
+    workloadScanData,
+    control,
+    frameworkName
+  );
   if (workloadsAffected === 0) {
     return 100;
   }
@@ -129,9 +180,10 @@ export function controlComplianceScore(
 /** The workloads that passed or are excepted from the control, and all workloads checked. */
 export function passedOrExcludedCount(
   workloadScanData: WorkloadConfigurationScanSummary[],
-  control: Control
+  control: Control,
+  frameworkName?: string
 ) {
-  const stats = controlStats(workloadScanData, control);
+  const stats = controlStats(workloadScanData, control, frameworkName);
   return [stats?.passedOrExcluded ?? 0, stats?.affected ?? 0];
 }
 
@@ -141,32 +193,47 @@ export function passedOrExcludedCount(
  * @param {WorkloadConfigurationScanSummary[]} workloadScanData
  * @param {Control} control
  * @param {string} status
+ * @param {string} frameworkName - The framework the control is checked in, for the exceptions limited to it.
  * @returns {number}
  */
 export function countScans(
   workloadScanData: WorkloadConfigurationScanSummary[],
   control: Control,
-  status: string
+  status: string,
+  frameworkName?: string
 ): number {
-  return controlStats(workloadScanData, control)?.byStatus.get(status) ?? 0;
+  return controlStats(workloadScanData, control, frameworkName)?.byStatus.get(status) ?? 0;
 }
 
 /**
  * Count the number of failed scans across all workloads.
  *
  * @param {WorkloadConfigurationScanSummary[]} workloadScanData
+ * @param {string} frameworkName - The framework of the exceptions limited to one.
+ * @param {Set<string>} controlIDs - The controls of the framework to count, all controls when undefined.
  * @returns {number}
  */
-export function countFailedScans(workloadScanData: WorkloadConfigurationScanSummary[]): number {
-  return indexScans(workloadScanData).failed;
+export function countFailedScans(
+  workloadScanData: WorkloadConfigurationScanSummary[],
+  frameworkName?: string,
+  controlIDs?: Set<string>
+): number {
+  const index = indexScans(workloadScanData, frameworkName);
+  if (!controlIDs) return index.failed;
+  let failed = 0;
+  for (const controlID of controlIDs) {
+    failed += index.controls.get(controlID)?.byStatus.get('failed') ?? 0;
+  }
+  return failed;
 }
 
 /** The workloads excepted from the control, and the excepted results of the control. */
 export function countExcludedWorkloadsForControl(
   workloadScanData: WorkloadConfigurationScanSummary[],
-  control: Control
+  control: Control,
+  frameworkName?: string
 ) {
-  return controlStats(workloadScanData, control)?.excluded ?? 0;
+  return controlStats(workloadScanData, control, frameworkName)?.excluded ?? 0;
 }
 
 /**
@@ -187,7 +254,9 @@ export function getControlsWithFindings(
   frameWork: FrameWork
 ) {
   if (!workloadScanData) return [];
-  return frameWork.controls.filter(control => countScans(workloadScanData, control, 'failed') > 0);
+  return frameWork.controls.filter(
+    control => countScans(workloadScanData, control, 'failed', frameWork.name) > 0
+  );
 }
 
 /**

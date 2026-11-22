@@ -109,6 +109,24 @@ describe('search', () => {
     expect(results.cves.total).toBe(3);
   });
 
+  it('searches on when a report does not name its image', () => {
+    // a report without the kubescape.io/image-tag annotation
+    const unnamed = {
+      ...redis,
+      manifestName: 'unnamed',
+      imageName: undefined as unknown as string,
+    };
+    const withUnnamed = buildVulnerabilityIndex([...scans, workload('batch', unnamed)]);
+
+    const results = search(withUnnamed, controls, 'redis')!;
+
+    expect(results.images.items.map(entry => entry.image)).toEqual([
+      'docker.io/library/redis:5.0.7',
+    ]);
+    // its workload and its CVEs are found
+    expect(search(withUnnamed, controls, 'batch')?.workloads.total).toBe(1);
+  });
+
   it('searches controls before the vulnerability reports are read', () => {
     const results = search(null, controls, 'C-0016')!;
     expect(results.cves.total).toBe(0);

@@ -1,6 +1,14 @@
 import { compareVersions } from '../common/versions';
 import { VulnerabilityManifest } from '../softwarecomposition/VulnerabilityManifest';
-import { getImageScanKey, getImageScans, ImageScan, WorkloadScan } from './scanData';
+import { findingKey, relevantFindingKeys } from './relevance';
+import {
+  getImageScanKey,
+  getImageScans,
+  ImageScan,
+  ofSeveralClusters,
+  workloadLabel,
+  WorkloadScan,
+} from './scanData';
 
 /** A package in an image whose upgrade fixes one or more CVEs. */
 export interface PackageUpgrade {
@@ -79,19 +87,19 @@ export function getPackageUpgrades(
     else workloadsByImage.set(key, [w]);
   }
 
+  const withCluster = ofSeveralClusters(workloadScans);
   for (const imageScan of getImageScans(workloadScans)) {
     const imageWorkloads = workloadsByImage.get(getImageScanKey(imageScan)) ?? [];
-    const workloadNames = [...new Set(imageWorkloads.map(w => `${w.name}/${w.container}`))];
+    const workloadNames = [...new Set(imageWorkloads.map(w => workloadLabel(w, withCluster)))];
     const relevantScans = imageWorkloads.flatMap(w => (w.relevant ? [w.relevant] : []));
-    const relevantIds = new Set(
-      relevantScans.flatMap(scan => scan.matches.map(m => m.vulnerability.id))
-    );
+    // relevance is per CVE and package: a CVE of several packages may be relevant for only some
+    const relevantKeys = relevantFindingKeys(...relevantScans.map(scan => scan.matches));
 
     const byPackage = new Map<string, PackageUpgrade>();
     for (const match of imageScan.matches) {
       const fixVersion = match.vulnerability.fix?.state === 'fixed' && fixVersionFor(match);
       if (!fixVersion) continue;
-      if (relevantOnly && relevantScans.length > 0 && !relevantIds.has(match.vulnerability.id)) {
+      if (relevantOnly && relevantScans.length > 0 && !relevantKeys.has(findingKey(match))) {
         continue;
       }
 

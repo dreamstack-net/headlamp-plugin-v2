@@ -78,6 +78,11 @@ func TestCheckMatchConstraints(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "resource in another case",
+			rule: `{apiGroups: ["*"], apiVersions: ["*"], operations: ["*"], resources: [Deployments]}`,
+			want: false,
+		},
+		{
 			name: "all subresources include the resource",
 			rule: `{apiGroups: [apps], apiVersions: [v1], operations: ["*"], resources: [deployments/*]}`,
 			want: true,

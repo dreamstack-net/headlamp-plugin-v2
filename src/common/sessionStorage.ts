@@ -1,6 +1,8 @@
 import { Dispatch, SetStateAction, useEffect, useState } from 'react';
 
 export enum KubescapeSettings {
+  ClusterComparisonFilter,
+  ClusterComparisonTab,
   ComplianceTab,
   FailedControls,
   FixedCVEs,
@@ -24,21 +26,29 @@ export function useSessionStorage<T>(
   return [value, setValue];
 }
 
+/**
+ * Keeps a setting for the session. false and 0 are kept too, as they differ from the default of
+ * settings such as the Failed controls switch, which is on unless the user switched it off.
+ */
 export function setItemInSessionStorage<T>(key: KubescapeSettings, value: T) {
   const storageKey = `kubescape.${KubescapeSettings[key]}`;
-
-  if (value) {
-    window.sessionStorage.setItem(storageKey, JSON.stringify(value));
-  } else {
-    window.sessionStorage.removeItem(storageKey);
+  try {
+    if (value === null || value === undefined) {
+      window.sessionStorage.removeItem(storageKey);
+    } else {
+      window.sessionStorage.setItem(storageKey, JSON.stringify(value));
+    }
+  } catch {
+    // the setting is not kept when the storage is not available
   }
 }
 
-export function getItemFromSessionStorage<T>(key: KubescapeSettings) {
+export function getItemFromSessionStorage<T>(key: KubescapeSettings): T | null {
   const storageKey = `kubescape.${KubescapeSettings[key]}`;
-  const saved = window.sessionStorage.getItem(storageKey);
-  if (saved) {
-    return JSON.parse(saved) as T;
+  try {
+    const saved = window.sessionStorage.getItem(storageKey);
+    return saved === null ? null : (JSON.parse(saved) as T);
+  } catch {
+    return null;
   }
-  return null;
 }

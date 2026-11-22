@@ -4,7 +4,10 @@ import { vi } from 'vitest';
 import { FrameworksPage } from './FrameworkList';
 
 const mocks = vi.hoisted(() => ({
+  // the default frameworks
+  frameworks: [] as any[],
   configMaps: [] as any[],
+  list: vi.fn(),
   remove: vi.fn(),
   // SelfSubjectAccessReviews
   post: vi.fn(),
@@ -18,7 +21,6 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@kinvolk/headlamp-plugin/lib', () => ({
-  K8s: { ResourceClasses: { ConfigMap: { useList: () => [mocks.configMaps] } } },
   Router: { createRouteURL: (route: string) => `/${route}` },
 }));
 vi.mock('@kinvolk/headlamp-plugin/lib/ApiProxy', () => ({
@@ -27,15 +29,24 @@ vi.mock('@kinvolk/headlamp-plugin/lib/ApiProxy', () => ({
 }));
 vi.mock('@kinvolk/headlamp-plugin/lib/Utils', () => ({ getCluster: () => mocks.cluster }));
 vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', () => ({
-  Link: ({ children }: any) => <a href="#framework">{children}</a>,
+  Link: ({ children, params, search }: any) => (
+    <a href={`#${params.name}${search ? `?${new URLSearchParams(search)}` : ''}`}>{children}</a>
+  ),
   Table: ({ data = [], columns }: any) => (
     <table>
       <tbody>
         {data.map((item: any, index: number) => (
           <tr key={index}>
-            {columns.map((column: any, cellIndex: number) => (
-              <td key={cellIndex}>{column.accessorFn?.(item) ?? item[column.accessorKey]}</td>
-            ))}
+            {columns.map((column: any, cellIndex: number) => {
+              const value = column.accessorFn?.(item) ?? item[column.accessorKey];
+              return (
+                <td key={cellIndex}>
+                  {column.Cell
+                    ? column.Cell({ cell: { getValue: () => value }, row: { original: item } })
+                    : value}
+                </td>
+              );
+            })}
           </tr>
         ))}
       </tbody>
@@ -45,6 +56,7 @@ vi.mock('@kinvolk/headlamp-plugin/lib/CommonComponents', () => ({
 vi.mock('notistack', () => ({ useSnackbar: () => ({ enqueueSnackbar: mocks.enqueueSnackbar }) }));
 vi.mock('../custom-objects/api-queries', () => ({
   getKubescapeNamespace: async () => mocks.namespace,
+  listCustomObjectConfigMaps: mocks.list,
   useKubescapeNamespace: () => ({ ...mocks.namespace, loading: false }),
 }));
 vi.mock('../index', () => ({
@@ -56,18 +68,19 @@ vi.mock('../index', () => ({
 }));
 vi.mock('../model', () => ({ customObjectLabel: 'kubescape.io/custom-object' }));
 vi.mock('../rego', () => ({
-  useRegoData: () => ({ controls: [{ controlID: 'C-0016' }], frameworks: [] }),
+  useRegoData: () => ({ controls: [{ controlID: 'C-0016' }], frameworks: mocks.frameworks }),
 }));
 
 beforeEach(() => {
+  mocks.frameworks = [];
+  // as the API returns them, in the Kubescape namespace
   mocks.configMaps = [
     {
-      metadata: { name: 'framework-team-baseline' },
-      jsonData: {
-        data: { name: 'Team baseline', description: 'Ours', controlsIDs: '["C-0016"]' },
-      },
+      metadata: { name: 'framework-team-baseline', namespace: 'kubescape' },
+      data: { name: 'Team baseline', description: 'Ours', controlsIDs: '["C-0016"]' },
     },
   ];
+  mocks.list.mockReset().mockImplementation(async () => mocks.configMaps);
   mocks.namespace = { kubeScapeNamespace: 'kubescape', error: null };
   mocks.cluster = 'cluster-a';
   mocks.post.mockReset().mockResolvedValue({ status: { allowed: true } });
@@ -76,19 +89,20 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-function renderPage() {
+async function renderPage() {
   render(
     <MemoryRouter>
       <FrameworksPage />
     </MemoryRouter>
   );
+  await screen.findAllByRole('button', { name: /^Delete / });
 }
 
 it('deletes a custom framework only after a confirmation that names it', async () => {
   mocks.remove.mockRejectedValueOnce(
     new Error('configmaps "framework-team-baseline" is forbidden')
   );
-  renderPage();
+  await renderPage();
   fireEvent.click(screen.getByRole('button', { name: 'Delete Team baseline' }));
 
   const dialog = await screen.findByRole('dialog', { name: 'Delete custom framework?' });
@@ -118,9 +132,68 @@ it('deletes a custom framework only after a confirmation that names it', async (
   });
 });
 
-it('asks nothing when the Kubescape namespace is not found', async () => {
+it('lists the custom frameworks in the Kubescape namespace, and again after a delete', async () => {
+  mocks.remove.mockImplementation(async () => {
+    mocks.configMaps = [];
+  });
+  await renderPage();
+  expect(mocks.list).toHaveBeenCalledWith('framework', 'cluster-a');
+  expect(screen.getByText('Team baseline')).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Delete Team baseline' }));
+  fireEvent.click(
+    within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete' })
+  );
+
+  await waitFor(() => expect(screen.queryByText('Team baseline')).toBeNull());
+  expect(mocks.list).toHaveBeenCalledTimes(2);
+});
+
+it('deletes and edits a framework in the namespace its ConfigMap was found in', async () => {
+  // listed in all namespaces, as the Kubescape namespace was not known
+  mocks.configMaps[0].metadata.namespace = 'security';
+  await renderPage();
+
+  expect(screen.getByText('Team baseline').closest('a')?.getAttribute('href')).toBe(
+    '#framework-team-baseline?namespace=security'
+  );
+  fireEvent.click(screen.getByRole('button', { name: 'Delete Team baseline' }));
+  const dialog = await screen.findByRole('dialog');
+  expect(dialog.textContent).toContain('in namespace security of cluster cluster-a');
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
+
+  await waitFor(() =>
+    expect(mocks.remove).toHaveBeenCalledWith(
+      '/api/v1/namespaces/security/configmaps/framework-team-baseline'
+    )
+  );
+});
+
+it('gives the default frameworks no empty column where the custom ones have their actions', async () => {
+  mocks.frameworks = [{ name: 'NSA', description: 'Hardening guidance', controls: [] }];
+  await renderPage();
+
+  expect(screen.getByText('NSA').closest('tr')?.querySelectorAll('td')).toHaveLength(3);
+  expect(screen.getByText('Team baseline').closest('tr')?.querySelectorAll('td')).toHaveLength(4);
+});
+
+it('shows why the custom frameworks could not be read', async () => {
+  mocks.list.mockRejectedValue(new Error('configmaps is forbidden'));
+  render(
+    <MemoryRouter>
+      <FrameworksPage />
+    </MemoryRouter>
+  );
+
+  expect(
+    await screen.findByText('Unable to read the custom frameworks: configmaps is forbidden')
+  ).toBeTruthy();
+});
+
+it('asks nothing when the namespace of a ConfigMap and the Kubescape namespace are not known', async () => {
+  delete mocks.configMaps[0].metadata.namespace;
   mocks.namespace = { error: 'Kubescape is not installed', kubeScapeNamespace: undefined };
-  renderPage();
+  await renderPage();
   fireEvent.click(screen.getByRole('button', { name: 'Delete Team baseline' }));
 
   await waitFor(() =>
@@ -137,7 +210,7 @@ it('offers no add or delete without permission for the ConfigMaps of the Kubesca
   mocks.post.mockImplementation(async (_url: string, review: any) => ({
     status: { allowed: review.spec.resourceAttributes.resource !== 'configmaps' },
   }));
-  renderPage();
+  await renderPage();
 
   await waitFor(() =>
     expect(screen.getByRole('button', { name: 'Delete Team baseline' })).toHaveProperty(

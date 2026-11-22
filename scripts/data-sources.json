@@ -1,0 +1,16 @@
+{
+  "$comment": "The Kubescape data the plugin ships, read by the Makefile and scripts/install_headlamp_plugin.py. Renovate raises the versions.",
+  "celAdmissionLibrary": "v0.15",
+  "regolibrary": "v2.0.39",
+  "vapTestFiles": [
+    "deployment.yaml",
+    "deployment-for-list-items.yaml",
+    "pod-capabilities.yaml",
+    "service-account.yaml",
+    "deployment-with-common-label-1.yaml",
+    "pod-for-list-items.yaml",
+    "service.yaml",
+    "deployment-with-common-label-2.yaml",
+    "pod.yaml"
+  ]
+}

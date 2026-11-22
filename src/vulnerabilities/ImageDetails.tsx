@@ -1,6 +1,7 @@
 /* 
   Show vulnerability scan results for a container image. 
 */
+import { ApiError } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import {
   DateLabel,
   Link as HeadlampLink,
@@ -8,11 +9,13 @@ import {
   SectionBox,
   ShowHideLabel,
 } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
-import { KubeObject } from '@kinvolk/headlamp-plugin/lib/k8s/cluster';
 import { getCluster } from '@kinvolk/headlamp-plugin/lib/Utils';
-import { Alert, Chip, Link, Stack, Typography } from '@mui/material';
+import { Alert, Chip, Stack, Typography } from '@mui/material';
 import { useEffect, useMemo, useState } from 'react';
 import { CompactTable } from '../common/CompactTable';
+import { ErrorMessage } from '../common/ErrorMessage';
+import { errorMessage } from '../common/errors';
+import { useStorageObject } from '../common/readOnce';
 import makeSeverityLabel from '../common/SeverityLabel';
 import HeadlampTable from '../common/Table';
 import { getURLSegments, useURLSearchParam } from '../common/url';
@@ -28,35 +31,64 @@ import {
 import { RoutingName } from '../index';
 import { vulnerabilityManifestClass } from '../model';
 import { VulnerabilityManifest } from '../softwarecomposition/VulnerabilityManifest';
-import { AcceptRiskButton, ExceptionChip, useSecurityExceptions } from './exceptionChips';
+import { DataSourceLink } from './CVESummary';
+import {
+  AcceptRiskButton,
+  ExceptionChip,
+  exceptionChipValue,
+  ExceptionReadErrors,
+  useSecurityExceptions,
+} from './exceptionChips';
+import { matchExploitIds } from './exploitData';
 import { ImageReference } from './ImageReference';
 import { imageSourceLabel } from './imageSource';
 import { imageVersionRows, useImageVersion, useImageVersionSettings } from './ImageVersion';
 import { fetchImageWorkloads, ImageWorkload, latestScan } from './imageWorkloads';
+import {
+  exploitColumns,
+  exploitCsvHeader,
+  exploitCsvValues,
+  ExploitDataErrors,
+  knownExploitedEmptyMessage,
+  KnownExploitedSwitch,
+  useExploitData,
+  withExploits,
+} from './KnownExploited';
+import { uniqueFindingIds } from './relevance';
 import { getVulnerabilityReportCreatedAt } from './reportTimestamp';
 
 export default function ImageVulnerabilityDetails() {
   const [name, namespace] = getURLSegments(-1, -2);
-  const [manifestVulnerability, setManifestVulnerability] = useState<KubeObject | null>(null);
-
   const cluster = getCluster() ?? '';
-  vulnerabilityManifestClass.useApiGet(setManifestVulnerability, name, namespace, undefined, {
-    cluster: cluster || undefined,
-  });
+  // read once: a watch of the storage would replace the report with one without its matches
+  const { data: manifestVulnerability, error } = useStorageObject<VulnerabilityManifest>(
+    vulnerabilityManifestClass,
+    name,
+    namespace,
+    cluster || undefined
+  );
 
   // the workloads that run the image, whose summaries carry its image-id label
   const imageId = manifestVulnerability?.metadata.labels?.['kubescape.io/image-id'];
   const [workloads, setWorkloads] = useState<ImageWorkload[] | null>(null);
   const [workloadsError, setWorkloadsError] = useState('');
+  // the allowed namespaces whose workloads could not be read
+  const [namespaceErrors, setNamespaceErrors] = useState<string[]>([]);
   useEffect(() => {
+    // the workloads of the image shown before, or of the cluster shown before, are not of this one
+    setWorkloads(null);
+    setWorkloadsError('');
+    setNamespaceErrors([]);
     if (!imageId) return;
     let active = true;
     fetchImageWorkloads(imageId, cluster)
       .then(found => {
-        if (active) setWorkloads(found);
+        if (!active) return;
+        setWorkloads(found.workloads);
+        setNamespaceErrors(found.errors);
       })
       .catch(err => {
-        if (active) setWorkloadsError(err?.message ?? String(err));
+        if (active) setWorkloadsError(errorMessage(err));
       });
     return () => {
       active = false;
@@ -71,9 +103,9 @@ export default function ImageVulnerabilityDetails() {
   const imageVersion = useImageVersion(
     image,
     cluster,
-    imageSourceLabel(manifestVulnerability?.jsonData.spec.payload.source?.target?.config)
+    imageSourceLabel(manifestVulnerability?.spec.payload.source?.target?.config)
   );
-  const { exceptions, reload } = useSecurityExceptions([cluster], []);
+  const { exceptions, errors: exceptionErrors, reload } = useSecurityExceptions([cluster], []);
   const exceptionData = exceptions.get(cluster);
   const covered = useMemo(
     () =>
@@ -82,8 +114,8 @@ export default function ImageVulnerabilityDetails() {
         : new Map<string, CveException>(),
     [exceptionData, image]
   );
-  const matches: VulnerabilityManifest.Match[] | undefined =
-    manifestVulnerability?.jsonData.spec.payload.matches;
+  const matches: VulnerabilityManifest.Match[] | null | undefined =
+    manifestVulnerability?.spec.payload.matches;
   const openCves = useMemo(
     () => summarizeWorkloadExceptions(covered, matches ?? []).open,
     [covered, matches]
@@ -91,19 +123,16 @@ export default function ImageVulnerabilityDetails() {
   const [accepting, setAccepting] = useState(false);
 
   if (manifestVulnerability) {
-    const evaluatedAt = getVulnerabilityReportCreatedAt(manifestVulnerability.jsonData);
+    const evaluatedAt = getVulnerabilityReportCreatedAt(manifestVulnerability);
     // recent kubevuln versions only record when they scanned, on the summaries of the workloads
     const scannedAt = latestScan(workloads ?? []);
     return (
       <>
         <SectionBox title="Image Vulnerabilities" backLink>
+          <ExceptionReadErrors errors={exceptionErrors} />
           {image && openCves.length > 0 && (
             <Stack direction="row" spacing={1} sx={{ mb: 1 }}>
-              <AcceptRiskButton
-                cveIds={openCves}
-                cluster={cluster || undefined}
-                onClick={() => setAccepting(true)}
-              />
+              <AcceptRiskButton cveIds={openCves} onClick={() => setAccepting(true)} />
             </Stack>
           )}
           <NameValueTable
@@ -128,6 +157,11 @@ export default function ImageVulnerabilityDetails() {
         </SectionBox>
 
         <SectionBox title="Workloads">
+          {namespaceErrors.length > 0 && (
+            <Alert severity="warning" sx={{ mb: 1 }}>
+              Unable to read all workloads that run the image: {namespaceErrors.join('; ')}
+            </Alert>
+          )}
           {workloadsError ? (
             <Alert severity="error">
               Unable to read the workloads that run the image: {workloadsError}
@@ -141,14 +175,18 @@ export default function ImageVulnerabilityDetails() {
               Reading workloads…
             </Typography>
           ) : workloads.length === 0 ? (
-            <Typography variant="body2">No workload runs this image anymore.</Typography>
+            <Typography variant="body2">
+              {namespaceErrors.length > 0
+                ? 'No workload of the namespaces that could be read runs this image.'
+                : 'No workload runs this image anymore.'}
+            </Typography>
           ) : (
             <ImageWorkloads workloads={workloads} cluster={cluster} />
           )}
         </SectionBox>
 
         <Matches
-          manifestVulnerability={manifestVulnerability.jsonData}
+          manifestVulnerability={manifestVulnerability}
           covered={covered}
           cluster={cluster}
         />
@@ -166,6 +204,17 @@ export default function ImageVulnerabilityDetails() {
       </>
     );
   }
+  return (
+    <SectionBox title="Image Vulnerabilities" backLink>
+      {error ? (
+        <ErrorMessage error={error as ApiError} />
+      ) : (
+        <Typography variant="body2" color="text.secondary">
+          Reading the vulnerabilities of the image…
+        </Typography>
+      )}
+    </SectionBox>
+  );
 }
 
 function ImageWorkloads(props: Readonly<{ workloads: ImageWorkload[]; cluster: string }>) {
@@ -208,6 +257,13 @@ function ImageWorkloads(props: Readonly<{ workloads: ImageWorkload[]; cluster: s
   );
 }
 
+// what the chip of an exception of the image says about counting the finding
+function exceptionNote(exception: CveException | undefined): string | undefined {
+  return exception && isSuppressing(exception.state)
+    ? 'Kubescape stops counting this finding at its next scan, when the riskAcceptance capability is enabled.'
+    : undefined;
+}
+
 function Matches(
   props: Readonly<{
     manifestVulnerability: VulnerabilityManifest;
@@ -218,12 +274,38 @@ function Matches(
 ) {
   const { manifestVulnerability, covered, cluster } = props;
   const [severity, clearSeverity] = useURLSearchParam('severity');
-  const results = useMemo(
+  const findings = useMemo(() => {
+    const matches = (manifestVulnerability.spec.payload.matches ?? []).filter(
+      match => !severity || match.vulnerability.severity === severity
+    );
+    // the rows are keyed by these ids, which are unique also for a package at several paths
+    const rowIds = uniqueFindingIds(matches);
+    return matches.map((match, i) => ({
+      ...match,
+      exception: findingException(covered, match),
+      rowId: rowIds[i],
+    }));
+  }, [manifestVulnerability, severity, covered]);
+  // the EPSS scores of the findings with the highest CVSS score first
+  const cveIds = useMemo(
     () =>
-      (manifestVulnerability.spec.payload.matches ?? [])
-        .filter(match => !severity || match.vulnerability.severity === severity)
-        .map(match => ({ ...match, exception: findingException(covered, match) })),
-    [manifestVulnerability, severity, covered]
+      [...findings]
+        .sort((a, b) => cvssScore(b) - cvssScore(a))
+        .flatMap(finding => matchExploitIds(finding)),
+    [findings]
+  );
+  const exploitData = useExploitData(cveIds);
+  const { settings: exploitSettings } = exploitData;
+  const [exploitedOnly, setExploitedOnly] = useState(false);
+  const showExploitedOnly = exploitSettings.knownExploited && exploitedOnly;
+  // new rows when the exploit data arrives, so that the table draws them again
+  const rows = useMemo(
+    () => withExploits(findings, matchExploitIds, exploitData),
+    [findings, exploitData]
+  );
+  const results = useMemo(
+    () => (showExploitedOnly ? rows.filter(finding => finding.exploit?.kev) : rows),
+    [rows, showExploitedOnly]
   );
   const exceptionLabel = (match: (typeof results)[number]) =>
     match.exception ? exceptionStateLabels[match.exception.state] : '';
@@ -241,14 +323,30 @@ function Matches(
     manifestVulnerability.metadata.annotations?.['kubescape.io/image-tag'] ??
     manifestVulnerability.metadata.name;
 
+  const emptyMessage =
+    results.length === 0 && rows.length > 0
+      ? knownExploitedEmptyMessage(exploitData, 'findings')
+      : undefined;
+
   return (
     <SectionBox title="Findings">
+      <ExploitDataErrors data={exploitData} />
       <HeadlampTable
         toolbarStart={
-          severity && (
-            <Chip label={`Only ${severity} findings`} onDelete={clearSeverity} size="small" />
+          (severity || exploitSettings.knownExploited) && (
+            <>
+              <KnownExploitedSwitch
+                settings={exploitSettings}
+                checked={exploitedOnly}
+                onChange={setExploitedOnly}
+              />
+              {severity && (
+                <Chip label={`Only ${severity} findings`} onDelete={clearSeverity} size="small" />
+              )}
+            </>
           )
         }
+        emptyMessage={emptyMessage}
         csvExport={{
           fileName: `kubescape-${manifestVulnerability.metadata.name}-cves.csv`,
           header: [
@@ -256,6 +354,7 @@ function Matches(
             'Severity',
             'CVE',
             'CVSS',
+            ...exploitCsvHeader(exploitSettings),
             'Artifact',
             'Version',
             'Fix',
@@ -268,7 +367,8 @@ function Matches(
               imageName,
               match.vulnerability.severity,
               match.vulnerability.id,
-              match.vulnerability.cvss?.[0]?.metrics.baseScore,
+              match.vulnerability.cvss?.[0]?.metrics?.baseScore,
+              ...exploitCsvValues(match.exploit, exploitSettings),
               match.artifact.name,
               match.artifact.version,
               match.vulnerability.fix?.state,
@@ -278,21 +378,22 @@ function Matches(
             ]),
         }}
         data={results}
+        getRowId={match => match.rowId}
         columns={[
           {
             header: 'Severity',
             accessorKey: 'vulnerability.severity',
-            Cell: ({ cell }: any) => makeSeverityLabel(cell.getValue()),
+            Cell: ({ cell }) => makeSeverityLabel(cell.getValue()),
             gridTemplate: 'auto',
           },
           {
             header: 'CVE',
             accessorKey: 'vulnerability.id',
-            Cell: ({ cell }: any) => {
+            Cell: ({ cell }) => {
               return (
-                <Link target="_blank" href={cell.row.original.vulnerability.dataSource}>
+                <DataSourceLink href={cell.row.original.vulnerability.dataSource}>
                   {cell.getValue()}
-                </Link>
+                </DataSourceLink>
               );
             },
             gridTemplate: 'auto',
@@ -300,10 +401,10 @@ function Matches(
           {
             id: 'Score',
             header: 'CVSS',
-            accessorFn: (match: VulnerabilityManifest.Match) =>
-              match.vulnerability.cvss ? match.vulnerability.cvss[0].metrics.baseScore : 0,
+            accessorFn: cvssScore,
             gridTemplate: 'auto',
           },
+          ...exploitColumns<(typeof results)[number]>(exploitSettings),
           {
             header: 'Artifact',
             accessorKey: 'artifact.name',
@@ -327,17 +428,16 @@ function Matches(
           {
             id: 'Exception',
             header: 'Exception',
-            accessorFn: exceptionLabel,
-            Cell: ({ row }: any) =>
+            // the label, the name and the rest of what the chip shows, so that the chip is
+            // drawn again for another exception
+            accessorFn: (match: (typeof results)[number]) =>
+              exceptionChipValue(match.exception, exceptionNote(match.exception)),
+            Cell: ({ row }) =>
               row.original.exception ? (
                 <ExceptionChip
                   exception={row.original.exception}
                   cluster={cluster || undefined}
-                  note={
-                    isSuppressing(row.original.exception.state)
-                      ? 'Kubescape stops counting this finding at its next scan, when the riskAcceptance capability is enabled.'
-                      : undefined
-                  }
+                  note={exceptionNote(row.original.exception)}
                 />
               ) : null,
             gridTemplate: 'auto',
@@ -345,7 +445,7 @@ function Matches(
           {
             header: 'Description',
             accessorFn: description,
-            Cell: ({ cell }: any) => <ShowHideLabel>{cell.getValue()}</ShowHideLabel>,
+            Cell: ({ cell }) => <ShowHideLabel>{cell.getValue()}</ShowHideLabel>,
           },
         ]}
         initialState={{
@@ -359,4 +459,8 @@ function Matches(
       />
     </SectionBox>
   );
+}
+
+function cvssScore(match: VulnerabilityManifest.Match): number {
+  return match.vulnerability.cvss?.[0]?.metrics?.baseScore ?? 0;
 }

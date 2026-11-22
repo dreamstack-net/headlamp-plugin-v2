@@ -4,11 +4,15 @@
 
 import { Link, NameValueTable, SectionBox } from '@kinvolk/headlamp-plugin/lib/CommonComponents';
 import { KubeObject } from '@kinvolk/headlamp-plugin/lib/k8s/KubeObject';
-import { useState } from 'react';
+import { Typography } from '@mui/material';
+import { useStorageObject } from '../common/readOnce';
 import { getControlsSummary } from '../compliance/ControlsSummary';
 import { RoutingName } from '../index';
 import { configurationScanSummariesClass, vulnerabilitySummaryClass } from '../model';
+import { VulnerabilitySummary } from '../softwarecomposition/VulnerabilitySummary';
 import { getCVESummary } from '../vulnerabilities/CVESummary';
+import { ExceptionsNote } from './ExceptionsNote';
+import { useNamespaceFailedControls } from './workloadSummaries';
 
 export default function addKubescapeNamespaceSection(resource: any, sections: any) {
   // Ignore if there is no resource.
@@ -45,51 +49,106 @@ function KubescapeInfo(props: { resource: KubeObject }) {
   const { resource } = props;
   const resourceName = resource.jsonData.metadata.name;
 
-  const [configurationScanSummary, setConfigurationScanSummary] = useState<KubeObject | null>(null);
-  const [vulnerabilitySummary, setVulnerabilitySummary] = useState<KubeObject | null>(null);
-
-  configurationScanSummariesClass.useApiGet(
-    setConfigurationScanSummary,
+  // the summaries are named after the namespace and are not namespaced; they are read once in
+  // the cluster of the namespace, as the storage refuses to watch them (405), and a namespace
+  // without scans has none
+  const { data: configurationScanSummary } = useStorageObject(
+    configurationScanSummariesClass,
     resourceName,
+    undefined,
     resource.cluster
   );
-  vulnerabilitySummaryClass.useApiGet(setVulnerabilitySummary, resourceName, resource.cluster);
+  const { data: vulnerabilitySummary } = useStorageObject<VulnerabilitySummary>(
+    vulnerabilitySummaryClass,
+    resourceName,
+    undefined,
+    resource.cluster
+  );
+
+  // the failed controls of the workloads of the namespace, without those that exceptions exclude,
+  // also where the plugin applies the exceptions itself; the summary of the storage counts them
+  // as the scanners applied them
+  const failedControls = useNamespaceFailedControls(
+    resource.cluster ?? '',
+    resourceName,
+    !!configurationScanSummary
+  );
+
+  // each summary is shown on its own: a cluster may only scan configurations or vulnerabilities
+  const rows = [
+    ...(configurationScanSummary
+      ? [
+          {
+            name: (
+              <Link
+                routeName={RoutingName.KubescapeConfigurationScanNamespaceSummary}
+                params={{ namespace: resourceName }}
+                activeCluster={resource.cluster}
+              >
+                Configuration scan
+              </Link>
+            ),
+            value: namespaceControlsSummary(
+              failedControls,
+              configurationScanSummary.spec?.severities
+            ),
+          },
+        ]
+      : []),
+    ...(vulnerabilitySummary
+      ? [
+          {
+            name: (
+              <Link
+                routeName={RoutingName.VulnerabilitiesNamespaceSummary}
+                params={{ namespace: resourceName }}
+                activeCluster={resource.cluster}
+              >
+                Vulnerabilities
+              </Link>
+            ),
+            value: getCVESummary(vulnerabilitySummary, false, false),
+          },
+        ]
+      : []),
+  ];
 
   return (
-    configurationScanSummary &&
-    vulnerabilitySummary && (
+    rows.length > 0 && (
       <SectionBox title="Kubescape">
-        <NameValueTable
-          rows={[
-            {
-              name: (
-                <Link
-                  routeName={RoutingName.KubescapeConfigurationScanNamespaceSummary}
-                  params={{
-                    namespace: resourceName,
-                  }}
-                >
-                  Configuration scan
-                </Link>
-              ),
-              value: getControlsSummary(configurationScanSummary.jsonData),
-            },
-            {
-              name: (
-                <Link
-                  routeName={RoutingName.VulnerabilitiesNamespaceSummary}
-                  params={{
-                    namespace: resourceName,
-                  }}
-                >
-                  Vulnerabilities
-                </Link>
-              ),
-              value: getCVESummary(vulnerabilitySummary.jsonData, false, false),
-            },
-          ]}
-        />
+        <NameValueTable rows={rows} />
       </SectionBox>
     )
+  );
+}
+
+function namespaceControlsSummary(
+  failedControls: ReturnType<typeof useNamespaceFailedControls>,
+  scannerCounts: any
+) {
+  const { counts, error, exceptionsError } = failedControls;
+  if (counts) {
+    return (
+      <>
+        {getControlsSummary(counts)}
+        <ExceptionsNote error={exceptionsError} />
+      </>
+    );
+  }
+  if (!error) return 'Reading the workload results…';
+  // the counts of the storage, which leave out the exceptions that the plugin applies
+  return (
+    <>
+      {getControlsSummary({
+        critical: scannerCounts?.critical ?? 0,
+        high: scannerCounts?.high ?? 0,
+        medium: scannerCounts?.medium ?? 0,
+        low: scannerCounts?.low ?? 0,
+      })}
+      <Typography variant="caption" color="text.secondary">
+        As counted by the scanner, without the exceptions that the plugin applies: unable to read
+        the results of the workloads: {error}
+      </Typography>
+    </>
   );
 }

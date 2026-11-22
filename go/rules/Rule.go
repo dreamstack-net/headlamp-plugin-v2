@@ -21,6 +21,8 @@ type Rule struct {
 	MitreTactic       string          `json:"mitreTactic" yaml:"mitreTactic"`
 	MitreTechnique    string          `json:"mitreTechnique" yaml:"mitreTechnique"`
 	Tags              []string        `json:"tags" yaml:"tags"`
+	// State holds the parameters of the node-agent's prefilter (prefilter.go)
+	State map[string]any `json:"state,omitempty" yaml:"state,omitempty"`
 }
 
 type RuleExpressions struct {
